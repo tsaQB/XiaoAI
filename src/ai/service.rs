@@ -270,6 +270,48 @@ pub struct ModelMetadata {
     pub max_completion_tokens: Option<usize>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CapabilityRecord {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub model: String,
+    pub context_window: Option<usize>,
+    pub supports_text: bool,
+    pub supports_image: Option<bool>,
+    pub supports_audio: Option<bool>,
+    pub supports_video: Option<bool>,
+    pub supports_reasoning: Option<bool>,
+    pub source: String,
+    pub details: Vec<String>,
+    pub checked_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CapabilityRegistry {
+    pub models: Vec<CapabilityRecord>,
+}
+
+pub fn get_capability_registry_path() -> std::path::PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        return std::path::Path::new(&home).join(".xiao_model_capabilities.json");
+    }
+    std::path::Path::new(".xiao_model_capabilities.json").to_path_buf()
+}
+
+pub fn load_capability_registry() -> CapabilityRegistry {
+    let path = get_capability_registry_path();
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_capability_registry(registry: &CapabilityRegistry) -> std::io::Result<()> {
+    let value = serde_json::to_string_pretty(registry)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    std::fs::write(get_capability_registry_path(), value)
+}
+
 fn format_number_with_commas(n: usize) -> String {
     let s = n.to_string();
     let mut result = String::new();
@@ -302,18 +344,12 @@ pub fn get_model_capabilities_with_meta(model_name: &str, meta: Option<&ModelMet
         }
         if let Some(ref mod_str) = m.modalities {
             let mod_low = mod_str.to_lowercase();
-            if mod_low.contains("image") || mod_low.contains("multimodal") {
-                cap.vision = true;
-                cap.vision_desc = "✅ Didukung (Endpoint Architecture Modality)".to_string();
-            }
-            if mod_low.contains("video") {
-                cap.video = true;
-                cap.video_desc = "✅ Native Video Vision Supported (Endpoint Modality)".to_string();
-            }
-            if mod_low.contains("audio") {
-                cap.audio = true;
-                cap.audio_desc = "✅ Native Audio Supported (Endpoint Modality)".to_string();
-            }
+            cap.vision = mod_low.contains("image") || mod_low.contains("vision") || mod_low.contains("multimodal");
+            cap.video = mod_low.contains("video");
+            cap.audio = mod_low.contains("audio");
+            cap.vision_desc = if cap.vision { "✅ Didukung (Endpoint modality)" } else { "❌ Tidak dipublikasikan endpoint" }.to_string();
+            cap.video_desc = if cap.video { "✅ Didukung (Endpoint modality)" } else { "❌ Tidak didukung endpoint" }.to_string();
+            cap.audio_desc = if cap.audio { "✅ Didukung (Endpoint modality)" } else { "❌ Tidak didukung endpoint" }.to_string();
         }
     }
 
@@ -647,8 +683,13 @@ impl AIChatService {
                                         let context_length = item.get("context_length").and_then(|c| c.as_u64()).map(|u| u as usize);
                                         let modality = item.get("architecture")
                                             .and_then(|a| a.get("modality"))
-                                            .and_then(|m| m.as_str())
-                                            .map(|s| s.to_string());
+                                            .or_else(|| item.get("modalities"))
+                                            .map(|value| match value {
+                                                Value::String(s) => s.clone(),
+                                                Value::Array(values) => values.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(","),
+                                                _ => String::new(),
+                                            })
+                                            .filter(|value| !value.is_empty());
                                         let max_comp = item.get("top_provider")
                                             .and_then(|p| p.get("max_completion_tokens"))
                                             .and_then(|m| m.as_u64())
@@ -670,6 +711,33 @@ impl AIChatService {
                                     model_ids.push(k.to_string());
                                 }
                             }
+
+                            let mut registry = load_capability_registry();
+                            let provider_id = clean_endpoint.to_string();
+                            for model_id in &model_ids {
+                                let meta = meta_guard.get(model_id);
+                                let modalities = meta.and_then(|m| m.modalities.as_deref()).unwrap_or("").to_ascii_lowercase();
+                                let record = CapabilityRecord {
+                                    provider_id: provider_id.clone(),
+                                    provider_name: provider_id.clone(),
+                                    model: model_id.clone(),
+                                    context_window: meta.and_then(|m| m.context_length),
+                                    supports_text: true,
+                                    supports_image: if modalities.is_empty() { None } else { Some(modalities.contains("image") || modalities.contains("vision") || modalities.contains("multimodal")) },
+                                    supports_audio: if modalities.is_empty() { None } else { Some(modalities.contains("audio")) },
+                                    supports_video: if modalities.is_empty() { None } else { Some(modalities.contains("video")) },
+                                    supports_reasoning: None,
+                                    source: "provider /models metadata".to_string(),
+                                    details: if modalities.is_empty() { vec!["Input modality tidak dipublikasikan endpoint".to_string()] } else { vec![format!("modalities: {modalities}")] },
+                                    checked_at: Local::now().to_rfc3339(),
+                                };
+                                if let Some(existing) = registry.models.iter_mut().find(|entry| entry.provider_id == provider_id && entry.model == *model_id) {
+                                    *existing = record;
+                                } else {
+                                    registry.models.push(record);
+                                }
+                            }
+                            let _ = save_capability_registry(&registry);
 
                             if !model_ids.is_empty() {
                                 (true, Ok(model_ids))

@@ -1,6 +1,6 @@
 [package]
 name = "XiaoAI"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Assaqib <264941327+tsaQB@users.noreply.github.com>"]
 description = "XiaoAI - Telegram Bot API 10.2 Full Live Execution Timeline AI Bot in Rust"

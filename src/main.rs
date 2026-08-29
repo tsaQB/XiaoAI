@@ -895,6 +895,26 @@ async fn run_cli_provider_menu(ai_service: &AIChatService, action: Option<&str>)
     }
 }
 
+async fn run_cli_model_probe(ai_service: &AIChatService) {
+    let providers = ai_service.get_user_providers(0).await;
+    if providers.is_empty() {
+        println!("No AI providers configured.");
+        return;
+    }
+    for provider in providers {
+        let (ok, result) = ai_service.fetch_models_from_endpoint(&provider.endpoint, &provider.api_key).await;
+        match result {
+            Ok(models) if ok => println!("{}: recorded {} model capabilities", provider.name, models.len()),
+            Ok(_) | Err(_) => println!("{}: capability probe failed", provider.name),
+        }
+    }
+    let registry = ai::service::load_capability_registry();
+    println!("Capability registry: {} model(s)", registry.models.len());
+    for record in registry.models {
+        println!("- {} / {}: image={:?}, audio={:?}, video={:?}, context={:?} [{}]", record.provider_name, record.model, record.supports_image, record.supports_audio, record.supports_video, record.context_window, record.source);
+    }
+}
+
 async fn run_cli_model_picker(ai_service: &AIChatService, initial_filter: Option<&str>) {
     load_environment();
     let mut store = load_provider_store();
@@ -1797,15 +1817,8 @@ async fn send_welcome(
                     Silakan jalankan perintah <code>xiao provider add</code> di terminal untuk menghubungkan provider AI.";
         let _ = bot.send_message(chat_id, text, Some("HTML"), Some(get_main_menu_keyboard()), None, None).await;
     } else {
-        let active_p = ai_service.get_active_provider(user_id).await;
-        let prov_name = active_p.as_ref().map(|p| p.name.as_str()).unwrap_or("Custom Provider");
-        let model_name = active_p.as_ref().map(|p| p.active_model.as_str()).unwrap_or("gpt-4o");
-
-        let text = format!(
-            "👋 <b>Hi, how can I help you?</b>\n\n\
-             ⚡ Provider: <b>{prov_name}</b> | Model: <code>{model_name}</code>\n\
-             <i>Silakan ketik pertanyaan Anda langsung atau gunakan tombol menu di bawah:</i>"
-        );
+        let text = "👋 <b>Hi, how can I help you?</b>\n\n\
+                    <i>Silakan ketik pertanyaan Anda langsung atau gunakan tombol menu di bawah:</i>";
         let _ = bot.send_message(chat_id, &text, Some("HTML"), Some(get_main_menu_keyboard()), None, None).await;
     }
 }
@@ -2742,7 +2755,9 @@ async fn main() {
         "model" => {
             let is_pick = args.get(2).map(|s| s.as_str()) == Some("pick")
                 || args.get(3).map(|s| s.as_str()) == Some("pick");
-            if is_pick {
+            if args.get(2).map(|s| s.as_str()) == Some("probe") {
+                run_cli_model_probe(&ai_service).await;
+            } else if is_pick {
                 run_cli_telegram_pick(&ai_service).await;
             } else {
                 let filter_arg = args.get(2).map(|s| s.as_str());
