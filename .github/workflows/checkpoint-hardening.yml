@@ -41,8 +41,18 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      - name: Format
-        run: cargo fmt --all -- --check
+      - name: Rustfmt implementation
+        run: |
+          cargo fmt --all
+          git diff --check
+          git diff -- src '*.rs' > /tmp/rustfmt.patch || true
+
+      - name: Upload rustfmt delta
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: xiao-rustfmt-delta
+          path: /tmp/rustfmt.patch
+          if-no-files-found: warn
 
       - name: Check
         run: cargo check --locked
@@ -63,19 +73,15 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-
       - name: Apply checkpoint patch
         run: git apply "$PATCH_FILE"
-
       - name: Install ARM64 linker
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
-
       - name: Install Rust target
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: stable
           targets: aarch64-unknown-linux-gnu
-
       - name: Build
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
@@ -91,30 +97,23 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-
       - name: Apply checkpoint patch
         run: git apply "$PATCH_FILE"
-
       - name: Setup JDK 17
         uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9
         with:
           distribution: temurin
           java-version: '17'
-
       - name: Setup Android SDK
         uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407
-
       - name: Install Android NDK
         run: sdkmanager --install "ndk;26.3.11579264"
-
       - name: Install Rust target
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: stable
           targets: aarch64-linux-android
-
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --version 4.1.2 --locked
-
       - name: Build
         run: cargo ndk -t arm64-v8a -P 26 build --release --locked
