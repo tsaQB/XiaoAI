@@ -104,14 +104,14 @@ index 08f1080..7cdbd93 100644
 +- Add context-aware history budgeting and transient provider retry/backoff with `Retry-After` support.
 +- Add tested SSE decoding for CRLF, split chunks, comments, multi-line data, and `[DONE]`.
 diff --git a/Cargo.toml b/Cargo.toml
-index 29682cb..4516035 100644
+index 29682cb..21b5062 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -28,6 +28,8 @@ html-escape = "0.2"
  crossterm = "0.27"
  url = "2.5"
  rusqlite = { version = "0.32", features = ["bundled"] }
-+pdf-extract = "0.12"
++lopdf = { version = "0.44", default-features = false }
 +zip = { version = "8.6", default-features = false, features = ["deflate"] }
  
  [profile.release]
@@ -1266,7 +1266,7 @@ index 0000000..01f5abf
 +
 +}
 diff --git a/src/ai/service.rs b/src/ai/service.rs
-index ac00856..7d45dd1 100644
+index ac00856..d9ca655 100644
 --- a/src/ai/service.rs
 +++ b/src/ai/service.rs
 @@ -4,7 +4,6 @@ use chrono::Local;
@@ -2089,7 +2089,7 @@ index ac00856..7d45dd1 100644
          let client = Client::builder()
              .timeout(Duration::from_secs(90))
              .build()
-@@ -806,502 +162,165 @@ impl AIChatService {
+@@ -806,16 +162,16 @@ impl AIChatService {
  
          Self {
              client,
@@ -2104,14 +2104,12 @@ index ac00856..7d45dd1 100644
              user_session_msg_id: Arc::new(RwLock::new(HashMap::new())),
 -            user_providers: Arc::new(RwLock::new(HashMap::new())),
 -            active_provider_id: Arc::new(RwLock::new(HashMap::new())),
-+            pub(super) provider_store: Arc::new(RwLock::new(provider_store)),
-+            pub(super) capability_registry: Arc::new(RwLock::new(capability_registry)),
++            provider_store: Arc::new(RwLock::new(provider_store)),
++            capability_registry: Arc::new(RwLock::new(capability_registry)),
              user_wizard_state: Arc::new(RwLock::new(HashMap::new())),
--            model_metadata: Arc::new(RwLock::new(HashMap::new())),
-+            pub(super) model_metadata: Arc::new(RwLock::new(HashMap::new())),
+             model_metadata: Arc::new(RwLock::new(HashMap::new())),
          }
-     }
- 
+@@ -824,484 +180,147 @@ impl AIChatService {
      // ==========================================
      // Provider Management
      // ==========================================
@@ -6036,10 +6034,10 @@ index 0000000..8df5608
 +
 diff --git a/src/document.rs b/src/document.rs
 new file mode 100644
-index 0000000..48510ff
+index 0000000..aba338a
 --- /dev/null
 +++ b/src/document.rs
-@@ -0,0 +1,356 @@
+@@ -0,0 +1,366 @@
 +use regex::Regex;
 +use std::io::{Cursor, Read};
 +use std::path::{Path, PathBuf};
@@ -6050,6 +6048,7 @@ index 0000000..48510ff
 +const MAX_SCANNED_PDF_PAGES: usize = 6;
 +const MAX_RENDERED_PDF_BYTES: usize = 12 * 1024 * 1024;
 +const MAX_ZIP_XML_BYTES: u64 = 8 * 1024 * 1024;
++const MAX_PDF_STREAM_BYTES: usize = 8 * 1024 * 1024;
 +const MAX_XLSX_WORKSHEETS: usize = 64;
 +
 +#[derive(Debug, Default)]
@@ -6100,10 +6099,19 @@ index 0000000..48510ff
 +
 +    if mime == "application/pdf" || name_lower.ends_with(".pdf") {
 +        let pdf_bytes = data.clone();
-+        let extracted = tokio::task::spawn_blocking(move || pdf_extract::extract_text_from_mem(&pdf_bytes))
-+            .await
-+            .map_err(|err| format!("Task extractor PDF gagal: {err}"))?
++        let extracted = tokio::task::spawn_blocking(move || -> Result<String, String> {
++            let document = lopdf::Document::load_mem_with_options(
++                &pdf_bytes,
++                lopdf::LoadOptions::with_max_decompressed_size(MAX_PDF_STREAM_BYTES),
++            )
 +            .map_err(|err| format!("PDF tidak dapat dibaca: {err}"))?;
++            let pages: Vec<u32> = document.get_pages().keys().copied().collect();
++            document
++                .extract_text_with_limit(&pages, MAX_PDF_STREAM_BYTES)
++                .map_err(|err| format!("Teks PDF tidak dapat diekstrak: {err}"))
++        })
++        .await
++        .map_err(|err| format!("Task extractor PDF gagal: {err}"))??;
 +        let cleaned = normalize_extracted_text(&extracted);
 +        if cleaned.chars().filter(|c| !c.is_whitespace()).count() >= 24 {
 +            return Ok(ExtractedDocument {
