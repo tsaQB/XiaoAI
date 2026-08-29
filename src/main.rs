@@ -446,8 +446,8 @@ async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Option<String>
     store.active_id = Some(provider_id);
     let _ = save_provider_store(&store);
 
-    let _ = save_env_kv("CLIPROXY_ENDPOINT", &endpoint);
-    let _ = save_env_kv("CLIPROXY_API_KEY", &api_key);
+    let _ = save_env_kv("AI_ENDPOINT", &endpoint);
+    let _ = save_env_kv("AI_API_KEY", &api_key);
     let _ = save_env_kv("AI_MODEL", &active_model);
 
     println!("\x1b[1;32m[OK] AI Provider '{}' configured with model '{}'!\x1b[0m", clean_alias, active_model);
@@ -615,8 +615,8 @@ async fn run_cli_provider_add(ai_service: &AIChatService) {
     store.active_id = Some(provider_id);
     let _ = save_provider_store(&store);
 
-    let _ = save_env_kv("CLIPROXY_ENDPOINT", &endpoint);
-    let _ = save_env_kv("CLIPROXY_API_KEY", &api_key);
+    let _ = save_env_kv("AI_ENDPOINT", &endpoint);
+    let _ = save_env_kv("AI_API_KEY", &api_key);
     let _ = save_env_kv("AI_MODEL", &active_model);
 
     println!("\n\x1b[1;32m[SUCCESS] Provider '{}' added and activated!\x1b[0m", clean_alias);
@@ -657,13 +657,13 @@ async fn run_cli_provider_remove(_ai_service: &AIChatService) {
         if store.active_id.as_deref() == Some(removed.id.as_str()) {
             if let Some(first_p) = store.providers.first() {
                 store.active_id = Some(first_p.id.clone());
-                let _ = save_env_kv("CLIPROXY_ENDPOINT", &first_p.endpoint);
-                let _ = save_env_kv("CLIPROXY_API_KEY", &first_p.api_key);
+                let _ = save_env_kv("AI_ENDPOINT", &first_p.endpoint);
+                let _ = save_env_kv("AI_API_KEY", &first_p.api_key);
                 let _ = save_env_kv("AI_MODEL", &first_p.active_model);
             } else {
                 store.active_id = None;
-                let _ = save_env_kv("CLIPROXY_ENDPOINT", "");
-                let _ = save_env_kv("CLIPROXY_API_KEY", "");
+                let _ = save_env_kv("AI_ENDPOINT", "");
+                let _ = save_env_kv("AI_API_KEY", "");
                 let _ = save_env_kv("AI_MODEL", "");
             }
         }
@@ -829,8 +829,8 @@ async fn run_cli_provider_menu(ai_service: &AIChatService, action: Option<&str>)
                     let mut updated_store = load_provider_store();
                     updated_store.active_id = Some(target_prov.id.clone());
                     let _ = save_provider_store(&updated_store);
-                    let _ = save_env_kv("CLIPROXY_ENDPOINT", &target_prov.endpoint);
-                    let _ = save_env_kv("CLIPROXY_API_KEY", &target_prov.api_key);
+                    let _ = save_env_kv("AI_ENDPOINT", &target_prov.endpoint);
+                    let _ = save_env_kv("AI_API_KEY", &target_prov.api_key);
                     let _ = save_env_kv("AI_MODEL", &target_prov.active_model);
                     println!("\n\x1b[1;32m[OK] Provider '{}' is now active!\x1b[0m\n", target_prov.name);
                 }
@@ -869,13 +869,13 @@ async fn run_cli_provider_menu(ai_service: &AIChatService, action: Option<&str>)
                         if updated_store.active_id.as_deref() == Some(removed.id.as_str()) {
                             if let Some(first_p) = updated_store.providers.first() {
                                 updated_store.active_id = Some(first_p.id.clone());
-                                let _ = save_env_kv("CLIPROXY_ENDPOINT", &first_p.endpoint);
-                                let _ = save_env_kv("CLIPROXY_API_KEY", &first_p.api_key);
+                                let _ = save_env_kv("AI_ENDPOINT", &first_p.endpoint);
+                                let _ = save_env_kv("AI_API_KEY", &first_p.api_key);
                                 let _ = save_env_kv("AI_MODEL", &first_p.active_model);
                             } else {
                                 updated_store.active_id = None;
-                                let _ = save_env_kv("CLIPROXY_ENDPOINT", "");
-                                let _ = save_env_kv("CLIPROXY_API_KEY", "");
+                                let _ = save_env_kv("AI_ENDPOINT", "");
+                                let _ = save_env_kv("AI_API_KEY", "");
                                 let _ = save_env_kv("AI_MODEL", "");
                             }
                         }
@@ -970,8 +970,8 @@ async fn run_cli_model_picker(ai_service: &AIChatService, initial_filter: Option
             updated_store.active_id = Some(prov_id.clone());
             if let Some(p) = updated_store.providers.iter_mut().find(|p| &p.id == prov_id) {
                 p.active_model = chosen_model.clone();
-                let _ = save_env_kv("CLIPROXY_ENDPOINT", &p.endpoint);
-                let _ = save_env_kv("CLIPROXY_API_KEY", &p.api_key);
+                let _ = save_env_kv("AI_ENDPOINT", &p.endpoint);
+                let _ = save_env_kv("AI_API_KEY", &p.api_key);
                 let _ = save_env_kv("AI_MODEL", chosen_model);
             }
             let _ = save_provider_store(&updated_store);
@@ -989,8 +989,8 @@ async fn run_cli_status(ai_service: &AIChatService) {
     println!("\n\x1b[1;36m== XiaoAI System Status ==\x1b[0m");
 
     let token = env::var("BOT_TOKEN").unwrap_or_default();
-    let endpoint = env::var("CLIPROXY_ENDPOINT").unwrap_or_else(|_| "".to_string());
-    let api_key = env::var("CLIPROXY_API_KEY").unwrap_or_else(|_| "none".to_string());
+    let endpoint = env::var("AI_ENDPOINT").unwrap_or_else(|_| "".to_string());
+    let api_key = env::var("AI_API_KEY").unwrap_or_else(|_| "none".to_string());
     let model = env::var("AI_MODEL").unwrap_or_else(|_| "".to_string());
 
     println!("\x1b[1;37m1. TELEGRAM BOT API\x1b[0m");

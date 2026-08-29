@@ -449,7 +449,7 @@ impl AIChatService {
             store.active_id = Some(provider_id.to_string());
             let _ = save_provider_store(&store);
             let _ = std::fs::write(".env", format!(
-                "BOT_TOKEN={}\nCLIPROXY_ENDPOINT={}\nCLIPROXY_API_KEY={}\nAI_MODEL={}\n",
+                "BOT_TOKEN={}\nAI_ENDPOINT={}\nAI_API_KEY={}\nAI_MODEL={}\n",
                 std::env::var("BOT_TOKEN").unwrap_or_default(),
                 p.endpoint,
                 p.api_key,
@@ -589,7 +589,7 @@ impl AIChatService {
             store.active_id = Some(provider_id.to_string());
             let _ = save_provider_store(&store);
             let _ = std::fs::write(".env", format!(
-                "BOT_TOKEN={}\nCLIPROXY_ENDPOINT={}\nCLIPROXY_API_KEY={}\nAI_MODEL={}\n",
+                "BOT_TOKEN={}\nAI_ENDPOINT={}\nAI_API_KEY={}\nAI_MODEL={}\n",
                 std::env::var("BOT_TOKEN").unwrap_or_default(),
                 matched_endpoint,
                 matched_key,

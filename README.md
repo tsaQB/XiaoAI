@@ -84,6 +84,19 @@ Workflow GitHub Actions `.github/workflows/build.yml` membuat artifact release u
 
 Workflow berjalan saat push, pull request, atau dapat dijalankan manual dari tab **Actions**. Artifact tersedia pada halaman workflow run yang selesai.
 
+## Konfigurasi Environment
+
+Salin `.env.example` menjadi `.env`, lalu isi:
+
+```dotenv
+BOT_TOKEN=123456:telegram-bot-token
+AI_ENDPOINT=https://provider.example/v1
+AI_API_KEY=provider-api-key
+AI_MODEL=model-name
+```
+
+`AI_ENDPOINT` dan `AI_API_KEY` bersifat generik untuk semua provider yang kompatibel dengan OpenAI; tidak ada konfigurasi yang dikunci ke provider tertentu.
+
 ---
 
 ## 💬 Daftar Perintah Bot Telegram
