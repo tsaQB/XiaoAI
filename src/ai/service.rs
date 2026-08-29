@@ -10,6 +10,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
+use rusqlite::{params, Connection};
 use tracing::{error, warn};
 
 use crate::timeline::{
@@ -73,6 +74,62 @@ pub struct ChatSession {
     pub name: String,
     pub messages: Vec<ChatMessage>,
     pub created_at: String,
+}
+
+fn session_db_path() -> std::path::PathBuf {
+    let base = std::env::var("HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from("."));
+    base.join(".local/share/xiaoai/xiaoai.db")
+}
+
+fn open_session_db() -> rusqlite::Result<Connection> {
+    let path = session_db_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let conn = Connection::open(path)?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
+        CREATE TABLE IF NOT EXISTS sessions (
+            user_id INTEGER NOT NULL, session_id INTEGER NOT NULL, name TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(user_id, session_id)
+        );
+        CREATE TABLE IF NOT EXISTS messages (
+            user_id INTEGER NOT NULL, session_id INTEGER NOT NULL, role TEXT NOT NULL,
+            content TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS active_sessions (
+            user_id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL
+        );")?;
+    Ok(conn)
+}
+
+fn load_sessions_db(user_id: i64) -> rusqlite::Result<Vec<ChatSession>> {
+    let conn = open_session_db()?;
+    let mut stmt = conn.prepare("SELECT session_id,name,created_at FROM sessions WHERE user_id=?1 ORDER BY session_id")?;
+    let mut rows = stmt.query(params![user_id])?;
+    let mut sessions = Vec::new();
+    while let Some(row) = rows.next()? {
+        let id: usize = row.get(0)?;
+        let mut session = ChatSession { id, name: row.get(1)?, messages: Vec::new(), created_at: row.get(2)? };
+        let mut msg_stmt = conn.prepare("SELECT role,content FROM messages WHERE user_id=?1 AND session_id=?2 ORDER BY rowid")?;
+        let mut msg_rows = msg_stmt.query(params![user_id, id])?;
+        while let Some(msg) = msg_rows.next()? {
+            let content: String = msg.get(1)?;
+            session.messages.push(ChatMessage { role: msg.get(0)?, content: serde_json::from_str(&content).unwrap_or(Value::String(content)) });
+        }
+        sessions.push(session);
+    }
+    Ok(sessions)
+}
+
+fn save_session_db(user_id: i64, session: &ChatSession) -> rusqlite::Result<()> {
+    let conn = open_session_db()?;
+    let now = Local::now().to_rfc3339();
+    conn.execute("INSERT INTO sessions(user_id,session_id,name,created_at,updated_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(user_id,session_id) DO UPDATE SET name=excluded.name,updated_at=excluded.updated_at", params![user_id, session.id, session.name, session.created_at, now])?;
+    conn.execute("DELETE FROM messages WHERE user_id=?1 AND session_id=?2", params![user_id, session.id])?;
+    for message in &session.messages {
+        conn.execute("INSERT INTO messages(user_id,session_id,role,content,created_at) VALUES(?1,?2,?3,?4,?5)", params![user_id, session.id, message.role, serde_json::to_string(&message.content).unwrap_or_default(), now])?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -796,13 +853,20 @@ impl AIChatService {
     pub async fn get_sessions(&self, user_id: i64) -> Vec<ChatSession> {
         let mut sessions_map = self.user_sessions.write().await;
         let list = sessions_map.entry(user_id).or_insert_with(|| {
+            if let Ok(existing) = load_sessions_db(user_id) {
+                if !existing.is_empty() {
+                    return existing;
+                }
+            }
             let now_str = Local::now().format("%d %b %H:%M").to_string();
-            vec![ChatSession {
+            let session = ChatSession {
                 id: 1,
                 name: format!("Session {now_str}"),
                 messages: Vec::new(),
                 created_at: now_str,
-            }]
+            };
+            let _ = save_session_db(user_id, &session);
+            vec![session]
         });
         list.clone()
     }
@@ -810,7 +874,13 @@ impl AIChatService {
     pub async fn get_active_session_index(&self, user_id: i64) -> usize {
         let _ = self.get_sessions(user_id).await;
         let mut active_map = self.active_session_idx.write().await;
-        let idx = *active_map.entry(user_id).or_insert(0);
+        let idx = if let Some(value) = active_map.get(&user_id).copied() {
+            value
+        } else {
+            let stored = open_session_db().ok().and_then(|conn| conn.query_row("SELECT session_id FROM active_sessions WHERE user_id=?1", params![user_id], |row| row.get::<_, usize>(0)).ok()).unwrap_or(0);
+            active_map.insert(user_id, stored);
+            stored
+        };
 
         let sessions_map = self.user_sessions.read().await;
         if let Some(list) = sessions_map.get(&user_id) {
@@ -830,6 +900,7 @@ impl AIChatService {
     }
 
     pub async fn create_new_session(&self, user_id: i64, custom_name: Option<&str>) -> ChatSession {
+        let _ = self.get_sessions(user_id).await;
         let mut sessions_map = self.user_sessions.write().await;
         let list = sessions_map.entry(user_id).or_default();
         let now_str = Local::now().format("%d %b %H:%M").to_string();
@@ -845,11 +916,15 @@ impl AIChatService {
             created_at: now_str,
         };
         list.push(session.clone());
+        let _ = save_session_db(user_id, &session);
 
         let new_idx = list.len() - 1;
         drop(sessions_map);
 
         self.active_session_idx.write().await.insert(user_id, new_idx);
+        if let Ok(conn) = open_session_db() {
+            let _ = conn.execute("INSERT INTO active_sessions(user_id,session_id) VALUES(?1,?2) ON CONFLICT(user_id) DO UPDATE SET session_id=excluded.session_id", params![user_id, new_idx]);
+        }
         session
     }
 
@@ -857,6 +932,9 @@ impl AIChatService {
         let sessions = self.get_sessions(user_id).await;
         if index < sessions.len() {
             self.active_session_idx.write().await.insert(user_id, index);
+            if let Ok(conn) = open_session_db() {
+                let _ = conn.execute("INSERT INTO active_sessions(user_id,session_id) VALUES(?1,?2) ON CONFLICT(user_id) DO UPDATE SET session_id=excluded.session_id", params![user_id, index]);
+            }
             return true;
         }
         false
@@ -875,6 +953,7 @@ impl AIChatService {
                         messages: Vec::new(),
                         created_at: now_str,
                     });
+                    let _ = save_session_db(user_id, &list[0]);
                     self.active_session_idx.write().await.insert(user_id, 0);
                 } else {
                     let mut active_map = self.active_session_idx.write().await;
@@ -884,6 +963,9 @@ impl AIChatService {
                     } else if curr == index {
                         active_map.insert(user_id, index.saturating_sub(1));
                     }
+                }
+                for session in list.iter() {
+                    let _ = save_session_db(user_id, session);
                 }
                 return true;
             }
@@ -897,6 +979,7 @@ impl AIChatService {
             if let Some(sess) = list.get_mut(index) {
                 let trimmed = new_name.trim();
                 sess.name = trimmed[..trimmed.len().min(60)].to_string();
+                let _ = save_session_db(user_id, sess);
                 return true;
             }
         }
@@ -909,6 +992,7 @@ impl AIChatService {
         if let Some(list) = sessions_map.get_mut(&user_id) {
             if let Some(sess) = list.get_mut(idx) {
                 sess.messages.clear();
+                let _ = save_session_db(user_id, sess);
             }
         }
     }
@@ -1434,6 +1518,7 @@ impl AIChatService {
                     role: "assistant".to_string(),
                     content: Value::String(answer_text.clone()),
                 });
+                let _ = save_session_db(user_id, sess);
             }
         }
 

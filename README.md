@@ -11,6 +11,7 @@ XiaoAI adalah bot Telegram asynchronous berbasis Rust untuk endpoint AI yang kom
 - Provider OpenAI-compatible dikelola dari CLI dan katalog model dapat diambil dari endpoint `/models`.
 - Whitelist model Telegram dikelola dari `xiao model pick`; maksimal 10 model, dibedakan berdasarkan provider/alias, dan hanya daftar tersebut yang muncul pada menu model Telegram.
 - Registry capability model disimpan terpisah di `~/.xiao_model_capabilities.json`; jalankan `xiao model probe` untuk menyegarkan metadata capability dari setiap endpoint.
+- Session dan message history disimpan persisten di `~/.local/share/xiaoai/xiaoai.db` menggunakan SQLite, sehingga konteks tetap tersedia setelah restart.
 - Pesan suara ditranskripsi melalui endpoint `/audio/transcriptions` bila provider mendukungnya. Gambar dikirim sebagai data URL ke input vision.
 - Video diteruskan sebagai data URL `video/*` ke input `image_url`. Ini hanya bekerja pada endpoint yang secara eksplisit menerima video pada format tersebut; banyak endpoint OpenAI-compatible menolaknya.
 - Pembuatan gambar memakai endpoint/provider yang tersedia pada konfigurasi.

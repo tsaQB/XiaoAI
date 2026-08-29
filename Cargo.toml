@@ -1,6 +1,6 @@
 [package]
 name = "XiaoAI"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["Assaqib <264941327+tsaQB@users.noreply.github.com>"]
 description = "XiaoAI - Telegram Bot API 10.2 Full Live Execution Timeline AI Bot in Rust"
@@ -27,6 +27,7 @@ urlencoding = "2.1"
 html-escape = "0.2"
 crossterm = "0.27"
 url = "2.5"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [profile.release]
 opt-level = 3
