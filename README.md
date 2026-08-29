@@ -75,6 +75,15 @@ chmod +x $PREFIX/bin/xiao
 
 Setelah disalin ke `$PREFIX/bin/` (atau `/usr/local/bin/`), Anda dapat langsung menjalankan perintah `xiao` dari folder mana pun tanpa path lokal.
 
+## Build Otomatis
+
+Workflow GitHub Actions `.github/workflows/build.yml` membuat artifact release untuk:
+
+- `xiao-linux-arm64-armbian`: Linux ARM64 GNU untuk Armbian/STB ARM64.
+- `xiao-android-arm64`: Android ARM64 untuk Termux.
+
+Workflow berjalan saat push, pull request, atau dapat dijalankan manual dari tab **Actions**. Artifact tersedia pada halaman workflow run yang selesai.
+
 ---
 
 ## 💬 Daftar Perintah Bot Telegram
