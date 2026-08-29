@@ -16,7 +16,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   PATCH_FILE: .checkpoint/XiaoAI-hardening-v0.2.0.patch
-  DELTA_FILE: .checkpoint/XiaoAI-final-p1-delta.patch\n  HOTFIX_FILE: .checkpoint/XiaoAI-p1-hotfix.patch
+  DELTA_FILE: .checkpoint/XiaoAI-final-p1-delta.patch
+  HOTFIX_FILE: .checkpoint/XiaoAI-p1-hotfix.patch
 
 jobs:
   quality:
@@ -34,7 +35,8 @@ jobs:
           git apply --check "$PATCH_FILE"
           git apply "$PATCH_FILE"
           git apply --check "$DELTA_FILE"
-          git apply "$DELTA_FILE"\n          git apply "$HOTFIX_FILE"
+          git apply "$DELTA_FILE"
+          git apply "$HOTFIX_FILE"
           git diff --check
           test "$(grep -E '^version = "0\.2\.0"$' Cargo.toml | wc -l)" -eq 1
 
@@ -88,7 +90,8 @@ jobs:
       - name: Apply checkpoint patches
         run: |
           git apply "$PATCH_FILE"
-          git apply "$DELTA_FILE"\n          git apply "$HOTFIX_FILE"
+          git apply "$DELTA_FILE"
+          git apply "$HOTFIX_FILE"
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
@@ -113,7 +116,8 @@ jobs:
       - name: Apply checkpoint patches
         run: |
           git apply "$PATCH_FILE"
-          git apply "$DELTA_FILE"\n          git apply "$HOTFIX_FILE"
+          git apply "$DELTA_FILE"
+          git apply "$HOTFIX_FILE"
       - name: Install ARM64 linker
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
       - name: Install Rust target
@@ -141,7 +145,8 @@ jobs:
       - name: Apply checkpoint patches
         run: |
           git apply "$PATCH_FILE"
-          git apply "$DELTA_FILE"\n          git apply "$HOTFIX_FILE"
+          git apply "$DELTA_FILE"
+          git apply "$HOTFIX_FILE"
       - name: Setup JDK 17
         uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9
         with:
