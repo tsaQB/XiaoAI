@@ -1,15 +1,33 @@
 #![allow(dead_code)]
 
-use std::time::Duration;
 use reqwest::multipart::{Form, Part};
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::time::Duration;
 use tracing::{error, info, warn};
 
 use super::models::{
-    ApiResponse, BotCommand, FileInfo, InputRichMessage,
-    RichBlock, RichBlockTableCell, Update, User,
+    ApiResponse, BotCommand, EphemeralMessageParameters, FileInfo, InputRichMessage, RichBlock,
+    RichBlockTableCell, Update, User,
 };
+
+const MAX_TELEGRAM_DOWNLOAD_BYTES: usize = 20 * 1024 * 1024;
+
+fn reqwest_error_kind(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connection failure"
+    } else if error.is_request() {
+        "request failure"
+    } else if error.is_body() {
+        "body failure"
+    } else if error.is_decode() {
+        "decode failure"
+    } else {
+        "transport failure"
+    }
+}
 
 #[derive(Clone)]
 pub struct TelegramBotClient {
@@ -45,20 +63,29 @@ impl TelegramBotClient {
                 let status = resp.status();
                 match resp.json::<Value>().await {
                     Ok(json_res) => {
-                        if !json_res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        if !json_res
+                            .get("ok")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                        {
                             warn!("Telegram API error [{method}] status {status}: {json_res}");
                         }
                         Ok(json_res)
                     }
                     Err(e) => {
-                        let err_msg = format!("Failed to parse response JSON for {method}: {e}");
+                        let err_msg = format!(
+                            "Failed to parse response JSON for {method}: {}",
+                            reqwest_error_kind(&e)
+                        );
                         error!("{err_msg}");
                         Err(err_msg)
                     }
                 }
             }
             Err(e) => {
-                let err_msg = format!("HTTP error for {method}: {e}");
+                // Do not format reqwest::Error directly here: it can contain the full
+                // Telegram URL, and Telegram URLs contain the bot token.
+                let err_msg = format!("HTTP error for {method}: {}", reqwest_error_kind(&e));
                 error!("{err_msg}");
                 Err(err_msg)
             }
@@ -75,7 +102,9 @@ impl TelegramBotClient {
     }
 
     pub async fn get_file(&self, file_id: &str) -> Result<ApiResponse<FileInfo>, String> {
-        let val = self.post_json("getFile", json!({ "file_id": file_id })).await?;
+        let val = self
+            .post_json("getFile", json!({ "file_id": file_id }))
+            .await?;
         serde_json::from_value(val).map_err(|e| e.to_string())
     }
 
@@ -85,8 +114,22 @@ impl TelegramBotClient {
             return None;
         }
         let info = file_res.result?;
+        if info
+            .file_size
+            .and_then(|size| usize::try_from(size).ok())
+            .is_some_and(|size| size > MAX_TELEGRAM_DOWNLOAD_BYTES)
+        {
+            warn!(
+                "Telegram file rejected before download: size exceeds Xiao limit of {} bytes",
+                MAX_TELEGRAM_DOWNLOAD_BYTES
+            );
+            return None;
+        }
         let file_path = info.file_path?;
-        let file_url = format!("https://api.telegram.org/file/bot{}/{}", self.token, file_path);
+        let file_url = format!(
+            "https://api.telegram.org/file/bot{}/{}",
+            self.token, file_path
+        );
 
         let dl_client = Client::builder()
             .timeout(Duration::from_secs(180))
@@ -100,9 +143,20 @@ impl TelegramBotClient {
                 let mut bytes_buf = Vec::new();
                 while let Some(chunk_res) = stream.next().await {
                     match chunk_res {
-                        Ok(chunk) => bytes_buf.extend_from_slice(&chunk),
+                        Ok(chunk) => {
+                            if bytes_buf.len().saturating_add(chunk.len())
+                                > MAX_TELEGRAM_DOWNLOAD_BYTES
+                            {
+                                warn!(
+                                    "Telegram file download aborted: streamed body exceeded Xiao limit of {} bytes",
+                                    MAX_TELEGRAM_DOWNLOAD_BYTES
+                                );
+                                return None;
+                            }
+                            bytes_buf.extend_from_slice(&chunk)
+                        }
                         Err(e) => {
-                            error!("Streaming error while downloading from {file_url}: {e}");
+                            error!("Telegram file streaming error: {}", reqwest_error_kind(&e));
                             return None;
                         }
                     }
@@ -110,11 +164,14 @@ impl TelegramBotClient {
                 Some((bytes_buf, file_path))
             }
             Ok(resp) => {
-                error!("Download failed with status {}: {}", resp.status(), file_url);
+                error!(
+                    "Telegram file download failed with status {}",
+                    resp.status()
+                );
                 None
             }
             Err(e) => {
-                error!("HTTP download error for {file_url}: {e}");
+                error!("Telegram file download error: {}", reqwest_error_kind(&e));
                 None
             }
         }
@@ -151,7 +208,7 @@ impl TelegramBotClient {
         receiver_user_id: Option<i64>,
         reply_to_message_id: Option<i64>,
     ) -> Result<Value, String> {
-        if text.len() > 4000 {
+        if text.chars().count() > 4000 {
             let chunks = self.split_text_chunks(text, 3800);
             let mut last_res = json!({ "ok": true });
             let total = chunks.len();
@@ -172,7 +229,13 @@ impl TelegramBotClient {
                     }
                 }
                 if let Some(recv) = receiver_user_id {
-                    payload["receiver_user_id"] = json!(recv);
+                    payload["ephemeral_message_parameters"] =
+                        serde_json::to_value(EphemeralMessageParameters {
+                            receiver_user_id: recv,
+                            callback_query_id: None,
+                            replace_callback_query_message: None,
+                        })
+                        .unwrap_or(json!({}));
                 }
                 if is_first {
                     if let Some(rep) = reply_to_message_id {
@@ -195,7 +258,13 @@ impl TelegramBotClient {
             payload["reply_markup"] = rm;
         }
         if let Some(recv) = receiver_user_id {
-            payload["receiver_user_id"] = json!(recv);
+            payload["ephemeral_message_parameters"] =
+                serde_json::to_value(EphemeralMessageParameters {
+                    receiver_user_id: recv,
+                    callback_query_id: None,
+                    replace_callback_query_message: None,
+                })
+                .unwrap_or(json!({}));
         }
         if let Some(rep) = reply_to_message_id {
             payload["reply_to_message_id"] = json!(rep);
@@ -237,8 +306,16 @@ impl TelegramBotClient {
         }
 
         match self.client.post(&url).multipart(form).send().await {
-            Ok(resp) => resp.json::<Value>().await.map_err(|e| e.to_string()),
-            Err(e) => Err(format!("sendPhoto multipart error: {e}")),
+            Ok(resp) => resp.json::<Value>().await.map_err(|e| {
+                format!(
+                    "sendPhoto response decode error: {}",
+                    reqwest_error_kind(&e)
+                )
+            }),
+            Err(e) => Err(format!(
+                "sendPhoto multipart error: {}",
+                reqwest_error_kind(&e)
+            )),
         }
     }
 
@@ -342,7 +419,7 @@ impl TelegramBotClient {
     }
 
     // ==========================================
-    // Telegram Bot API 10.2: Rich Message & Draft Methods
+    // Telegram Bot API 10.3: Rich Message & Draft Methods
     // ==========================================
 
     pub async fn send_rich_message_draft(
@@ -371,13 +448,18 @@ impl TelegramBotClient {
             }
             // Fallback to sendMessageDraft
             let mut fallback_text = "Thinking...".to_string();
-            if let Some(first_b) = rich_message.blocks.first() {
-                if let RichBlock::Thinking { ref text, .. } = first_b {
-                    fallback_text = text.clone();
-                }
+            if let Some(RichBlock::Thinking { text }) = rich_message.blocks.first() {
+                fallback_text = text.as_str().unwrap_or("Thinking...").to_string();
             }
             return self
-                .send_message_draft(chat_id, draft_id, &fallback_text, Some("HTML"), can_stop, keep_on_stop)
+                .send_message_draft(
+                    chat_id,
+                    draft_id,
+                    &fallback_text,
+                    Some("HTML"),
+                    can_stop,
+                    keep_on_stop,
+                )
                 .await;
         }
 
@@ -422,7 +504,13 @@ impl TelegramBotClient {
             payload["reply_markup"] = rm.clone();
         }
         if let Some(recv) = receiver_user_id {
-            payload["receiver_user_id"] = json!(recv);
+            payload["ephemeral_message_parameters"] =
+                serde_json::to_value(EphemeralMessageParameters {
+                    receiver_user_id: recv,
+                    callback_query_id: None,
+                    replace_callback_query_message: None,
+                })
+                .unwrap_or(json!({}));
         }
 
         let res = self.post_json("sendRichMessage", payload).await?;
@@ -463,57 +551,61 @@ impl TelegramBotClient {
     // HTML Rendering Helpers & Chunking
     // ==========================================
 
-    pub fn split_text_chunks(&self, text: &str, max_chunk_len: usize) -> Vec<String> {
-        if text.len() <= max_chunk_len {
-            return if text.is_empty() { vec![] } else { vec![text.to_string()] };
+    pub fn split_text_chunks(&self, text: &str, max_chunk_chars: usize) -> Vec<String> {
+        if text.is_empty() || max_chunk_chars == 0 {
+            return Vec::new();
+        }
+
+        let chars: Vec<char> = text.chars().collect();
+        if chars.len() <= max_chunk_chars {
+            return vec![text.to_string()];
         }
 
         let mut chunks = Vec::new();
-        let mut current_chunk = Vec::new();
-        let mut current_len = 0;
+        let mut start = 0usize;
+        while start < chars.len() {
+            let hard_end = (start + max_chunk_chars).min(chars.len());
+            let mut end = hard_end;
 
-        let sections: Vec<&str> = text.split("\n\n").collect();
-        for sec in sections {
-            let sec_len = sec.len() + 2;
-            if current_len + sec_len > max_chunk_len {
-                if !current_chunk.is_empty() {
-                    chunks.push(current_chunk.join("\n\n"));
-                    current_chunk.clear();
-                    current_len = 0;
-                }
-                if sec.len() > max_chunk_len {
-                    let lines: Vec<&str> = sec.split('\n').collect();
-                    for line in lines {
-                        if current_len + line.len() + 1 > max_chunk_len {
-                            if !current_chunk.is_empty() {
-                                chunks.push(current_chunk.join("\n"));
-                                current_chunk.clear();
-                                current_len = 0;
-                            }
-                        }
-                        current_chunk.push(line.to_string());
-                        current_len += line.len() + 1;
+            if hard_end < chars.len() {
+                // Prefer a natural boundary in the latter half of the chunk, but
+                // always make progress even for a single huge token/code line.
+                let soft_floor = start + (max_chunk_chars / 2);
+                for idx in (soft_floor..hard_end).rev() {
+                    if chars[idx] == '\n' {
+                        end = idx + 1;
+                        break;
                     }
-                } else {
-                    current_chunk.push(sec.to_string());
-                    current_len += sec_len;
                 }
-            } else {
-                current_chunk.push(sec.to_string());
-                current_len += sec_len;
+                if end == hard_end {
+                    for idx in (soft_floor..hard_end).rev() {
+                        if chars[idx].is_whitespace() {
+                            end = idx + 1;
+                            break;
+                        }
+                    }
+                }
             }
-        }
 
-        if !current_chunk.is_empty() {
-            chunks.push(current_chunk.join("\n\n"));
+            if end <= start {
+                end = hard_end.max(start + 1);
+            }
+            chunks.push(chars[start..end].iter().collect());
+            start = end;
         }
 
         chunks
     }
 
-    pub fn render_blocks_to_html_chunks(&self, blocks: &[RichBlock], max_chars: usize) -> Vec<String> {
+    pub fn render_blocks_to_html_chunks(
+        &self,
+        blocks: &[RichBlock],
+        max_chars: usize,
+    ) -> Vec<String> {
         let mut chunks = Vec::new();
         let mut current_text = String::new();
+        let tag_clean_re =
+            regex::Regex::new(r"</?[^>]+>").expect("static HTML tag regex must compile");
 
         for block in blocks {
             let b_html = self.render_single_block_html(block);
@@ -521,19 +613,38 @@ impl TelegramBotClient {
                 continue;
             }
 
-            if b_html.len() > max_chars {
+            if b_html.chars().count() > max_chars {
                 if !current_text.is_empty() {
                     chunks.push(current_text.trim().to_string());
                     current_text.clear();
                 }
-                let sub_chunks = self.split_text_chunks(&b_html, max_chars);
-                for sub in sub_chunks {
-                    chunks.push(sub);
+
+                // Never split raw Telegram HTML in the middle of a tag/entity.
+                // Oversized single blocks degrade to escaped plain text chunks;
+                // correctness is preferable to a parse-mode rejection.
+                let stripped = tag_clean_re.replace_all(&b_html, "").into_owned();
+                let plain = html_escape::decode_html_entities(&stripped).into_owned();
+                let mut escaped_chunk = String::new();
+                let mut escaped_len = 0usize;
+                for ch in plain.chars() {
+                    let encoded = html_escape::encode_text(&ch.to_string()).into_owned();
+                    let encoded_len = encoded.chars().count();
+                    if !escaped_chunk.is_empty() && escaped_len + encoded_len > max_chars {
+                        chunks.push(std::mem::take(&mut escaped_chunk));
+                        escaped_len = 0;
+                    }
+                    escaped_chunk.push_str(&encoded);
+                    escaped_len += encoded_len;
+                }
+                if !escaped_chunk.is_empty() {
+                    chunks.push(escaped_chunk);
                 }
                 continue;
             }
 
-            if current_text.len() + b_html.len() + 2 > max_chars && !current_text.is_empty() {
+            if current_text.chars().count() + b_html.chars().count() + 2 > max_chars
+                && !current_text.is_empty()
+            {
                 chunks.push(current_text.trim().to_string());
                 current_text.clear();
             }
@@ -579,14 +690,15 @@ impl TelegramBotClient {
             RichBlock::Preformatted { text, language } => {
                 let lang_attr = language
                     .as_ref()
-                    .map(|l| format!(" class=\"language-{l}\""))
+                    .map(|language| html_escape::encode_double_quoted_attribute(language))
+                    .map(|language| format!(" class=\"language-{language}\""))
                     .unwrap_or_default();
                 let esc = html_escape::encode_text(text);
                 format!("<pre{lang_attr}>{esc}</pre>\n")
             }
             RichBlock::List { items } => {
                 let mut list_lines = Vec::new();
-                for (_idx, item) in items.iter().enumerate() {
+                for item in items {
                     let item_str = if let Some(obj) = item.as_object() {
                         if let Some(b) = obj.get("blocks") {
                             self.rich_value_to_html(b)
@@ -609,12 +721,24 @@ impl TelegramBotClient {
                 }
                 format!("<blockquote>{q_text}</blockquote>\n")
             }
+            RichBlock::ExpandableBlockQuotation { text, credit } => {
+                let q_text = self.rich_value_to_html(text);
+                let credit_html = credit
+                    .as_ref()
+                    .map(|value| self.rich_value_to_html(value))
+                    .filter(|value| !value.is_empty())
+                    .map(|value| format!("<cite>{value}</cite>"))
+                    .unwrap_or_default();
+                format!("<blockquote expandable>{q_text}{credit_html}</blockquote>\n")
+            }
             RichBlock::Divider {} => "────────────────────────\n".to_string(),
             RichBlock::MathematicalExpression { expression } => {
                 let esc = html_escape::encode_text(expression);
                 format!("<code>{esc}</code>\n")
             }
-            RichBlock::Table { cells, has_header, .. } => {
+            RichBlock::Table {
+                cells, has_header, ..
+            } => {
                 let ascii_tbl = self.render_table_to_ascii(cells, *has_header);
                 if !ascii_tbl.is_empty() {
                     format!("\n{ascii_tbl}\n")
@@ -622,13 +746,31 @@ impl TelegramBotClient {
                     String::new()
                 }
             }
-            RichBlock::Details { title, content, .. } => {
-                let t_esc = html_escape::encode_text(title);
-                let c_esc = html_escape::encode_text(content);
-                format!("<blockquote expandable><b>{t_esc}</b>\n{c_esc}</blockquote>\n")
+            RichBlock::Buttons { buttons, .. } => buttons
+                .iter()
+                .map(|button| format!("[{}]", self.rich_value_to_html(&button.text)))
+                .collect::<Vec<_>>()
+                .join(" "),
+            RichBlock::Document { document, .. } => {
+                let label = document
+                    .get("media")
+                    .and_then(Value::as_str)
+                    .unwrap_or("document");
+                format!("📄 <code>{}</code>\n", html_escape::encode_text(label))
             }
-            RichBlock::Thinking { text, .. } => {
-                let t_esc = html_escape::encode_text(text);
+            RichBlock::Details {
+                summary, blocks, ..
+            } => {
+                let summary_html = self.rich_value_to_html(summary);
+                let body_html = blocks
+                    .iter()
+                    .map(|block| self.rich_value_to_html(block))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("<blockquote expandable><b>{summary_html}</b>\n{body_html}</blockquote>\n")
+            }
+            RichBlock::Thinking { text } => {
+                let t_esc = self.rich_value_to_html(text);
                 format!("<blockquote expandable>💭 <b>Thinking:</b>\n{t_esc}</blockquote>\n")
             }
             RichBlock::Anchor { .. } => String::new(),
@@ -637,8 +779,11 @@ impl TelegramBotClient {
 
     fn rich_value_to_html(&self, v: &Value) -> String {
         match v {
-            Value::String(s) => s.clone(),
-            Value::Array(arr) => arr.iter().map(|item| self.rich_value_to_html(item)).collect(),
+            Value::String(s) => html_escape::encode_text(s).into_owned(),
+            Value::Array(arr) => arr
+                .iter()
+                .map(|item| self.rich_value_to_html(item))
+                .collect(),
             Value::Object(obj) => {
                 let t = obj.get("type").and_then(|s| s.as_str()).unwrap_or("");
                 let inner = obj
@@ -651,7 +796,8 @@ impl TelegramBotClient {
                     "code" => format!("<code>{inner}</code>"),
                     "url" => {
                         let url = obj.get("url").and_then(|s| s.as_str()).unwrap_or("#");
-                        format!("<a href=\"{url}\">{inner}</a>")
+                        let safe_url = html_escape::encode_double_quoted_attribute(url);
+                        format!("<a href=\"{safe_url}\">{inner}</a>")
                     }
                     "strike" => format!("<s>{inner}</s>"),
                     "underline" => format!("<u>{inner}</u>"),
@@ -666,7 +812,10 @@ impl TelegramBotClient {
     fn rich_value_to_plain(&self, v: &Value) -> String {
         match v {
             Value::String(s) => s.clone(),
-            Value::Array(arr) => arr.iter().map(|item| self.rich_value_to_plain(item)).collect(),
+            Value::Array(arr) => arr
+                .iter()
+                .map(|item| self.rich_value_to_plain(item))
+                .collect(),
             Value::Object(obj) => {
                 if let Some(text) = obj.get("text") {
                     self.rich_value_to_plain(text)
@@ -831,5 +980,41 @@ impl TelegramBotClient {
         }
 
         format!("<pre><code>{}</code></pre>", table_lines.join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_text_chunks_preserves_unicode_and_bounds() {
+        let client = TelegramBotClient::new("test-token");
+        let input = format!("{}\n{}", "😊世界".repeat(900), "x".repeat(5000));
+        let chunks = client.split_text_chunks(&input, 3800);
+
+        assert!(chunks.len() >= 2);
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 3800));
+        assert_eq!(chunks.concat(), input);
+    }
+
+    #[test]
+    fn oversized_rich_block_fallback_never_splits_html_entities() {
+        let client = TelegramBotClient::new("test-token");
+        let blocks = vec![RichBlock::Paragraph {
+            text: Value::String("<&😊>".repeat(2000)),
+        }];
+        let chunks = client.render_blocks_to_html_chunks(&blocks, 256);
+
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 256));
+        assert!(chunks.iter().all(|chunk| {
+            let amp = chunk.matches('&').count();
+            amp == chunk.matches("&lt;").count()
+                + chunk.matches("&gt;").count()
+                + chunk.matches("&amp;").count()
+                + chunk.matches("&quot;").count()
+                + chunk.matches("&#x27;").count()
+        }));
     }
 }

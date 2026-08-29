@@ -8,6 +8,7 @@ use tracing::debug;
 
 use crate::bot::client::TelegramBotClient;
 use crate::bot::models::{InputRichMessage, RichBlock};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgressState {
@@ -93,181 +94,49 @@ impl ProgressItem {
     }
 }
 
-pub fn classify_text_activity(text: &str) -> ProgressActivity {
-    let t = text.to_lowercase();
-    if ["look", "lihat", "gambar", "image", "photo", "foto", "vision", "visual", "logo"]
-        .iter()
-        .any(|k| t.contains(k))
-    {
-        return ProgressActivity::Looking;
-    }
-    if ["read", "baca", "dokumen", "document", "pdf", "file", "teks", "text"]
-        .iter()
-        .any(|k| t.contains(k))
-    {
-        return ProgressActivity::Reading;
-    }
-    if ["tabel", "table", "grid", "kolom", "baris", "matrix", "rekap", "jadwal", "klasemen"]
-        .iter()
-        .any(|k| t.contains(k))
-    {
-        return ProgressActivity::Table;
-    }
-    if ["test", "uji", "validat", "evaluat", "verif", "benchmark", "check"]
-        .iter()
-        .any(|k| t.contains(k))
-    {
-        return ProgressActivity::Testing;
-    }
-    if ["search", "cari", "find", "scan", "telusuri", "inspect", "query", "explore", "lookup"]
-        .iter()
-        .any(|k| t.contains(k))
-    {
-        return ProgressActivity::Searching;
-    }
-    if ["fetch", "request", "api", "endpoint", "download", "ambil", "connect", "hubungi", "retrieve", "http", "network", "sync"]
-        .iter()
-        .any(|k| t.contains(k))
-    {
-        return ProgressActivity::Fetching;
-    }
-    if [
-        "code", "coding", "syntax", "hitung", "calculat", "math", "rumus", "run", "eksekusi", "compile",
-        "algoritma", "derivat", "logic", "logika", "program", "fungsi", "function",
-    ]
-    .iter()
-    .any(|k| t.contains(k))
-    {
-        return ProgressActivity::Coding;
-    }
-    if [
-        "tool", "patch", "modifikasi", "update", "simpan", "apply", "terapkan", "perbaiki", "simulate",
-        "branch", "exec", "database", "db",
-    ]
-    .iter()
-    .any(|k| t.contains(k))
-    {
-        return ProgressActivity::Tool;
-    }
-    if [
-        "write", "tulis", "format", "susun", "rangkum", "synthesize", "jelaskan", "draft", "compose",
-        "render", "jawab",
-    ]
-    .iter()
-    .any(|k| t.contains(k))
-    {
-        return ProgressActivity::Writing;
-    }
-    ProgressActivity::Thinking
-}
-
-pub fn generate_contextual_stages(prompt: &str, _model: &str) -> Vec<(&'static str, ProgressActivity)> {
-    let p = prompt.to_lowercase();
-    let mut stages = Vec::new();
-
-    if ["tabel", "table", "jadwal", "rekap", "klasemen", "grid", "kolom", "baris"]
-        .iter()
-        .any(|k| p.contains(k))
-    {
-        stages.push(("Searching", ProgressActivity::Searching));
-        stages.push(("Table", ProgressActivity::Table));
-        stages.push(("Writing", ProgressActivity::Writing));
-    } else if [
-        "code", "coding", "python", "rust", "javascript", "html", "css", "sql", "query", "script",
-        "function", "fungsi", "class", "api", "jwt", "auth", "endpoint", "bug", "error", "fix", "patch",
-    ]
-    .iter()
-    .any(|k| p.contains(k))
-    {
-        stages.push(("Searching", ProgressActivity::Searching));
-        stages.push(("Fetching", ProgressActivity::Fetching));
-        stages.push(("Coding", ProgressActivity::Coding));
-        if ["error", "bug", "fix", "debug", "masalah", "fail"].iter().any(|k| p.contains(k)) {
-            stages.push(("Tool", ProgressActivity::Tool));
-        } else {
-            stages.push(("Testing", ProgressActivity::Testing));
-        }
-        stages.push(("Writing", ProgressActivity::Writing));
-    } else if [
-        "hitung", "berapa", "matematika", "fisika", "rumus", "integral", "turunan", "aljabar",
-        "persamaan", "deret", "probabilitas", "kecepatan", "jarak", "energi", "kalkulus",
-    ]
-    .iter()
-    .any(|k| p.contains(k))
-    {
-        stages.push(("Thinking", ProgressActivity::Thinking));
-        stages.push(("Coding", ProgressActivity::Coding));
-        stages.push(("Tool", ProgressActivity::Tool));
-        stages.push(("Writing", ProgressActivity::Writing));
-    } else if [
-        "teka-teki", "logika", "puzzle", "riddle", "petani", "serigala", "kambing", "kotak", "apel",
-        "jeruk", "strategi", "analisa lebih dalam", "analisis", "bandingkan",
-    ]
-    .iter()
-    .any(|k| p.contains(k))
-    {
-        stages.push(("Thinking", ProgressActivity::Thinking));
-        stages.push(("Tool", ProgressActivity::Tool));
-        stages.push(("Testing", ProgressActivity::Testing));
-        stages.push(("Writing", ProgressActivity::Writing));
-    } else if [
-        "sejarah", "kenapa", "mengapa", "apa itu", "jelaskan", "bagaimana", "definisi", "teori",
-        "faktor", "penyebab", "prinsip",
-    ]
-    .iter()
-    .any(|k| p.contains(k))
-    {
-        stages.push(("Searching", ProgressActivity::Searching));
-        stages.push(("Fetching", ProgressActivity::Fetching));
-        stages.push(("Thinking", ProgressActivity::Thinking));
-        stages.push(("Writing", ProgressActivity::Writing));
-    } else if [
-        "terjemah", "translate", "inggris", "indonesia", "puisi", "cerita", "esai", "surat", "kalimat",
-    ]
-    .iter()
-    .any(|k| p.contains(k))
-    {
-        stages.push(("Searching", ProgressActivity::Searching));
-        stages.push(("Writing", ProgressActivity::Writing));
-    } else {
-        stages.push(("Thinking", ProgressActivity::Thinking));
-        stages.push(("Searching", ProgressActivity::Searching));
-        stages.push(("Writing", ProgressActivity::Writing));
-    }
-
-    stages
-}
-
 pub struct ExecutionTimeline {
     bot: TelegramBotClient,
     chat_id: i64,
     draft_id: i64,
     max_items: usize,
+    draft_enabled: bool,
+    can_stop: bool,
     items: Arc<RwLock<Vec<ProgressItem>>>,
     start_time: Instant,
     last_sync_time: Arc<RwLock<Instant>>,
     sync_lock: Arc<Mutex<()>>,
     stopped: Arc<AtomicBool>,
+    partial_answer: Arc<RwLock<String>>,
 }
 
 impl ExecutionTimeline {
-    pub fn new(bot: TelegramBotClient, chat_id: i64, draft_id: i64, max_items: usize) -> Self {
+    pub fn new(
+        bot: TelegramBotClient,
+        chat_id: i64,
+        draft_id: i64,
+        max_items: usize,
+        draft_enabled: bool,
+        can_stop: bool,
+    ) -> Self {
         Self {
             bot,
             chat_id,
             draft_id,
             max_items,
+            draft_enabled,
+            can_stop,
             items: Arc::new(RwLock::new(Vec::new())),
             start_time: Instant::now(),
             last_sync_time: Arc::new(RwLock::new(Instant::now())),
             sync_lock: Arc::new(Mutex::new(())),
             stopped: Arc::new(AtomicBool::new(false)),
+            partial_answer: Arc::new(RwLock::new(String::new())),
         }
     }
 
     pub async fn add_action(&self, label: impl Into<String>, activity: Option<ProgressActivity>) {
         let lbl = label.into();
-        let act = activity.unwrap_or_else(|| classify_text_activity(&lbl));
+        let act = activity.unwrap_or(ProgressActivity::Thinking);
 
         let mut items = self.items.write().await;
         for it in items.iter_mut() {
@@ -303,7 +172,6 @@ impl ExecutionTimeline {
     }
 
     pub async fn fail_current(&self, error: String) {
-        self.stop_ticker();
         let mut items = self.items.write().await;
         for it in items.iter_mut().rev() {
             if it.state == ProgressState::Active {
@@ -326,6 +194,10 @@ impl ExecutionTimeline {
 
     pub fn stop_ticker(&self) {
         self.stopped.store(true, Ordering::SeqCst);
+    }
+
+    pub async fn set_partial_answer(&self, text: &str) {
+        *self.partial_answer.write().await = text.to_string();
     }
 
     pub fn start_ticker(self: &Arc<Self>) {
@@ -374,11 +246,21 @@ impl ExecutionTimeline {
         if items.is_empty() {
             return "🧩 Thinking...".to_string();
         }
-        items.iter().map(|it| it.format_line()).collect::<Vec<_>>().join("\n")
+        items
+            .iter()
+            .map(|it| it.format_line())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     pub async fn sync_draft(&self, force: bool) {
-        if self.stopped.load(Ordering::SeqCst) {
+        // Telegram streaming drafts are a private-chat feature. In allowed group
+        // chats Xiao still completes the request and sends the final response,
+        // but it doesn't repeatedly call a draft method that Telegram will reject.
+        if !self.draft_enabled {
+            return;
+        }
+        if self.stopped.load(Ordering::SeqCst) && !force {
             return;
         }
 
@@ -397,15 +279,26 @@ impl ExecutionTimeline {
         *self.last_sync_time.write().await = Instant::now();
         let status = self.render_current_status().await;
 
-        let rich_message = InputRichMessage::new(vec![RichBlock::Thinking {
-            text: status,
-            collapsed: true,
-            expandable: true,
-        }]);
+        let partial = self.partial_answer.read().await.clone();
+        let mut blocks = vec![RichBlock::Thinking {
+            text: Value::String(status),
+        }];
+        if !partial.trim().is_empty() {
+            blocks.push(RichBlock::Paragraph {
+                text: Value::String(partial),
+            });
+        }
+        let rich_message = InputRichMessage::new(blocks);
 
         if let Err(e) = self
             .bot
-            .send_rich_message_draft(self.chat_id, self.draft_id, &rich_message, true, false)
+            .send_rich_message_draft(
+                self.chat_id,
+                self.draft_id,
+                &rich_message,
+                self.can_stop,
+                self.can_stop,
+            )
             .await
         {
             debug!("Failed to sync draft update: {e}");

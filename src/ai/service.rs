@@ -1,455 +1,40 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
 use chrono::Local;
 use futures_util::StreamExt;
 use reqwest::multipart::{Form, Part};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::RwLock;
-use rusqlite::{params, Connection};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{watch, Mutex, RwLock};
 use tracing::{error, warn};
 
-use crate::timeline::{
-    classify_text_activity, generate_contextual_stages, ExecutionTimeline, ProgressActivity,
-    ProgressState,
+use crate::attachments::{
+    decode_user_content, delete_session_attachments, encode_user_content, load_attachment,
+    persist_attachment,
 };
+use crate::util::{truncate_chars, truncate_chars_with_ellipsis};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderConfig {
-    pub id: String,
-    pub name: String,
-    pub endpoint: String,
-    pub api_key: String,
-    pub models: Vec<String>,
-    pub active_model: String,
-}
+use super::http::{is_retryable_status, retry_delay, MAX_PROVIDER_ATTEMPTS};
+use super::stream::{SseDecoder, StreamEvent};
+use crate::timeline::{ExecutionTimeline, ProgressActivity, ProgressState};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ProviderStore {
-    pub active_id: Option<String>,
-    pub providers: Vec<ProviderConfig>,
-    #[serde(default)]
-    pub telegram_models: Vec<String>,
-}
+pub use super::capability::{ModelCapability, ModelMetadata};
 
-pub fn get_providers_store_path() -> std::path::PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        return std::path::Path::new(&home).join(".xiao_providers.json");
-    }
-    std::path::Path::new(".xiao_providers.json").to_path_buf()
-}
-
-pub fn load_provider_store() -> ProviderStore {
-    if let Ok(conn) = open_session_db() {
-        if let Ok(value) = conn.query_row("SELECT value FROM settings WHERE key='provider_store'", [], |row| row.get::<_, String>(0)) {
-            if let Ok(store) = serde_json::from_str(&value) {
-                return store;
-            }
-        }
-    }
-    let p = get_providers_store_path();
-    if p.exists() {
-        if let Ok(content) = std::fs::read_to_string(&p) {
-            if let Ok(store) = serde_json::from_str::<ProviderStore>(&content) {
-                let _ = save_provider_store(&store);
-                return store;
-            }
-        }
-    }
-    ProviderStore::default()
-}
-
-pub fn save_provider_store(store: &ProviderStore) -> std::io::Result<()> {
-    let json_str = serde_json::to_string_pretty(store)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let conn = open_session_db().map_err(|e| std::io::Error::other(e.to_string()))?;
-    conn.execute("INSERT INTO settings(key,value) VALUES('provider_store',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![json_str])
-        .map(|_| ())
-        .map_err(|e| std::io::Error::other(e.to_string()))
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatSession {
-    pub id: usize,
-    pub name: String,
-    pub messages: Vec<ChatMessage>,
-    pub created_at: String,
-}
-
-fn session_db_path() -> std::path::PathBuf {
-    let base = std::env::var("HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from("."));
-    base.join(".local/share/xiaoai/xiaoai.db")
-}
-
-fn open_session_db() -> rusqlite::Result<Connection> {
-    let path = session_db_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let conn = Connection::open(path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
-        CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS sessions (
-            user_id INTEGER NOT NULL, session_id INTEGER NOT NULL, name TEXT NOT NULL,
-            created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(user_id, session_id)
-        );
-        CREATE TABLE IF NOT EXISTS messages (
-            user_id INTEGER NOT NULL, session_id INTEGER NOT NULL, role TEXT NOT NULL,
-            content TEXT NOT NULL, created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS active_sessions (
-            user_id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL
-        );")?;
-    Ok(conn)
-}
-
-fn load_sessions_db(user_id: i64) -> rusqlite::Result<Vec<ChatSession>> {
-    let conn = open_session_db()?;
-    let mut stmt = conn.prepare("SELECT session_id,name,created_at FROM sessions WHERE user_id=?1 ORDER BY session_id")?;
-    let mut rows = stmt.query(params![user_id])?;
-    let mut sessions = Vec::new();
-    while let Some(row) = rows.next()? {
-        let id: usize = row.get(0)?;
-        let mut session = ChatSession { id, name: row.get(1)?, messages: Vec::new(), created_at: row.get(2)? };
-        let mut msg_stmt = conn.prepare("SELECT role,content FROM messages WHERE user_id=?1 AND session_id=?2 ORDER BY rowid")?;
-        let mut msg_rows = msg_stmt.query(params![user_id, id])?;
-        while let Some(msg) = msg_rows.next()? {
-            let content: String = msg.get(1)?;
-            session.messages.push(ChatMessage { role: msg.get(0)?, content: serde_json::from_str(&content).unwrap_or(Value::String(content)) });
-        }
-        sessions.push(session);
-    }
-    Ok(sessions)
-}
-
-fn save_session_db(user_id: i64, session: &ChatSession) -> rusqlite::Result<()> {
-    let conn = open_session_db()?;
-    let now = Local::now().to_rfc3339();
-    conn.execute("INSERT INTO sessions(user_id,session_id,name,created_at,updated_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(user_id,session_id) DO UPDATE SET name=excluded.name,updated_at=excluded.updated_at", params![user_id, session.id, session.name, session.created_at, now])?;
-    conn.execute("DELETE FROM messages WHERE user_id=?1 AND session_id=?2", params![user_id, session.id])?;
-    for message in &session.messages {
-        conn.execute("INSERT INTO messages(user_id,session_id,role,content,created_at) VALUES(?1,?2,?3,?4,?5)", params![user_id, session.id, message.role, serde_json::to_string(&message.content).unwrap_or_default(), now])?;
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelCapability {
-    pub model_name: String,
-    pub family: String,
-    pub provider_icon: String,
-    pub context_limit: usize,
-    pub context_str: String,
-    pub vision: bool,
-    pub vision_desc: String,
-    pub video: bool,
-    pub video_desc: String,
-    pub documents: bool,
-    pub docs_desc: String,
-    pub audio: bool,
-    pub audio_desc: String,
-    pub thinking: bool,
-    pub thinking_desc: String,
-    pub strengths: String,
-}
-
-pub fn get_model_capabilities(model_name: &str) -> ModelCapability {
-    let m = model_name.to_lowercase();
-
-    if m.contains("gemini") {
-        let (context_limit, context_str) = if m.contains("pro") || m.contains("2m") {
-            (2097152, "2,000,000 tokens (2M Masif)".to_string())
-        } else {
-            (1048576, "1,048,576 tokens (1M Masif)".to_string())
-        };
-        let thinking = m.contains("high") || m.contains("pro") || m.contains("3.7") || m.contains("3.6");
-
-        ModelCapability {
-            model_name: model_name.to_string(),
-            family: "Google Gemini 3.x Multimodal".to_string(),
-            provider_icon: "✨".to_string(),
-            context_limit,
-            context_str,
-            vision: true,
-            vision_desc: "✅ Didukung Penuh (Ultra High-Res OCR & Vision)".to_string(),
-            video: true,
-            video_desc: "✅ Native Video Vision (Analisis Video Langsung)".to_string(),
-            documents: true,
-            docs_desc: "✅ Didukung Penuh (Membaca file PDF/TXT/Code)".to_string(),
-            audio: true,
-            audio_desc: "✅ Native Audio (Bisa langsung mendengar pesan suara)".to_string(),
-            thinking,
-            thinking_desc: "✅ Adaptive Thinking & High Reasoning Engine".to_string(),
-            strengths: "Konteks masif (1M-2M), video & audio langsung, kecepatan tinggi, penalaran multimodal adaptif".to_string(),
-        }
-    } else if m.contains("claude") {
-        ModelCapability {
-            model_name: model_name.to_string(),
-            family: "Anthropic Claude 4.x / 3.x".to_string(),
-            provider_icon: "🧠".to_string(),
-            context_limit: 200000,
-            context_str: "200,000 tokens (200k Luas)".to_string(),
-            vision: true,
-            vision_desc: "✅ Didukung Penuh (Diagram, Arsitektur UI & OCR)".to_string(),
-            video: false,
-            video_desc: "❌ Belum Didukung Langsung".to_string(),
-            documents: true,
-            docs_desc: "✅ Didukung Penuh (Analisis Dokumen Kompleks & Codebase)".to_string(),
-            audio: false,
-            audio_desc: "❌ Belum Didukung Langsung (Ketik via teks / butuh Whisper)".to_string(),
-            thinking: true,
-            thinking_desc: "✅ Extended Thinking & Chain-of-Thought".to_string(),
-            strengths: "Kualitas penulisan prosa alami, pemahaman instruksi kompleks, arsitektur & refactoring kode tingkat lanjut".to_string(),
-        }
-    } else if ["gpt", "codex", "o1", "o3"].iter().any(|k| m.contains(k)) {
-        let (context_limit, context_str) = if m.contains("sol") || m.contains("terra") || m.contains("luna") || m.contains("256k") {
-            (256000, "256,000 tokens (256k Luas)".to_string())
-        } else if m.contains("mini") {
-            (128000, "128,000 tokens (128k)".to_string())
-        } else {
-            (128000, "128,000 tokens (128k Standar)".to_string())
-        };
-
-        let vision = !(m.contains("codex") && m.contains("spark"));
-        let audio = m.contains("audio") || m.contains("realtime");
-
-        ModelCapability {
-            model_name: model_name.to_string(),
-            family: "OpenAI GPT-5.x / Next-Gen".to_string(),
-            provider_icon: "❇️".to_string(),
-            context_limit,
-            context_str,
-            vision,
-            vision_desc: if vision { "✅ Didukung Penuh (Visi Gambar & Analisis Grafis)".to_string() } else { "❌ Model Khusus Kode".to_string() },
-            video: false,
-            video_desc: "❌ Belum Didukung Langsung".to_string(),
-            documents: true,
-            docs_desc: "✅ Didukung Penuh (Membaca Dokumen & Kode)".to_string(),
-            audio,
-            audio_desc: if audio { "✅ Native Audio Supported".to_string() } else { "❌ Belum Didukung Langsung (Ketik via teks)".to_string() },
-            thinking: true,
-            thinking_desc: "✅ Next-Gen CoT Reasoning & Code Synthesis".to_string(),
-            strengths: "Presisi logika matematika, sintesis & perbaikan kode, manipulasi data terstruktur".to_string(),
-        }
-    } else if m.contains("minimax") {
-        ModelCapability {
-            model_name: model_name.to_string(),
-            family: "MiniMax Multimodal (M3 / 01 / Text)".to_string(),
-            provider_icon: "🦁".to_string(),
-            context_limit: 245760,
-            context_str: "245,760 tokens (245k Luas)".to_string(),
-            vision: true,
-            vision_desc: "✅ Didukung Penuh (Visual OCR & Vision)".to_string(),
-            video: true,
-            video_desc: "✅ Native Video & Vision Sequences Supported".to_string(),
-            documents: true,
-            docs_desc: "✅ Didukung Penuh (Dokumen Teks, PDF & Code)".to_string(),
-            audio: false,
-            audio_desc: "❌ Belum Didukung Langsung (Ketik via teks / Whisper)".to_string(),
-            thinking: false,
-            thinking_desc: "Standar (High Efficiency)".to_string(),
-            strengths: "Pemahaman sekuens visual & video, konteks panjang 245k, performa respons cepat".to_string(),
-        }
-    } else if m.contains("qwen") {
-        let is_video = m.contains("vl") || m.contains("qvq") || m.contains("vision") || m.contains("video");
-        let is_thinking = m.contains("qvq") || m.contains("think") || m.contains("r1") || m.contains("reason");
-        ModelCapability {
-            model_name: model_name.to_string(),
-            family: "Qwen 2.5 / 2.0 (Alibaba)".to_string(),
-            provider_icon: "👑".to_string(),
-            context_limit: 131072,
-            context_str: "131,072 tokens (128k Luas)".to_string(),
-            vision: true,
-            vision_desc: "✅ Didukung (Qwen-VL Multimodal)".to_string(),
-            video: is_video,
-            video_desc: if is_video { "✅ Native Video Vision Supported".to_string() } else { "❌ Belum Didukung Langsung".to_string() },
-            documents: true,
-            docs_desc: "✅ Didukung (Dokumen Teks & Codebase)".to_string(),
-            audio: false,
-            audio_desc: "❌ Belum Didukung Langsung".to_string(),
-            thinking: is_thinking,
-            thinking_desc: if is_thinking { "✅ QVQ / CoT Visual Reasoning".to_string() } else { "Standar (Direct Prompting)".to_string() },
-            strengths: "Keunggulan visual reasoning (Qwen VL/QVQ), coding, instruksi multibahasa tingkat tinggi".to_string(),
-        }
-    } else if m.contains("deepseek") {
-        let vision = m.contains("vl") || m.contains("vision");
-        let thinking = m.contains("r1") || m.contains("think") || m.contains("reason");
-
-        ModelCapability {
-            model_name: model_name.to_string(),
-            family: "DeepSeek AI (V3 / R1)".to_string(),
-            provider_icon: "🐋".to_string(),
-            context_limit: 128000,
-            context_str: "128,000 tokens (128k)".to_string(),
-            vision,
-            vision_desc: if vision { "✅ Didukung (DeepSeek-VL)".to_string() } else { "❌ Model Teks Murni".to_string() },
-            video: false,
-            video_desc: "❌ Tidak Didukung".to_string(),
-            documents: true,
-            docs_desc: "✅ Didukung (Dokumen Teks & Kode)".to_string(),
-            audio: false,
-            audio_desc: "❌ Tidak Didukung (Ketik via teks)".to_string(),
-            thinking,
-            thinking_desc: if thinking { "✅ DeepSeek-R1 Deep Reasoning CoT".to_string() } else { "Standar (Direct Prompting)".to_string() },
-            strengths: "Kemampuan matematika murni, algoritma pemrograman, logika penalaran terbuka".to_string(),
-        }
-    } else {
-        let has_video = m.contains("video") || m.contains("vl") || m.contains("vision") || m.contains("omni") || m.contains("qvq") || m.contains("pixtral") || m.contains("internvl") || m.contains("cogvlm") || m.contains("m3") || m.contains("m2");
-        let has_audio = m.contains("audio") || m.contains("voice") || m.contains("realtime") || m.contains("omni");
-        let has_thinking = m.contains("think") || m.contains("reason") || m.contains("r1") || m.contains("qvq");
-
-        ModelCapability {
-            model_name: model_name.to_string(),
-            family: "OpenAI-Compatible Multimodal Model".to_string(),
-            provider_icon: "⚡".to_string(),
-            context_limit: 128000,
-            context_str: "128,000 tokens (128k)".to_string(),
-            vision: true,
-            vision_desc: "✅ Didukung (Multimodal Image)".to_string(),
-            video: has_video,
-            video_desc: if has_video { "✅ Native Video Vision Supported".to_string() } else { "❌ Belum Didukung Langsung".to_string() },
-            documents: true,
-            docs_desc: "✅ Didukung (Dokumen Teks & PDF)".to_string(),
-            audio: has_audio,
-            audio_desc: if has_audio { "✅ Native Audio Supported".to_string() } else { "❌ Belum Didukung Langsung".to_string() },
-            thinking: has_thinking,
-            thinking_desc: if has_thinking { "✅ Reasoning Chain-of-Thought".to_string() } else { "Standar (Direct Prompting)".to_string() },
-            strengths: "Pemrosesan multimodal, penalaran kontekstual, dan pemahaman konten luas".to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ModelMetadata {
-    pub id: String,
-    pub name: Option<String>,
-    pub context_length: Option<usize>,
-    pub modalities: Option<String>,
-    pub max_completion_tokens: Option<usize>,
-}
-
-pub fn model_metadata_key(endpoint: &str, model: &str) -> String {
-    format!("{}::{}", endpoint.trim_end_matches('/'), model)
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CapabilityRecord {
-    pub provider_id: String,
-    pub provider_name: String,
-    pub model: String,
-    pub context_window: Option<usize>,
-    pub supports_text: bool,
-    pub supports_image: Option<bool>,
-    pub supports_audio: Option<bool>,
-    pub supports_video: Option<bool>,
-    pub supports_reasoning: Option<bool>,
-    pub source: String,
-    pub details: Vec<String>,
-    pub checked_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CapabilityRegistry {
-    pub models: Vec<CapabilityRecord>,
-}
-
-pub fn get_capability_registry_path() -> std::path::PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        return std::path::Path::new(&home).join(".xiao_model_capabilities.json");
-    }
-    std::path::Path::new(".xiao_model_capabilities.json").to_path_buf()
-}
-
-pub fn load_capability_registry() -> CapabilityRegistry {
-    if let Ok(conn) = open_session_db() {
-        if let Ok(value) = conn.query_row("SELECT value FROM settings WHERE key='capability_registry'", [], |row| row.get::<_, String>(0)) {
-            if let Ok(registry) = serde_json::from_str(&value) {
-                return registry;
-            }
-        }
-    }
-    let path = get_capability_registry_path();
-    let registry = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|value| serde_json::from_str(&value).ok())
-        .unwrap_or_default();
-    let _ = save_capability_registry(&registry);
-    registry
-}
-
-pub fn save_capability_registry(registry: &CapabilityRegistry) -> std::io::Result<()> {
-    let value = serde_json::to_string_pretty(registry)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let conn = open_session_db().map_err(|e| std::io::Error::other(e.to_string()))?;
-    conn.execute("INSERT INTO settings(key,value) VALUES('capability_registry',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![value])
-        .map(|_| ())
-        .map_err(|e| std::io::Error::other(e.to_string()))
-}
-
-pub fn load_app_setting(key: &str) -> Option<String> {
-    open_session_db().ok()?.query_row("SELECT value FROM settings WHERE key=?1", params![format!("app:{key}")], |row| row.get(0)).ok()
-}
-
-pub fn save_app_setting(key: &str, value: &str) -> std::io::Result<()> {
-    let conn = open_session_db().map_err(|e| std::io::Error::other(e.to_string()))?;
-    conn.execute("INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![format!("app:{key}"), value])
-        .map(|_| ())
-        .map_err(|e| std::io::Error::other(e.to_string()))
-}
-
-fn format_number_with_commas(n: usize) -> String {
-    let s = n.to_string();
-    let mut result = String::new();
-    let chars: Vec<char> = s.chars().collect();
-    for (i, &c) in chars.iter().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(c);
-    }
-    result.chars().rev().collect()
-}
-
-pub fn get_model_capabilities_with_meta(model_name: &str, meta: Option<&ModelMetadata>) -> ModelCapability {
-    let mut cap = get_model_capabilities(model_name);
-
-    if let Some(m) = meta {
-        if let Some(ctx) = m.context_length {
-            if ctx > 0 {
-                cap.context_limit = ctx;
-                let formatted_ctx = format_number_with_commas(ctx);
-                cap.context_str = if ctx >= 1_000_000 {
-                    format!("{} tokens ({}M Masif)", formatted_ctx, ctx / 1_000_000)
-                } else if ctx >= 1_000 {
-                    format!("{} tokens ({}k)", formatted_ctx, ctx / 1_000)
-                } else {
-                    format!("{ctx} tokens")
-                };
-            }
-        }
-        if let Some(ref mod_str) = m.modalities {
-            let mod_low = mod_str.to_lowercase();
-            cap.vision = mod_low.contains("image") || mod_low.contains("vision") || mod_low.contains("multimodal");
-            cap.video = mod_low.contains("video");
-            cap.audio = mod_low.contains("audio");
-            cap.vision_desc = if cap.vision { "✅ Didukung (Endpoint modality)" } else { "❌ Tidak dipublikasikan endpoint" }.to_string();
-            cap.video_desc = if cap.video { "✅ Didukung (Endpoint modality)" } else { "❌ Tidak didukung endpoint" }.to_string();
-            cap.audio_desc = if cap.audio { "✅ Didukung (Endpoint modality)" } else { "❌ Tidak didukung endpoint" }.to_string();
-        }
-    }
-
-    cap
-}
+use super::storage::{
+    allocate_session_id_db_async, append_session_messages_db_async, delete_session_db_async,
+    ensure_session_identity_v2_db_async, load_active_session_id_db_async, load_app_setting_async,
+    load_sessions_db_async, replace_session_messages_db_async, save_active_session_db_async,
+    save_session_metadata_db_async,
+};
+pub use super::storage::{
+    load_app_setting, load_capability_registry, load_provider_store, save_app_setting,
+    save_provider_store, CapabilityRecord, CapabilityRegistry, ChatMessage, ChatSession,
+    ProviderConfig, ProviderStore,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextMessageItem {
@@ -478,24 +63,83 @@ pub struct ContextStats {
     pub messages_breakdown: Vec<ContextMessageItem>,
 }
 
+fn estimate_text_tokens(text: &str) -> usize {
+    text.chars().count().div_ceil(4).max(1)
+}
+
+fn estimate_stored_content_tokens(content: &Value) -> usize {
+    if let Some(persisted) = decode_user_content(content) {
+        let media_cost = persisted.attachments.len().saturating_mul(1_500);
+        return estimate_text_tokens(&persisted.text).saturating_add(media_cost);
+    }
+    match content {
+        Value::String(text) => estimate_text_tokens(text),
+        value => estimate_text_tokens(&value.to_string()),
+    }
+}
+
+fn max_output_tokens_for_model(model: &str) -> usize {
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("claude") {
+        64_000
+    } else if lower.contains("gemini")
+        || ["o1", "o3", "gpt-4o", "gpt-5", "sol", "terra", "luna"]
+            .iter()
+            .any(|needle| lower.contains(needle))
+    {
+        65_536
+    } else {
+        16_384
+    }
+}
+
+type GenerationKey = (i64, i64);
+type GenerationCancelSender = watch::Sender<bool>;
+type ActiveGenerations = Arc<RwLock<HashMap<GenerationKey, GenerationCancelSender>>>;
+
+pub struct GenerationInput<'a> {
+    pub prompt: &'a str,
+    pub timeline: Option<&'a Arc<ExecutionTimeline>>,
+    pub image_bytes: Option<Vec<u8>>,
+    pub document_images: Option<Vec<Vec<u8>>>,
+    pub mime_type: Option<&'a str>,
+    pub doc_text: Option<&'a str>,
+    pub doc_name: Option<&'a str>,
+    pub audio_bytes: Option<Vec<u8>>,
+    pub audio_mime: Option<&'a str>,
+    pub video_bytes: Option<Vec<u8>>,
+    pub video_mime: Option<&'a str>,
+    pub video_duration: Option<i32>,
+}
+
 #[derive(Clone)]
 pub struct AIChatService {
-    client: Client,
-    user_models: Arc<RwLock<HashMap<i64, String>>>,
+    pub(super) client: Client,
     user_sessions: Arc<RwLock<HashMap<i64, Vec<ChatSession>>>>,
-    active_session_idx: Arc<RwLock<HashMap<i64, usize>>>,
+    active_session_id: Arc<RwLock<HashMap<i64, usize>>>,
+    generation_locks: Arc<RwLock<HashMap<i64, Arc<Mutex<()>>>>>,
+    session_locks: Arc<RwLock<HashMap<i64, Arc<Mutex<()>>>>>,
+    active_generations: ActiveGenerations,
     pub user_waiting_rename: Arc<RwLock<HashMap<i64, usize>>>,
     pub user_rename_msg_id: Arc<RwLock<HashMap<i64, i64>>>,
     pub user_session_msg_id: Arc<RwLock<HashMap<i64, i64>>>,
-    user_providers: Arc<RwLock<HashMap<i64, Vec<ProviderConfig>>>>,
-    active_provider_id: Arc<RwLock<HashMap<i64, String>>>,
+    pub(super) provider_store: Arc<RwLock<ProviderStore>>,
+    pub(super) capability_registry: Arc<RwLock<CapabilityRegistry>>,
     pub user_wizard_state: Arc<RwLock<HashMap<i64, HashMap<String, String>>>>,
     pub model_metadata: Arc<RwLock<HashMap<String, ModelMetadata>>>,
 }
 
 impl AIChatService {
     pub fn new() -> Self {
-        for key in ["BOT_TOKEN", "AI_ENDPOINT", "AI_API_KEY", "AI_MODEL"] {
+        for key in [
+            "BOT_TOKEN",
+            "AI_ENDPOINT",
+            "AI_API_KEY",
+            "AI_MODEL",
+            "OWNER_USER_ID",
+            "ALLOWED_CHAT_IDS",
+            "IMAGE_FALLBACK_PROVIDER",
+        ] {
             if load_app_setting(key).is_none() {
                 if let Ok(value) = std::env::var(key) {
                     if !value.trim().is_empty() {
@@ -504,6 +148,8 @@ impl AIChatService {
                 }
             }
         }
+        let provider_store = load_provider_store();
+        let capability_registry = load_capability_registry();
         let client = Client::builder()
             .timeout(Duration::from_secs(90))
             .build()
@@ -511,14 +157,16 @@ impl AIChatService {
 
         Self {
             client,
-            user_models: Arc::new(RwLock::new(HashMap::new())),
             user_sessions: Arc::new(RwLock::new(HashMap::new())),
-            active_session_idx: Arc::new(RwLock::new(HashMap::new())),
+            active_session_id: Arc::new(RwLock::new(HashMap::new())),
+            generation_locks: Arc::new(RwLock::new(HashMap::new())),
+            session_locks: Arc::new(RwLock::new(HashMap::new())),
+            active_generations: Arc::new(RwLock::new(HashMap::new())),
             user_waiting_rename: Arc::new(RwLock::new(HashMap::new())),
             user_rename_msg_id: Arc::new(RwLock::new(HashMap::new())),
             user_session_msg_id: Arc::new(RwLock::new(HashMap::new())),
-            user_providers: Arc::new(RwLock::new(HashMap::new())),
-            active_provider_id: Arc::new(RwLock::new(HashMap::new())),
+            provider_store: Arc::new(RwLock::new(provider_store)),
+            capability_registry: Arc::new(RwLock::new(capability_registry)),
             user_wizard_state: Arc::new(RwLock::new(HashMap::new())),
             model_metadata: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -527,521 +175,429 @@ impl AIChatService {
     // ==========================================
     // Provider Management
     // ==========================================
+    //
+    // XiaoAI is intentionally single-owner. Provider configuration therefore
+    // has one owner-global source of truth instead of a pseudo multi-user cache
+    // layered over global SQLite settings.
 
-    pub fn get_global_provider(&self) -> Option<ProviderConfig> {
-        let store = load_provider_store();
-        if let Some(ref aid) = store.active_id {
-            if let Some(p) = store.providers.iter().find(|p| &p.id == aid) {
-                return Some(p.clone());
-            }
-        }
-        store.providers.first().cloned()
-    }
-
-    pub async fn has_configured_provider(&self, user_id: i64) -> bool {
-        let providers = self.user_providers.read().await;
-        if let Some(list) = providers.get(&user_id) {
-            if !list.is_empty() {
-                return true;
-            }
-        }
-        self.get_global_provider().is_some()
-    }
-
-    pub async fn get_user_providers(&self, user_id: i64) -> Vec<ProviderConfig> {
-        let providers = self.user_providers.read().await;
-        if let Some(list) = providers.get(&user_id) {
-            if !list.is_empty() {
-                return list.clone();
-            }
-        }
-        let store = load_provider_store();
-        if !store.providers.is_empty() {
-            store.providers
-        } else if let Some(global) = self.get_global_provider() {
-            vec![global]
-        } else {
-            Vec::new()
-        }
-    }
-
-    pub async fn get_active_provider(&self, user_id: i64) -> Option<ProviderConfig> {
-        let providers = self.user_providers.read().await;
-        if let Some(list) = providers.get(&user_id) {
-            if !list.is_empty() {
-                let active_ids = self.active_provider_id.read().await;
-                if let Some(active_id) = active_ids.get(&user_id) {
-                    for p in list {
-                        if &p.id == active_id {
-                            return Some(p.clone());
-                        }
-                    }
-                }
-                return Some(list[0].clone());
-            }
-        }
-        self.get_global_provider()
-    }
-
-    pub async fn set_active_provider(&self, user_id: i64, provider_id: &str) -> bool {
-        let mut store = load_provider_store();
-        if let Some(p) = store.providers.iter().find(|p| p.id == provider_id) {
-            store.active_id = Some(provider_id.to_string());
-            let _ = save_provider_store(&store);
-            let _ = save_app_setting("AI_ENDPOINT", &p.endpoint);
-            let _ = save_app_setting("AI_API_KEY", &p.api_key);
-            let _ = save_app_setting("AI_MODEL", &p.active_model);
-        }
-
-        let providers = self.user_providers.read().await;
-        if let Some(list) = providers.get(&user_id) {
-            if list.iter().any(|p| p.id == provider_id) {
-                drop(providers);
-                self.active_provider_id
-                    .write()
-                    .await
-                    .insert(user_id, provider_id.to_string());
-                return true;
-            }
-        }
-        drop(providers);
-        self.active_provider_id
-            .write()
-            .await
-            .insert(user_id, provider_id.to_string());
-        true
-    }
-
-    pub async fn add_user_provider(
+    async fn rehydrate_history_content(
         &self,
         user_id: i64,
-        endpoint: &str,
-        api_key: &str,
-        alias: &str,
-        models: Vec<String>,
-    ) -> ProviderConfig {
-        use rand::Rng;
-        let random_suffix: String = rand::thread_rng()
-            .sample_iter(&rand::distributions::Alphanumeric)
-            .take(6)
-            .map(char::from)
-            .collect();
-        let provider_id = format!("prov_{}", random_suffix.to_lowercase());
-
-        let default_model = models.first().cloned().unwrap_or_else(|| "gpt-4o".to_string());
-        let provider = ProviderConfig {
-            id: provider_id.clone(),
-            name: if alias.trim().is_empty() { "Custom Provider".to_string() } else { alias.trim().to_string() },
-            endpoint: endpoint.trim().trim_end_matches('/').to_string(),
-            api_key: api_key.trim().to_string(),
-            models,
-            active_model: default_model,
+        session_id: usize,
+        value: &Value,
+        capability: Option<&CapabilityRecord>,
+    ) -> Value {
+        let Some(persisted) = decode_user_content(value) else {
+            return value.clone();
         };
 
-        {
-            let mut store = load_provider_store();
-            store.providers.push(provider.clone());
-            store.active_id = Some(provider_id.clone());
-            let _ = save_provider_store(&store);
-        }
-
-        {
-            let mut providers = self.user_providers.write().await;
-            providers.entry(user_id).or_default().push(provider.clone());
-        }
-
-        self.active_provider_id
-            .write()
-            .await
-            .insert(user_id, provider_id);
-
-        provider
-    }
-
-    pub async fn remove_user_provider(&self, user_id: i64, provider_id: &str) -> bool {
-        let mut store = load_provider_store();
-        if let Some(pos) = store.providers.iter().position(|p| p.id == provider_id) {
-            store.providers.remove(pos);
-            if store.active_id.as_deref() == Some(provider_id) {
-                store.active_id = store.providers.first().map(|p| p.id.clone());
+        let mut text = persisted.text;
+        let mut parts = Vec::new();
+        let mut total_loaded = 0usize;
+        for attachment in persisted.attachments {
+            let allowed = match attachment.kind.as_str() {
+                "image" | "document_page" => capability
+                    .and_then(|record| record.supports_image)
+                    .unwrap_or(true),
+                "audio" => capability
+                    .and_then(|record| record.supports_audio)
+                    .unwrap_or(false),
+                "video" => capability
+                    .and_then(|record| record.supports_video)
+                    .unwrap_or(false),
+                _ => false,
+            };
+            if !allowed {
+                text.push_str(&format!(
+                    "\n[Attachment '{}' omitted because current model capability is unsupported/unknown.]",
+                    attachment.name.as_deref().unwrap_or(&attachment.kind)
+                ));
+                continue;
             }
-            let _ = save_provider_store(&store);
-        }
 
-        let mut providers = self.user_providers.write().await;
-        if let Some(list) = providers.get_mut(&user_id) {
-            if let Some(pos) = list.iter().position(|p| p.id == provider_id) {
-                list.remove(pos);
-                let new_active = list.first().map(|p| p.id.clone());
-                drop(providers);
-
-                let mut active_ids = self.active_provider_id.write().await;
-                if let Some(first_id) = new_active {
-                    active_ids.insert(user_id, first_id);
-                } else {
-                    active_ids.remove(&user_id);
+            let bytes = match load_attachment(user_id, session_id, &attachment).await {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    warn!("Unable to reload persisted attachment: {err}");
+                    text.push_str("\n[Previously attached media is no longer available.]");
+                    continue;
                 }
-                return true;
+            };
+            total_loaded = total_loaded.saturating_add(bytes.len());
+            if total_loaded > 12 * 1024 * 1024 {
+                text.push_str(
+                    "\n[Older attachments omitted because the history media budget was reached.]",
+                );
+                break;
             }
-        }
-        false
-    }
 
-    pub async fn update_provider_models(&self, user_id: i64, provider_id: &str, models: Vec<String>) {
-        let mut store = load_provider_store();
-        if let Some(p) = store.providers.iter_mut().find(|p| p.id == provider_id) {
-            p.models = models.clone();
-            let _ = save_provider_store(&store);
-        }
-
-        let mut providers = self.user_providers.write().await;
-        let list = providers.entry(user_id).or_default();
-        if let Some(p) = list.iter_mut().find(|p| p.id == provider_id) {
-            p.models = models;
-        } else if let Some(mut global) = self.get_global_provider() {
-            global.models = models;
-            list.push(global);
-        }
-    }
-
-    pub async fn get_provider_model_by_index(&self, user_id: i64, provider_id: &str, index: usize) -> Option<String> {
-        let providers = self.get_user_providers(user_id).await;
-        let target = providers.into_iter().find(|p| p.id == provider_id)?;
-        target.models.get(index).cloned()
-    }
-
-    pub async fn set_provider_model(&self, user_id: i64, provider_id: &str, model_name: &str) -> bool {
-        let mut store = load_provider_store();
-        let mut matched_endpoint = String::new();
-        let mut matched_key = String::new();
-
-        if let Some(p) = store.providers.iter_mut().find(|p| p.id == provider_id) {
-            p.active_model = model_name.to_string();
-            matched_endpoint = p.endpoint.clone();
-            matched_key = p.api_key.clone();
-        }
-
-        if !matched_endpoint.is_empty() {
-            store.active_id = Some(provider_id.to_string());
-            let _ = save_provider_store(&store);
-            let _ = save_app_setting("AI_ENDPOINT", &matched_endpoint);
-            let _ = save_app_setting("AI_API_KEY", &matched_key);
-            let _ = save_app_setting("AI_MODEL", model_name);
-        }
-
-        let mut providers = self.user_providers.write().await;
-        if let Some(list) = providers.get_mut(&user_id) {
-            for p in list.iter_mut() {
-                if p.id == provider_id {
-                    p.active_model = model_name.to_string();
-                }
-            }
-        }
-        self.active_provider_id
-            .write()
-            .await
-            .insert(user_id, provider_id.to_string());
-        self.user_models
-            .write()
-            .await
-            .insert(user_id, model_name.to_string());
-        true
-    }
-
-    pub async fn fetch_models_from_endpoint(
-        &self,
-        endpoint: &str,
-        api_key: &str,
-    ) -> (bool, Result<Vec<String>, String>) {
-        let clean_endpoint = endpoint.trim().trim_end_matches('/');
-        let url = format!("{clean_endpoint}/models");
-
-        let mut req = self.client.get(&url).timeout(Duration::from_secs(15));
-        let trimmed_key = api_key.trim();
-        if !trimmed_key.is_empty() && !["none", "-", "no", "null"].iter().any(|k| trimmed_key.eq_ignore_ascii_case(k)) {
-            req = req.header("Authorization", format!("Bearer {trimmed_key}"));
-        }
-
-        match req.send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() {
-                    match resp.json::<Value>().await {
-                        Ok(data) => {
-                            let mut model_ids = Vec::new();
-                            let mut meta_guard = self.model_metadata.write().await;
-
-                            if let Some(data_arr) = data.get("data").and_then(|d| d.as_array()) {
-                                for item in data_arr {
-                                    if let Some(id_str) = item.get("id").and_then(|s| s.as_str()) {
-                                        model_ids.push(id_str.to_string());
-
-                                        let context_length = item.get("context_length").and_then(|c| c.as_u64()).map(|u| u as usize);
-                                        let modality = item.get("architecture")
-                                            .and_then(|a| a.get("modality"))
-                                            .or_else(|| item.get("modalities"))
-                                            .map(|value| match value {
-                                                Value::String(s) => s.clone(),
-                                                Value::Array(values) => values.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(","),
-                                                _ => String::new(),
-                                            })
-                                            .filter(|value| !value.is_empty());
-                                        let max_comp = item.get("top_provider")
-                                            .and_then(|p| p.get("max_completion_tokens"))
-                                            .and_then(|m| m.as_u64())
-                                            .map(|u| u as usize);
-
-                                        meta_guard.insert(model_metadata_key(clean_endpoint, id_str), ModelMetadata {
-                                            id: id_str.to_string(),
-                                            name: item.get("name").and_then(|s| s.as_str()).map(|s| s.to_string()),
-                                            context_length,
-                                            modalities: modality,
-                                            max_completion_tokens: max_comp,
-                                        });
-                                    } else if let Some(s) = item.as_str() {
-                                        model_ids.push(s.to_string());
-                                    }
-                                }
-                            } else if let Some(data_obj) = data.get("data").and_then(|d| d.as_object()) {
-                                for k in data_obj.keys() {
-                                    model_ids.push(k.to_string());
-                                }
-                            }
-
-                            let mut registry = load_capability_registry();
-                            let provider_id = clean_endpoint.to_string();
-                            for model_id in &model_ids {
-                                let meta = meta_guard.get(&model_metadata_key(clean_endpoint, model_id));
-                                let modalities = meta.and_then(|m| m.modalities.as_deref()).unwrap_or("").to_ascii_lowercase();
-                                let record = CapabilityRecord {
-                                    provider_id: provider_id.clone(),
-                                    provider_name: provider_id.clone(),
-                                    model: model_id.clone(),
-                                    context_window: meta.and_then(|m| m.context_length),
-                                    supports_text: true,
-                                    supports_image: if modalities.is_empty() { None } else { Some(modalities.contains("image") || modalities.contains("vision") || modalities.contains("multimodal")) },
-                                    supports_audio: if modalities.is_empty() { None } else { Some(modalities.contains("audio")) },
-                                    supports_video: if modalities.is_empty() { None } else { Some(modalities.contains("video")) },
-                                    supports_reasoning: None,
-                                    source: "provider /models metadata".to_string(),
-                                    details: if modalities.is_empty() { vec!["Input modality tidak dipublikasikan endpoint".to_string()] } else { vec![format!("modalities: {modalities}")] },
-                                    checked_at: Local::now().to_rfc3339(),
-                                };
-                                if let Some(existing) = registry.models.iter_mut().find(|entry| entry.provider_id == provider_id && entry.model == *model_id) {
-                                    *existing = record;
-                                } else {
-                                    registry.models.push(record);
-                                }
-                            }
-                            let _ = save_capability_registry(&registry);
-
-                            if !model_ids.is_empty() {
-                                (true, Ok(model_ids))
-                            } else {
-                                (false, Err("Endpoint berhasil dihubungi, namun tidak ada daftar model yang dikembalikan (data kosong).".to_string()))
-                            }
+            use base64::Engine;
+            match attachment.kind.as_str() {
+                "image" | "document_page" => {
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+                    parts.push(json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("data:{};base64,{encoded}", attachment.mime_type),
+                            "detail": "auto"
                         }
-                        Err(e) => (false, Err(format!("Respon dari endpoint bukan JSON valid: {e}"))),
-                    }
-                } else if status.as_u16() == 401 || status.as_u16() == 403 {
-                    (false, Err(format!("HTTP {} Unauthorized: Autentikasi gagal. Mohon periksa kembali API Key Anda.", status.as_u16())))
-                } else if status.as_u16() == 404 {
-                    (false, Err(format!("HTTP 404 Not Found: Path /models tidak ditemukan di {clean_endpoint}. Pastikan format endpoint URL benar (misal: https://api.openai.com/v1).")))
-                } else {
-                    let err_text = resp.text().await.unwrap_or_default();
-                    (false, Err(format!("HTTP {}: {}", status.as_u16(), &err_text[..err_text.len().min(150)])))
+                    }));
                 }
-            }
-            Err(e) => {
-                if e.is_timeout() {
-                    (false, Err(format!("Koneksi timeout setelah 15 detik ke {clean_endpoint}.")))
-                } else if e.is_connect() {
-                    (false, Err(format!("Gagal terhubung ke {clean_endpoint}. Pastikan host/domain benar dan server aktif.")))
-                } else {
-                    (false, Err(format!("Koneksi gagal: {e}")))
+                "audio" => {
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+                    let format = if attachment.mime_type.contains("ogg") {
+                        "ogg"
+                    } else if attachment.mime_type.contains("wav") {
+                        "wav"
+                    } else {
+                        "mp3"
+                    };
+                    parts.push(json!({
+                        "type": "input_audio",
+                        "input_audio": {"data": encoded, "format": format}
+                    }));
                 }
+                "video" => {
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+                    parts.push(json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("data:{};base64,{encoded}", attachment.mime_type)
+                        }
+                    }));
+                }
+                _ => {}
             }
         }
-    }
 
-    pub async fn get_user_model(&self, user_id: i64) -> String {
-        if let Some(prov) = self.get_active_provider(user_id).await {
-            if !prov.active_model.is_empty() {
-                return prov.active_model;
-            }
+        if parts.is_empty() {
+            Value::String(text)
+        } else {
+            let mut content = vec![json!({"type": "text", "text": text})];
+            content.extend(parts);
+            Value::Array(content)
         }
-        let models = self.user_models.read().await;
-        models.get(&user_id).cloned().unwrap_or_else(|| "gpt-4o".to_string())
     }
 
-    pub async fn set_user_model(&self, user_id: i64, model: &str) {
-        if let Some(prov) = self.get_active_provider(user_id).await {
-            self.set_provider_model(user_id, &prov.id, model).await;
+    async fn session_lock(&self, user_id: i64) -> Arc<Mutex<()>> {
+        if let Some(lock) = self.session_locks.read().await.get(&user_id).cloned() {
+            return lock;
         }
-        self.user_models.write().await.insert(user_id, model.to_string());
+        let mut locks = self.session_locks.write().await;
+        locks
+            .entry(user_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
-
-    // ==========================================
-    // Multi-Session Management
-    // ==========================================
 
     pub async fn get_sessions(&self, user_id: i64) -> Vec<ChatSession> {
-        let mut sessions_map = self.user_sessions.write().await;
-        let list = sessions_map.entry(user_id).or_insert_with(|| {
-            if let Ok(existing) = load_sessions_db(user_id) {
-                if !existing.is_empty() {
-                    return existing;
-                }
-            }
+        if let Some(list) = self.user_sessions.read().await.get(&user_id).cloned() {
+            return list;
+        }
+
+        let init_lock = self.session_lock(user_id).await;
+        let _guard = init_lock.lock().await;
+        if let Some(list) = self.user_sessions.read().await.get(&user_id).cloned() {
+            return list;
+        }
+
+        let mut existing = load_sessions_db_async(user_id).await;
+        if existing.is_empty() {
             let now_str = Local::now().format("%d %b %H:%M").to_string();
             let session = ChatSession {
-                id: 1,
+                id: allocate_session_id_db_async(user_id).await.unwrap_or(1),
                 name: format!("Session {now_str}"),
                 messages: Vec::new(),
                 created_at: now_str,
             };
-            let _ = save_session_db(user_id, &session);
-            vec![session]
-        });
-        list.clone()
+            let _ = save_session_metadata_db_async(user_id, session.clone()).await;
+            existing.push(session);
+        }
+        let _ = ensure_session_identity_v2_db_async(user_id, existing.clone()).await;
+        self.user_sessions
+            .write()
+            .await
+            .insert(user_id, existing.clone());
+        existing
+    }
+
+    pub async fn get_active_session_id(&self, user_id: i64) -> usize {
+        let sessions = self.get_sessions(user_id).await;
+        if let Some(id) = self.active_session_id.read().await.get(&user_id).copied() {
+            if sessions.iter().any(|session| session.id == id) {
+                return id;
+            }
+        }
+
+        let stored_id = load_active_session_id_db_async(user_id)
+            .await
+            .filter(|id| sessions.iter().any(|session| session.id == *id))
+            .unwrap_or(sessions[0].id);
+
+        self.active_session_id
+            .write()
+            .await
+            .insert(user_id, stored_id);
+        let _ = save_active_session_db_async(user_id, stored_id).await;
+        stored_id
     }
 
     pub async fn get_active_session_index(&self, user_id: i64) -> usize {
-        let _ = self.get_sessions(user_id).await;
-        let mut active_map = self.active_session_idx.write().await;
-        let idx = if let Some(value) = active_map.get(&user_id).copied() {
-            value
-        } else {
-            let stored = open_session_db().ok().and_then(|conn| conn.query_row("SELECT session_id FROM active_sessions WHERE user_id=?1", params![user_id], |row| row.get::<_, usize>(0)).ok()).unwrap_or(0);
-            active_map.insert(user_id, stored);
-            stored
-        };
-
-        let sessions_map = self.user_sessions.read().await;
-        if let Some(list) = sessions_map.get(&user_id) {
-            if idx >= list.len() {
-                let fixed = list.len().saturating_sub(1);
-                active_map.insert(user_id, fixed);
-                return fixed;
-            }
-        }
-        idx
+        let sessions = self.get_sessions(user_id).await;
+        let active_id = self.get_active_session_id(user_id).await;
+        sessions
+            .iter()
+            .position(|session| session.id == active_id)
+            .unwrap_or(0)
     }
 
     pub async fn get_active_session(&self, user_id: i64) -> ChatSession {
         let sessions = self.get_sessions(user_id).await;
-        let idx = self.get_active_session_index(user_id).await;
-        sessions.get(idx).cloned().unwrap_or_else(|| sessions[0].clone())
+        let active_id = self.get_active_session_id(user_id).await;
+        sessions
+            .iter()
+            .find(|session| session.id == active_id)
+            .cloned()
+            .unwrap_or_else(|| sessions[0].clone())
     }
 
     pub async fn create_new_session(&self, user_id: i64, custom_name: Option<&str>) -> ChatSession {
         let _ = self.get_sessions(user_id).await;
-        let mut sessions_map = self.user_sessions.write().await;
-        let list = sessions_map.entry(user_id).or_default();
         let now_str = Local::now().format("%d %b %H:%M").to_string();
-        let new_id = list.len() + 1;
+        let fallback_next_id = {
+            let sessions_map = self.user_sessions.read().await;
+            sessions_map
+                .get(&user_id)
+                .and_then(|list| list.iter().map(|session| session.id).max())
+                .unwrap_or(0)
+                .saturating_add(1)
+                .max(1)
+        };
+        let new_id = allocate_session_id_db_async(user_id)
+            .await
+            .unwrap_or(fallback_next_id);
         let name = custom_name
-            .map(|s| s.to_string())
+            .map(|value| truncate_chars(value.trim(), 60))
+            .filter(|value| !value.is_empty())
             .unwrap_or_else(|| format!("Session {now_str}"));
-
         let session = ChatSession {
             id: new_id,
             name,
             messages: Vec::new(),
             created_at: now_str,
         };
-        list.push(session.clone());
-        let _ = save_session_db(user_id, &session);
 
-        let new_idx = list.len() - 1;
-        drop(sessions_map);
-
-        self.active_session_idx.write().await.insert(user_id, new_idx);
-        if let Ok(conn) = open_session_db() {
-            let _ = conn.execute("INSERT INTO active_sessions(user_id,session_id) VALUES(?1,?2) ON CONFLICT(user_id) DO UPDATE SET session_id=excluded.session_id", params![user_id, new_idx]);
+        {
+            let mut sessions_map = self.user_sessions.write().await;
+            sessions_map
+                .entry(user_id)
+                .or_default()
+                .push(session.clone());
         }
+        let _ = save_session_metadata_db_async(user_id, session.clone()).await;
+        self.active_session_id.write().await.insert(user_id, new_id);
+        let _ = save_active_session_db_async(user_id, new_id).await;
         session
     }
 
-    pub async fn switch_session(&self, user_id: i64, index: usize) -> bool {
+    pub async fn switch_session_by_id(&self, user_id: i64, session_id: usize) -> bool {
         let sessions = self.get_sessions(user_id).await;
-        if index < sessions.len() {
-            self.active_session_idx.write().await.insert(user_id, index);
-            if let Ok(conn) = open_session_db() {
-                let _ = conn.execute("INSERT INTO active_sessions(user_id,session_id) VALUES(?1,?2) ON CONFLICT(user_id) DO UPDATE SET session_id=excluded.session_id", params![user_id, index]);
-            }
+        if sessions.iter().any(|session| session.id == session_id) {
+            self.active_session_id
+                .write()
+                .await
+                .insert(user_id, session_id);
+            let _ = save_active_session_db_async(user_id, session_id).await;
             return true;
         }
         false
     }
 
-    pub async fn remove_session(&self, user_id: i64, index: usize) -> bool {
-        let mut sessions_map = self.user_sessions.write().await;
-        if let Some(list) = sessions_map.get_mut(&user_id) {
-            if index < list.len() {
-                list.remove(index);
-                if list.is_empty() {
-                    let now_str = Local::now().format("%d %b %H:%M").to_string();
-                    list.push(ChatSession {
-                        id: 1,
-                        name: format!("Session {now_str}"),
-                        messages: Vec::new(),
-                        created_at: now_str,
-                    });
-                    let _ = save_session_db(user_id, &list[0]);
-                    self.active_session_idx.write().await.insert(user_id, 0);
-                } else {
-                    let mut active_map = self.active_session_idx.write().await;
-                    let curr = active_map.get(&user_id).copied().unwrap_or(0);
-                    if curr >= list.len() {
-                        active_map.insert(user_id, list.len() - 1);
-                    } else if curr == index {
-                        active_map.insert(user_id, index.saturating_sub(1));
-                    }
-                }
-                for session in list.iter() {
-                    let _ = save_session_db(user_id, session);
-                }
-                let active_idx = *self.active_session_idx.read().await.get(&user_id).unwrap_or(&0);
-                if let Ok(conn) = open_session_db() {
-                    let _ = conn.execute("INSERT INTO active_sessions(user_id,session_id) VALUES(?1,?2) ON CONFLICT(user_id) DO UPDATE SET session_id=excluded.session_id", params![user_id, active_idx]);
-                }
-                return true;
-            }
+    pub async fn switch_session(&self, user_id: i64, index: usize) -> bool {
+        let sessions = self.get_sessions(user_id).await;
+        let Some(session_id) = sessions.get(index).map(|session| session.id) else {
+            return false;
+        };
+        self.switch_session_by_id(user_id, session_id).await
+    }
+
+    pub async fn remove_session_by_id(&self, user_id: i64, session_id: usize) -> bool {
+        let active_id = self.get_active_session_id(user_id).await;
+        let (removed_id, mut new_active_id, create_replacement) = {
+            let mut sessions_map = self.user_sessions.write().await;
+            let Some(list) = sessions_map.get_mut(&user_id) else {
+                return false;
+            };
+            let Some(index) = list.iter().position(|session| session.id == session_id) else {
+                return false;
+            };
+            let removed = list.remove(index);
+            let create_replacement = list.is_empty();
+            let new_active_id = if !create_replacement
+                && (removed.id == active_id || !list.iter().any(|session| session.id == active_id))
+            {
+                let target_index = index.min(list.len().saturating_sub(1));
+                list[target_index].id
+            } else {
+                active_id
+            };
+            (removed.id, new_active_id, create_replacement)
+        };
+
+        let _ = delete_session_db_async(user_id, removed_id).await;
+        delete_session_attachments(user_id, removed_id).await;
+
+        if create_replacement {
+            let now_str = Local::now().format("%d %b %H:%M").to_string();
+            let replacement = ChatSession {
+                id: allocate_session_id_db_async(user_id)
+                    .await
+                    .unwrap_or(active_id.saturating_add(1).max(1)),
+                name: format!("Session {now_str}"),
+                messages: Vec::new(),
+                created_at: now_str,
+            };
+            let _ = save_session_metadata_db_async(user_id, replacement.clone()).await;
+            new_active_id = replacement.id;
+            self.user_sessions
+                .write()
+                .await
+                .entry(user_id)
+                .or_default()
+                .push(replacement);
         }
-        false
+
+        self.active_session_id
+            .write()
+            .await
+            .insert(user_id, new_active_id);
+        let _ = save_active_session_db_async(user_id, new_active_id).await;
+        true
+    }
+
+    pub async fn remove_session(&self, user_id: i64, index: usize) -> bool {
+        let sessions = self.get_sessions(user_id).await;
+        let Some(session_id) = sessions.get(index).map(|session| session.id) else {
+            return false;
+        };
+        self.remove_session_by_id(user_id, session_id).await
+    }
+
+    pub async fn rename_session_by_id(
+        &self,
+        user_id: i64,
+        session_id: usize,
+        new_name: &str,
+    ) -> bool {
+        let name = truncate_chars(new_name.trim(), 60);
+        if name.is_empty() {
+            return false;
+        }
+        let updated = {
+            let mut sessions_map = self.user_sessions.write().await;
+            let Some(list) = sessions_map.get_mut(&user_id) else {
+                return false;
+            };
+            let Some(session) = list.iter_mut().find(|session| session.id == session_id) else {
+                return false;
+            };
+            session.name = name;
+            session.clone()
+        };
+        save_session_metadata_db_async(user_id, updated).await
     }
 
     pub async fn rename_session(&self, user_id: i64, index: usize, new_name: &str) -> bool {
-        let mut sessions_map = self.user_sessions.write().await;
-        if let Some(list) = sessions_map.get_mut(&user_id) {
-            if let Some(sess) = list.get_mut(index) {
-                let trimmed = new_name.trim();
-                sess.name = trimmed[..trimmed.len().min(60)].to_string();
-                let _ = save_session_db(user_id, sess);
-                return true;
-            }
-        }
-        false
+        let sessions = self.get_sessions(user_id).await;
+        let Some(session_id) = sessions.get(index).map(|session| session.id) else {
+            return false;
+        };
+        self.rename_session_by_id(user_id, session_id, new_name)
+            .await
     }
 
     pub async fn clear_history(&self, user_id: i64) {
-        let idx = self.get_active_session_index(user_id).await;
-        let mut sessions_map = self.user_sessions.write().await;
-        if let Some(list) = sessions_map.get_mut(&user_id) {
-            if let Some(sess) = list.get_mut(idx) {
-                sess.messages.clear();
-                let _ = save_session_db(user_id, sess);
-            }
+        let active_id = self.get_active_session_id(user_id).await;
+        let cleared = {
+            let mut sessions_map = self.user_sessions.write().await;
+            sessions_map.get_mut(&user_id).and_then(|list| {
+                list.iter_mut()
+                    .find(|session| session.id == active_id)
+                    .map(|session| {
+                        session.messages.clear();
+                        session.clone()
+                    })
+            })
+        };
+        if let Some(session) = cleared {
+            let _ = replace_session_messages_db_async(user_id, session).await;
+            delete_session_attachments(user_id, active_id).await;
+        }
+    }
+
+    pub async fn generation_lock(&self, user_id: i64) -> Arc<Mutex<()>> {
+        if let Some(lock) = self.generation_locks.read().await.get(&user_id).cloned() {
+            return lock;
+        }
+        let mut locks = self.generation_locks.write().await;
+        locks
+            .entry(user_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    pub async fn begin_generation(&self, chat_id: i64, draft_id: i64) -> watch::Receiver<bool> {
+        let (sender, receiver) = watch::channel(false);
+        self.active_generations
+            .write()
+            .await
+            .insert((chat_id, draft_id), sender);
+        receiver
+    }
+
+    pub async fn cancel_generation(&self, chat_id: i64, draft_id: i64) -> bool {
+        let sender = self
+            .active_generations
+            .read()
+            .await
+            .get(&(chat_id, draft_id))
+            .cloned();
+        sender
+            .map(|sender| sender.send(true).is_ok())
+            .unwrap_or(false)
+    }
+
+    pub async fn end_generation(&self, chat_id: i64, draft_id: i64) {
+        self.active_generations
+            .write()
+            .await
+            .remove(&(chat_id, draft_id));
+    }
+
+    pub async fn cancel_all_generations(&self) {
+        let senders: Vec<GenerationCancelSender> = self
+            .active_generations
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect();
+        for sender in senders {
+            let _ = sender.send(true);
         }
     }
 
     pub async fn get_context_stats(&self, user_id: i64) -> ContextStats {
         let active_sess = self.get_active_session(user_id).await;
         let active_model = self.get_user_model(user_id).await;
-        let endpoint = self.get_active_provider(user_id).await.map(|provider| provider.endpoint).unwrap_or_default();
-        let metadata = self.model_metadata.read().await.get(&model_metadata_key(&endpoint, &active_model)).cloned();
-        let cap = get_model_capabilities_with_meta(&active_model, metadata.as_ref());
+        let endpoint = self
+            .get_active_provider(user_id)
+            .await
+            .map(|provider| provider.endpoint)
+            .unwrap_or_default();
+        let cap = self
+            .resolved_model_capability(&endpoint, &active_model)
+            .await;
         let limit_tokens = cap.context_limit;
         let limit_str = cap.context_str.clone();
 
@@ -1051,21 +607,25 @@ impl AIChatService {
         for (i, m) in active_sess.messages.iter().enumerate() {
             let c_str = match &m.content {
                 Value::String(s) => s.clone(),
-                v => v.to_string(),
+                value => decode_user_content(value)
+                    .map(|persisted| {
+                        if persisted.attachments.is_empty() {
+                            persisted.text
+                        } else {
+                            format!(
+                                "{}\n[{} persisted attachment(s)]",
+                                persisted.text,
+                                persisted.attachments.len()
+                            )
+                        }
+                    })
+                    .unwrap_or_else(|| value.to_string()),
             };
-            let chars = c_str.len();
-            let toks = (chars / 3).max(1);
+            let chars = c_str.chars().count();
+            let toks = estimate_text_tokens(&c_str);
             total_chars += chars;
 
-            let preview = if c_str.len() > 90 {
-                let mut end = 90;
-                while end < c_str.len() && !c_str.is_char_boundary(end) {
-                    end += 1;
-                }
-                format!("{}...", &c_str[..end])
-            } else {
-                c_str.clone()
-            };
+            let preview = truncate_chars_with_ellipsis(&c_str, 90);
 
             msg_stats.push(ContextMessageItem {
                 index: i + 1,
@@ -1076,7 +636,11 @@ impl AIChatService {
             });
         }
 
-        let total_tokens = total_chars / 3;
+        let total_tokens = active_sess
+            .messages
+            .iter()
+            .map(|message| estimate_stored_content_tokens(&message.content))
+            .sum();
         let usage_pct = ((total_tokens as f64 / limit_tokens.max(1) as f64) * 100.0).min(100.0);
 
         let mut filled_blocks = (usage_pct / 10.0).floor() as usize;
@@ -1084,7 +648,11 @@ impl AIChatService {
             filled_blocks = 1;
         }
         filled_blocks = filled_blocks.min(10);
-        let bar = format!("{}{}", "█".repeat(filled_blocks), "░".repeat(10 - filled_blocks));
+        let bar = format!(
+            "{}{}",
+            "█".repeat(filled_blocks),
+            "░".repeat(10 - filled_blocks)
+        );
 
         ContextStats {
             session_name: active_sess.name,
@@ -1095,7 +663,7 @@ impl AIChatService {
             limit_tokens,
             limit_str,
             total_messages: active_sess.messages.len(),
-            total_turns: (active_sess.messages.len() + 1) / 2,
+            total_turns: active_sess.messages.len().div_ceil(2),
             total_tokens,
             total_chars,
             usage_pct,
@@ -1114,21 +682,39 @@ impl AIChatService {
         audio_bytes: Vec<u8>,
         file_name: &str,
     ) -> (bool, Result<String, String>) {
-        let provider = match self.get_active_provider(user_id).await {
-            Some(p) if !p.endpoint.is_empty() => p,
-            _ => return (false, Err("Provider belum dikonfigurasi. Silakan jalankan /provider terlebih dahulu.".to_string())),
-        };
+        let provider =
+            match self.get_active_provider(user_id).await {
+                Some(p) if !p.endpoint.is_empty() => p,
+                _ => return (
+                    false,
+                    Err(
+                        "Provider belum dikonfigurasi. Silakan jalankan /provider terlebih dahulu."
+                            .to_string(),
+                    ),
+                ),
+            };
 
         let stt_url = format!("{}/audio/transcriptions", provider.endpoint);
-        let part = match Part::bytes(audio_bytes).file_name(file_name.to_string()).mime_str("audio/ogg") {
+        let part = match Part::bytes(audio_bytes)
+            .file_name(file_name.to_string())
+            .mime_str("audio/ogg")
+        {
             Ok(p) => p,
             Err(e) => return (false, Err(format!("Multipart part error: {e}"))),
         };
 
         let form = Form::new().part("file", part).text("model", "whisper-1");
-        let mut req = self.client.post(&stt_url).multipart(form).timeout(Duration::from_secs(45));
+        let mut req = self
+            .client
+            .post(&stt_url)
+            .multipart(form)
+            .timeout(Duration::from_secs(45));
 
-        if !provider.api_key.is_empty() && !["none", "-", "no"].iter().any(|k| provider.api_key.eq_ignore_ascii_case(k)) {
+        if !provider.api_key.is_empty()
+            && !["none", "-", "no"]
+                .iter()
+                .any(|k| provider.api_key.eq_ignore_ascii_case(k))
+        {
             req = req.header("Authorization", format!("Bearer {}", provider.api_key));
         }
 
@@ -1151,7 +737,14 @@ impl AIChatService {
                     (false, Err("ENDPOINT_NOT_SUPPORTED".to_string()))
                 } else {
                     let err_txt = resp.text().await.unwrap_or_default();
-                    (false, Err(format!("HTTP {}: {}", status.as_u16(), &err_txt[..err_txt.len().min(100)])))
+                    (
+                        false,
+                        Err(format!(
+                            "HTTP {}: {}",
+                            status.as_u16(),
+                            truncate_chars(&err_txt, 100).as_str()
+                        )),
+                    )
                 }
             }
             Err(e) => (false, Err(format!("Audio transcription error: {e}"))),
@@ -1165,24 +758,30 @@ impl AIChatService {
     pub async fn generate_response(
         &self,
         user_id: i64,
-        prompt: &str,
-        timeline: Option<&Arc<ExecutionTimeline>>,
-        image_bytes: Option<Vec<u8>>,
-        mime_type: Option<&str>,
-        doc_text: Option<&str>,
-        doc_name: Option<&str>,
-        audio_bytes: Option<Vec<u8>>,
-        audio_mime: Option<&str>,
-        video_bytes: Option<Vec<u8>>,
-        video_mime: Option<&str>,
-        video_duration: Option<i32>,
-    ) -> (Option<String>, String) {
+        input: GenerationInput<'_>,
+        cancel_rx: &mut watch::Receiver<bool>,
+    ) -> (Option<String>, String, bool) {
+        let GenerationInput {
+            prompt,
+            timeline,
+            image_bytes,
+            document_images,
+            mime_type,
+            doc_text,
+            doc_name,
+            audio_bytes,
+            audio_mime,
+            video_bytes,
+            video_mime,
+            video_duration,
+        } = input;
         let provider = match self.get_active_provider(user_id).await {
             Some(p) if !p.endpoint.is_empty() => p,
             _ => {
                 return (
                     None,
                     "👋 <b>Hi, selamat datang di XiaoAI!</b>\n\n⚠️ <i>AI Provider belum dikonfigurasi.</i>\nSilakan jalankan perintah <code>xiao provider add</code> di terminal.".to_string(),
+                    false,
                 );
             }
         };
@@ -1193,63 +792,53 @@ impl AIChatService {
         } else if !provider.active_model.is_empty() {
             provider.active_model.clone()
         } else {
-            provider.models.first().cloned().unwrap_or_else(|| "gpt-4o".to_string())
+            provider
+                .models
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "gpt-4o".to_string())
         };
 
-        let capability_registry = load_capability_registry();
-        let capability = capability_registry
-            .models
-            .iter()
-            .find(|record| record.provider_id == provider.endpoint.trim_end_matches('/') && record.model == model);
-        if let Some(record) = capability {
+        let capability = self.capability_record(&provider.endpoint, &model).await;
+        if let Some(record) = capability.as_ref() {
+            if document_images
+                .as_ref()
+                .is_some_and(|pages| !pages.is_empty())
+                && record.supports_image == Some(false)
+            {
+                return (
+                    None,
+                    format!(
+                        "Endpoint '{}' tidak mendukung vision yang diperlukan untuk membaca PDF scan pada model '{}'.",
+                        provider.name, model
+                    ),
+                    false,
+                );
+            }
             if video_bytes.is_some() && record.supports_video == Some(false) {
-                return (None, format!("Endpoint '{}' tidak mendukung input video untuk model '{}'.", provider.name, model));
+                return (
+                    None,
+                    format!(
+                        "Endpoint '{}' tidak mendukung input video untuk model '{}'.",
+                        provider.name, model
+                    ),
+                    false,
+                );
             }
             if audio_bytes.is_some() && record.supports_audio == Some(false) {
-                return (None, format!("Endpoint '{}' tidak mendukung input audio untuk model '{}'.", provider.name, model));
+                return (
+                    None,
+                    format!(
+                        "Endpoint '{}' tidak mendukung input audio untuk model '{}'.",
+                        provider.name, model
+                    ),
+                    false,
+                );
             }
         }
 
         let active_sess = self.get_active_session(user_id).await;
-        let mut history: Vec<Value> = active_sess
-            .messages
-            .iter()
-            .map(|m| json!({ "role": m.role, "content": m.content }))
-            .collect();
-
-        if history.len() > 10 {
-            let start = history.len() - 10;
-            history = history[start..].to_vec();
-        }
-
-        // Contextual stage classification
-        let _contextual_stages = if video_bytes.is_some() {
-            vec![
-                ("Watching", ProgressActivity::Watching),
-                ("Thinking", ProgressActivity::Thinking),
-                ("Writing", ProgressActivity::Writing),
-            ]
-        } else if image_bytes.is_some() {
-            vec![
-                ("Looking", ProgressActivity::Looking),
-                ("Thinking", ProgressActivity::Thinking),
-                ("Writing", ProgressActivity::Writing),
-            ]
-        } else if doc_text.is_some() {
-            vec![
-                ("Reading", ProgressActivity::Reading),
-                ("Thinking", ProgressActivity::Thinking),
-                ("Writing", ProgressActivity::Writing),
-            ]
-        } else if audio_bytes.is_some() {
-            vec![
-                ("Listening", ProgressActivity::Listening),
-                ("Thinking", ProgressActivity::Thinking),
-                ("Writing", ProgressActivity::Writing),
-            ]
-        } else {
-            generate_contextual_stages(prompt, &model)
-        };
+        let request_session_id = active_sess.id;
 
         let mut clean_prompt = prompt.trim().to_string();
         if let Some(doc) = doc_text {
@@ -1260,8 +849,19 @@ impl AIChatService {
             } else {
                 format!("{doc_header}{clean_prompt}")
             };
+        } else if document_images
+            .as_ref()
+            .is_some_and(|pages| !pages.is_empty())
+            && clean_prompt.is_empty()
+        {
+            let d_name = doc_name.unwrap_or("PDF scan");
+            clean_prompt = format!(
+                "Baca dan analisis halaman hasil render dari dokumen '{d_name}'. Lakukan OCR visual pada teks yang terlihat dan jelaskan isi dokumen secara akurat."
+            );
         } else if video_bytes.is_some() && clean_prompt.is_empty() {
-            let dur_str = video_duration.map(|d| format!(" ({d} detik)")).unwrap_or_default();
+            let dur_str = video_duration
+                .map(|d| format!(" ({d} detik)"))
+                .unwrap_or_default();
             clean_prompt = format!("Tonton dan analisis rekaman video ini{dur_str} secara mendalam. Jelaskan isi visual, alur peristiwa, teks di layar, dan suara di dalamnya.");
         } else if image_bytes.is_some() && clean_prompt.is_empty() {
             clean_prompt = "Jelaskan dan analisis gambar ini secara detail.".to_string();
@@ -1269,34 +869,92 @@ impl AIChatService {
             clean_prompt = "Dengarkan rekaman suara ini dan jawab pertanyaan atau instruksi di dalamnya secara lengkap.".to_string();
         }
 
-        let p_low = clean_prompt.to_lowercase();
-        let needs_think = ["logika", "teka-teki", "puzzle", "riddle", "analisis mendalam", "hitung", "rumus", "derivat", "audit", "debug"]
-            .iter()
-            .any(|k| p_low.contains(k))
-            || model.to_lowercase().contains("thinking");
+        let resolved_capability = self
+            .resolved_model_capability(&provider.endpoint, &model)
+            .await;
+        let max_output_tokens = max_output_tokens_for_model(&model)
+            .min(resolved_capability.context_limit.saturating_div(2).max(1));
+        let max_prompt_tokens = resolved_capability
+            .context_limit
+            .saturating_sub(max_output_tokens)
+            .saturating_sub(2_048)
+            .max(1);
+        if estimate_text_tokens(&clean_prompt) > max_prompt_tokens {
+            let max_chars = max_prompt_tokens.saturating_mul(4);
+            clean_prompt = truncate_chars(&clean_prompt, max_chars);
+            clean_prompt.push_str("\n\n[Input dipotong Xiao agar muat di context window model.]");
+        }
+        let enhanced_prompt = clean_prompt.clone();
 
-        let enhanced_prompt = if needs_think {
-            format!(
-                "Tuliskan analisis penalaranmu di dalam tag <think>...</think> terlebih dahulu jika diperlukan, lalu berikan jawabanmu dengan format yang rapi dan elegan.\n\n\
-                Pesan/Pertanyaan: {clean_prompt}"
-            )
-        } else {
-            clean_prompt.clone()
-        };
+        let reserved_tokens = max_output_tokens
+            .saturating_add(estimate_text_tokens(&enhanced_prompt))
+            .saturating_add(2_048);
+        let history_budget = resolved_capability
+            .context_limit
+            .saturating_sub(reserved_tokens);
+
+        let mut selected_history = Vec::new();
+        let mut used_history_tokens = 0usize;
+        for message in active_sess.messages.iter().rev().take(50) {
+            let estimated = estimate_stored_content_tokens(&message.content).saturating_add(8);
+            if !selected_history.is_empty()
+                && used_history_tokens.saturating_add(estimated) > history_budget
+            {
+                break;
+            }
+            if estimated > history_budget && selected_history.is_empty() {
+                continue;
+            }
+            used_history_tokens = used_history_tokens.saturating_add(estimated);
+            selected_history.push(message);
+        }
+        selected_history.reverse();
+
+        let mut history = Vec::with_capacity(selected_history.len());
+        for message in selected_history {
+            let content = if message.role == "user" {
+                self.rehydrate_history_content(
+                    user_id,
+                    request_session_id,
+                    &message.content,
+                    capability.as_ref(),
+                )
+                .await
+            } else {
+                message.content.clone()
+            };
+            history.push(json!({ "role": message.role, "content": content }));
+        }
 
         let mut messages = vec![json!({
             "role": "system",
             "content": "Kamu adalah asisten AI yang cerdas, komunikatif, dan ramah. \
-                        Kamu memiliki kemampuan penglihatan visual multimodal yang andal untuk menganalisis rekaman video, mengenali gambar/foto, membaca dokumen teks/PDF, serta mendengarkan pesan suara audio. \
+                        Gunakan input multimodal hanya ketika input tersebut benar-benar disediakan dan endpoint/model mendukungnya. \
+                        Dokumen Xiao diekstrak menjadi teks bila memungkinkan; PDF scan dapat diberikan sebagai halaman hasil render untuk OCR visual. \
+                        Lakukan penalaran secara internal dan berikan hanya jawaban yang berguna bagi pengguna; jangan menampilkan chain-of-thought tersembunyi. \
                         Gunakan gaya bahasa yang alami dan format teks yang elegan. \
-                        Jika membuat tabel atau data berkolom, SELALU gunakan format standar Markdown Table (| Kolom 1 | Kolom 2 |\n| :--- | :--- |) dan hindari menggambar border ASCII manual, karena sistem akan secara otomatis merendernya sebagai tabel native Telegram interaktif (InputRichBlockTable)."
+                        Jika membuat tabel atau data berkolom, gunakan Markdown Table standar agar Xiao dapat merendernya sebagai tabel Telegram."
         })];
 
         messages.extend(history);
 
-        if let Some(v_bytes) = video_bytes {
+        if let Some(pages) = document_images.as_ref().filter(|pages| !pages.is_empty()) {
             use base64::Engine;
-            let b64_vid = base64::engine::general_purpose::STANDARD.encode(&v_bytes);
+            let mut content = vec![json!({ "type": "text", "text": enhanced_prompt })];
+            for page in pages {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(page);
+                content.push(json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:image/png;base64,{encoded}"),
+                        "detail": "high"
+                    }
+                }));
+            }
+            messages.push(json!({ "role": "user", "content": content }));
+        } else if let Some(v_bytes) = video_bytes.as_ref() {
+            use base64::Engine;
+            let b64_vid = base64::engine::general_purpose::STANDARD.encode(v_bytes);
             let v_m = video_mime.unwrap_or("video/mp4");
             let data_url = format!("data:{v_m};base64,{b64_vid}");
             messages.push(json!({
@@ -1306,9 +964,9 @@ impl AIChatService {
                     { "type": "image_url", "image_url": { "url": data_url } }
                 ]
             }));
-        } else if let Some(i_bytes) = image_bytes {
+        } else if let Some(i_bytes) = image_bytes.as_ref() {
             use base64::Engine;
-            let b64_img = base64::engine::general_purpose::STANDARD.encode(&i_bytes);
+            let b64_img = base64::engine::general_purpose::STANDARD.encode(i_bytes);
             let i_m = mime_type.unwrap_or("image/jpeg");
             let data_url = format!("data:{i_m};base64,{b64_img}");
             messages.push(json!({
@@ -1318,10 +976,14 @@ impl AIChatService {
                     { "type": "image_url", "image_url": { "url": data_url, "detail": "auto" } }
                 ]
             }));
-        } else if let Some(a_bytes) = audio_bytes {
+        } else if let Some(a_bytes) = audio_bytes.as_ref() {
             use base64::Engine;
-            let b64_audio = base64::engine::general_purpose::STANDARD.encode(&a_bytes);
-            let fmt = if audio_mime.unwrap_or("").contains("ogg") { "ogg" } else { "mp3" };
+            let b64_audio = base64::engine::general_purpose::STANDARD.encode(a_bytes);
+            let fmt = if audio_mime.unwrap_or("").contains("ogg") {
+                "ogg"
+            } else {
+                "mp3"
+            };
             messages.push(json!({
                 "role": "user",
                 "content": [
@@ -1337,148 +999,245 @@ impl AIChatService {
         }
 
         let url = format!("{}/chat/completions", provider.endpoint);
-        let m_lower = model.to_lowercase();
-        let max_output_tokens: usize = if m_lower.contains("gemini") {
-            65536
-        } else if m_lower.contains("claude") {
-            64000
-        } else if ["o1", "o3", "gpt-4o", "gpt-5", "sol", "terra", "luna"].iter().any(|k| m_lower.contains(k)) {
-            65536
-        } else {
-            16384
-        };
+        let payload = json!({
+            "model": model,
+            "messages": messages,
+            "stream": true,
+            "max_tokens": max_output_tokens,
+        });
 
-        let mut req = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&json!({
-                "model": model,
-                "messages": messages,
-                "stream": true,
-                "max_tokens": max_output_tokens,
-            }))
-            .timeout(Duration::from_secs(180));
+        let use_auth = !provider.api_key.is_empty()
+            && !["none", "-", "no"]
+                .iter()
+                .any(|k| provider.api_key.eq_ignore_ascii_case(k));
 
-        if !provider.api_key.is_empty() && !["none", "-", "no"].iter().any(|k| provider.api_key.eq_ignore_ascii_case(k)) {
-            req = req.header("Authorization", format!("Bearer {}", provider.api_key));
-        }
-
-        let resp = match req.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                error!("Error sending AI completion request: {e}");
-                if let Some(tl) = timeline {
-                    tl.fail_current(e.to_string()).await;
-                    tl.sync_draft(true).await;
-                }
-                return (None, format!("⚠️ Terjadi kendala saat memproses jawaban AI: {e}"));
+        let mut response = None;
+        let mut terminal_transport_failure = false;
+        for attempt in 0..MAX_PROVIDER_ATTEMPTS {
+            let mut req = self
+                .client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .timeout(Duration::from_secs(180));
+            if use_auth {
+                req = req.header("Authorization", format!("Bearer {}", provider.api_key));
             }
-        };
 
-        if !resp.status().is_success() {
-            let status_code = resp.status().as_u16();
-            let err_txt = resp.text().await.unwrap_or_default();
-            error!("AI endpoint returned status {status_code}: {err_txt}");
-            if let Some(tl) = timeline {
-                tl.fail_current(format!("API status {status_code}")).await;
-                tl.sync_draft(true).await;
-            }
-            return (None, format!("⚠️ Gagal menghubungi AI proxy: {status_code}"));
-        }
-
-        let mut stream = resp.bytes_stream();
-        let mut buffer = String::new();
-        let mut accumulated_raw = String::new();
-        let mut accumulated_reasoning = String::new();
-        let mut last_activity: Option<ProgressActivity> = None;
-        let mut has_started_answer = false;
-
-        while let Some(item) = stream.next().await {
-            let bytes = match item {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!("Stream chunk error: {e}");
-                    break;
+            let mut send_future = Box::pin(req.send());
+            let send_result = tokio::select! {
+                changed = cancel_rx.changed() => {
+                    if changed.is_ok() && *cancel_rx.borrow() {
+                        if let Some(tl) = timeline {
+                            tl.fail_current("Stopped by user".to_string()).await;
+                            tl.sync_draft(true).await;
+                        }
+                        return (None, "⏹️ Generasi dihentikan oleh pengguna.".to_string(), true);
+                    }
+                    send_future.as_mut().await
                 }
+                result = send_future.as_mut() => result,
             };
 
-            let chunk_str = String::from_utf8_lossy(&bytes);
-            buffer.push_str(&chunk_str);
-
-            while let Some(newline_pos) = buffer.find('\n') {
-                let line = buffer[..newline_pos].trim().to_string();
-                buffer.drain(..=newline_pos);
-
-                if !line.starts_with("data: ") {
-                    continue;
-                }
-                let line_data = &line[6..].trim();
-                if *line_data == "[DONE]" {
-                    break;
-                }
-
-                if let Ok(data) = serde_json::from_str::<Value>(line_data) {
-                    if let Some(choice) = data.get("choices").and_then(|c| c.get(0)) {
-                        if let Some(delta) = choice.get("delta") {
-                            let content_chunk = delta.get("content").and_then(|s| s.as_str()).unwrap_or("");
-                            let reasoning_chunk = delta.get("reasoning_content").and_then(|s| s.as_str()).unwrap_or("");
-
-                            if !reasoning_chunk.is_empty() {
-                                accumulated_reasoning.push_str(reasoning_chunk);
+            match send_result {
+                Ok(resp)
+                    if is_retryable_status(resp.status())
+                        && attempt + 1 < MAX_PROVIDER_ATTEMPTS =>
+                {
+                    let status = resp.status();
+                    let delay = retry_delay(resp.headers(), attempt);
+                    let _ = resp.bytes().await;
+                    warn!(
+                        "Transient provider status {}; retrying attempt {}/{}",
+                        status.as_u16(),
+                        attempt + 2,
+                        MAX_PROVIDER_ATTEMPTS
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        changed = cancel_rx.changed() => {
+                            if changed.is_ok() && *cancel_rx.borrow() {
                                 if let Some(tl) = timeline {
-                                    let mut window_start = accumulated_reasoning.len().saturating_sub(150);
-                                    while window_start > 0 && !accumulated_reasoning.is_char_boundary(window_start) {
-                                        window_start += 1;
-                                    }
-                                    let act = classify_text_activity(&accumulated_reasoning[window_start..]);
-                                    if Some(act) != last_activity {
-                                        last_activity = Some(act);
-                                        tl.add_action(act.display_name(), Some(act)).await;
-                                        tl.sync_draft(false).await;
-                                    }
+                                    tl.fail_current("Stopped by user".to_string()).await;
+                                    tl.sync_draft(true).await;
                                 }
-                            }
-
-                            if !content_chunk.is_empty() {
-                                accumulated_raw.push_str(content_chunk);
-
-                                if accumulated_raw.contains("<think>") {
-                                    if !accumulated_raw.contains("</think>") {
-                                        if let Some(tl) = timeline {
-                                            if let Some(after) = accumulated_raw.split("<think>").nth(1) {
-                                                let mut window_start = after.len().saturating_sub(150);
-                                                while window_start > 0 && !after.is_char_boundary(window_start) {
-                                                    window_start += 1;
-                                                }
-                                                let act = classify_text_activity(&after[window_start..]);
-                                                if Some(act) != last_activity {
-                                                    last_activity = Some(act);
-                                                    tl.add_action(act.display_name(), Some(act)).await;
-                                                    tl.sync_draft(false).await;
-                                                }
-                                            }
-                                        }
-                                    } else if !has_started_answer {
-                                        has_started_answer = true;
-                                        last_activity = Some(ProgressActivity::Writing);
-                                        if let Some(tl) = timeline {
-                                            tl.add_action("Writing", Some(ProgressActivity::Writing)).await;
-                                            tl.sync_draft(false).await;
-                                        }
-                                    }
-                                } else if !has_started_answer {
-                                    has_started_answer = true;
-                                    last_activity = Some(ProgressActivity::Writing);
-                                    if let Some(tl) = timeline {
-                                        tl.add_action("Writing", Some(ProgressActivity::Writing)).await;
-                                        tl.sync_draft(false).await;
-                                    }
-                                }
+                                return (None, "⏹️ Generasi dihentikan oleh pengguna.".to_string(), true);
                             }
                         }
                     }
                 }
+                Ok(resp) => {
+                    response = Some(resp);
+                    break;
+                }
+                Err(e) => {
+                    let retryable_transport = e.is_timeout() || e.is_connect();
+                    if retryable_transport && attempt + 1 < MAX_PROVIDER_ATTEMPTS {
+                        let delay =
+                            Duration::from_millis(500_u64.saturating_mul(1_u64 << attempt.min(5)));
+                        warn!(
+                            "Transient provider transport failure; retrying attempt {}/{}",
+                            attempt + 2,
+                            MAX_PROVIDER_ATTEMPTS
+                        );
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            changed = cancel_rx.changed() => {
+                                if changed.is_ok() && *cancel_rx.borrow() {
+                                    if let Some(tl) = timeline {
+                                        tl.fail_current("Stopped by user".to_string()).await;
+                                        tl.sync_draft(true).await;
+                                    }
+                                    return (None, "⏹️ Generasi dihentikan oleh pengguna.".to_string(), true);
+                                }
+                            }
+                        }
+                    } else {
+                        error!(
+                            "Error sending AI completion request: {}",
+                            if e.is_timeout() {
+                                "timeout"
+                            } else {
+                                "transport failure"
+                            }
+                        );
+                        terminal_transport_failure = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let Some(resp) = response else {
+            if let Some(tl) = timeline {
+                tl.fail_current("Provider connection failed".to_string())
+                    .await;
+                tl.sync_draft(true).await;
+            }
+            return (
+                None,
+                if terminal_transport_failure {
+                    "⚠️ Terjadi kendala saat memproses jawaban AI.".to_string()
+                } else {
+                    "⚠️ Provider tidak merespons setelah beberapa percobaan.".to_string()
+                },
+                false,
+            );
+        };
+
+        if !resp.status().is_success() {
+            let status_code = resp.status().as_u16();
+            let _ = resp.text().await;
+            error!("AI endpoint returned status {status_code}");
+            if let Some(tl) = timeline {
+                tl.fail_current(format!("API status {status_code}")).await;
+                tl.sync_draft(true).await;
+            }
+            return (
+                None,
+                format!("⚠️ Gagal menghubungi AI proxy: {status_code}"),
+                false,
+            );
+        }
+
+        let mut stream = resp.bytes_stream();
+        let mut decoder = SseDecoder::default();
+        let mut accumulated_raw = String::new();
+        let mut accumulated_reasoning = String::new();
+        let mut has_started_answer = false;
+
+        let mut cancelled = false;
+        let mut stream_interrupted = false;
+        let mut stream_done = false;
+        while !stream_done {
+            let mut next_future = Box::pin(stream.next());
+            let next_item = tokio::select! {
+                changed = cancel_rx.changed() => {
+                    if changed.is_ok() && *cancel_rx.borrow() {
+                        cancelled = true;
+                        None
+                    } else {
+                        next_future.as_mut().await
+                    }
+                }
+                item = next_future.as_mut() => item,
+            };
+
+            let Some(item) = next_item else {
+                break;
+            };
+            let bytes = match item {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    stream_interrupted = true;
+                    warn!("AI response stream interrupted");
+                    break;
+                }
+            };
+
+            for event in decoder.push(&bytes) {
+                match event {
+                    StreamEvent::Done => {
+                        stream_done = true;
+                        break;
+                    }
+                    StreamEvent::Json(data) => {
+                        let Some(delta) = data
+                            .get("choices")
+                            .and_then(|choices| choices.get(0))
+                            .and_then(|choice| choice.get("delta"))
+                        else {
+                            continue;
+                        };
+
+                        if let Some(reasoning_chunk) =
+                            delta.get("reasoning_content").and_then(Value::as_str)
+                        {
+                            accumulated_reasoning.push_str(reasoning_chunk);
+                        }
+
+                        let content_chunk =
+                            delta.get("content").and_then(Value::as_str).unwrap_or("");
+                        if content_chunk.is_empty() {
+                            continue;
+                        }
+                        accumulated_raw.push_str(content_chunk);
+
+                        let visible_partial =
+                            if let Some(close_pos) = accumulated_raw.rfind("</think>") {
+                                accumulated_raw[close_pos + "</think>".len()..].trim()
+                            } else if accumulated_raw.contains("<think>") {
+                                ""
+                            } else {
+                                accumulated_raw.trim()
+                            };
+
+                        if !visible_partial.is_empty() {
+                            if !has_started_answer {
+                                has_started_answer = true;
+                                if let Some(tl) = timeline {
+                                    tl.add_action("Writing", Some(ProgressActivity::Writing))
+                                        .await;
+                                }
+                            }
+                            if let Some(tl) = timeline {
+                                tl.set_partial_answer(visible_partial).await;
+                                tl.sync_draft(false).await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !stream_done && !cancelled && !stream_interrupted {
+            for event in decoder.finish() {
+                if matches!(event, StreamEvent::Done) {
+                    stream_done = true;
+                }
+            }
+            if !stream_done {
+                stream_interrupted = true;
             }
         }
 
@@ -1493,7 +1252,10 @@ impl AIChatService {
             let think_re = regex::Regex::new(r"(?s)<think>(.*?)</think>").unwrap();
             if let Some(caps) = think_re.captures(&accumulated_raw) {
                 thinking_text = caps.get(1).map(|m| m.as_str().trim().to_string());
-                answer_text = think_re.replace_all(&accumulated_raw, "").trim().to_string();
+                answer_text = think_re
+                    .replace_all(&accumulated_raw, "")
+                    .trim()
+                    .to_string();
             } else if accumulated_raw.contains("<think>") {
                 let parts: Vec<&str> = accumulated_raw.split("<think>").collect();
                 let before_think = parts[0].trim();
@@ -1509,7 +1271,10 @@ impl AIChatService {
         }
 
         let tag_clean_re = regex::Regex::new(r"(?i)</?think>").unwrap();
-        answer_text = tag_clean_re.replace_all(&answer_text, "").trim().to_string();
+        answer_text = tag_clean_re
+            .replace_all(&answer_text, "")
+            .trim()
+            .to_string();
 
         if answer_text.is_empty() {
             if let Some(ref th) = thinking_text {
@@ -1517,51 +1282,145 @@ impl AIChatService {
             }
         }
 
-        if answer_text.is_empty() {
+        if cancelled {
+            if answer_text.trim().is_empty() {
+                answer_text = "⏹️ Generasi dihentikan oleh pengguna.".to_string();
+            } else {
+                answer_text.push_str("\n\n_⏹️ Generasi dihentikan oleh pengguna._");
+            }
+        } else if stream_interrupted {
+            if answer_text.trim().is_empty() {
+                answer_text = "⚠️ Stream provider terputus sebelum jawaban diterima.".to_string();
+            } else {
+                answer_text
+                    .push_str("\n\n_⚠️ Stream provider terputus; jawaban mungkin tidak lengkap._");
+            }
+        } else if answer_text.is_empty() {
             answer_text = "Maaf, respon AI kosong untuk permintaan ini.".to_string();
         }
 
         if let Some(tl) = timeline {
-            if !has_started_answer {
-                tl.add_action("Writing", Some(ProgressActivity::Writing)).await;
+            tl.set_partial_answer(&answer_text).await;
+            if cancelled {
+                tl.fail_current("Stopped by user".to_string()).await;
                 tl.sync_draft(true).await;
-            }
-            tl.finish_all(ProgressState::Done).await;
-        }
-
-        // Auto-update session name on first turn
-        let idx = self.get_active_session_index(user_id).await;
-        let mut sessions_map = self.user_sessions.write().await;
-        if let Some(list) = sessions_map.get_mut(&user_id) {
-            if let Some(sess) = list.get_mut(idx) {
-                if sess.messages.is_empty() && sess.name.starts_with("Session ") {
-                    let clean_title = prompt.trim().replace('\n', " ");
-                    let short_title = if clean_title.len() > 35 {
-                        let mut end = 32;
-                        while end < clean_title.len() && !clean_title.is_char_boundary(end) {
-                            end += 1;
-                        }
-                        format!("{}...", &clean_title[..end])
-                    } else {
-                        clean_title
-                    };
-                    if !short_title.is_empty() {
-                        sess.name = short_title;
-                    }
+            } else if stream_interrupted {
+                tl.fail_current("Provider stream interrupted".to_string())
+                    .await;
+                tl.sync_draft(true).await;
+            } else {
+                if !has_started_answer {
+                    tl.add_action("Writing", Some(ProgressActivity::Writing))
+                        .await;
+                    tl.sync_draft(true).await;
                 }
-                sess.messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: Value::String(prompt.to_string()),
-                });
-                sess.messages.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: Value::String(answer_text.clone()),
-                });
-                let _ = save_session_db(user_id, sess);
+                tl.finish_all(ProgressState::Done).await;
             }
         }
 
-        (thinking_text, answer_text)
+        // Persist only to the stable session that originated this request. Multimodal
+        // attachments are stored outside SQLite and referenced from the user message so
+        // follow-up turns can rehydrate the original media without bloating the database.
+        let mut attachment_refs = Vec::new();
+        if let Some(pages) = document_images.as_ref() {
+            for (index, page) in pages.iter().enumerate() {
+                let page_name = format!(
+                    "{} page {}",
+                    doc_name.unwrap_or("PDF scan"),
+                    index.saturating_add(1)
+                );
+                match persist_attachment(
+                    user_id,
+                    request_session_id,
+                    "document_page",
+                    "image/png",
+                    Some(&page_name),
+                    page,
+                )
+                .await
+                {
+                    Ok(reference) => attachment_refs.push(reference),
+                    Err(err) => warn!("Failed to persist rendered PDF page: {err}"),
+                }
+            }
+        } else if let Some(bytes) = image_bytes.as_ref() {
+            match persist_attachment(
+                user_id,
+                request_session_id,
+                "image",
+                mime_type.unwrap_or("image/jpeg"),
+                None,
+                bytes,
+            )
+            .await
+            {
+                Ok(reference) => attachment_refs.push(reference),
+                Err(err) => warn!("Failed to persist image attachment: {err}"),
+            }
+        } else if let Some(bytes) = audio_bytes.as_ref() {
+            match persist_attachment(
+                user_id,
+                request_session_id,
+                "audio",
+                audio_mime.unwrap_or("audio/ogg"),
+                None,
+                bytes,
+            )
+            .await
+            {
+                Ok(reference) => attachment_refs.push(reference),
+                Err(err) => warn!("Failed to persist audio attachment: {err}"),
+            }
+        } else if let Some(bytes) = video_bytes.as_ref() {
+            match persist_attachment(
+                user_id,
+                request_session_id,
+                "video",
+                video_mime.unwrap_or("video/mp4"),
+                None,
+                bytes,
+            )
+            .await
+            {
+                Ok(reference) => attachment_refs.push(reference),
+                Err(err) => warn!("Failed to persist video attachment: {err}"),
+            }
+        }
+
+        let user_message = ChatMessage {
+            role: "user".to_string(),
+            content: encode_user_content(&clean_prompt, attachment_refs),
+        };
+        let assistant_message = ChatMessage {
+            role: "assistant".to_string(),
+            content: Value::String(answer_text.clone()),
+        };
+        let appended = [user_message.clone(), assistant_message.clone()];
+        let persisted_session = {
+            let mut sessions_map = self.user_sessions.write().await;
+            sessions_map.get_mut(&user_id).and_then(|list| {
+                list.iter_mut()
+                    .find(|session| session.id == request_session_id)
+                    .map(|session| {
+                        if session.messages.is_empty() && session.name.starts_with("Session ") {
+                            let clean_title = prompt.trim().replace('\n', " ");
+                            let short_title = truncate_chars_with_ellipsis(&clean_title, 32);
+                            if !short_title.is_empty() {
+                                session.name = short_title;
+                            }
+                        }
+                        session.messages.extend(appended.iter().cloned());
+                        session.clone()
+                    })
+            })
+        };
+        if let Some(session) = persisted_session {
+            let _ = append_session_messages_db_async(user_id, session, appended.to_vec()).await;
+        } else {
+            warn!("Discarding late AI result for deleted session {request_session_id}");
+        }
+
+        (thinking_text, answer_text, cancelled)
     }
 
     // ==========================================
@@ -1594,7 +1453,11 @@ impl AIChatService {
                     }))
                     .timeout(Duration::from_secs(45));
 
-                if !p.api_key.is_empty() && !["none", "-", "no"].iter().any(|k| p.api_key.eq_ignore_ascii_case(k)) {
+                if !p.api_key.is_empty()
+                    && !["none", "-", "no"]
+                        .iter()
+                        .any(|k| p.api_key.eq_ignore_ascii_case(k))
+                {
                     req = req.header("Authorization", format!("Bearer {}", p.api_key));
                 }
 
@@ -1602,16 +1465,29 @@ impl AIChatService {
                     if resp.status().is_success() {
                         if let Ok(res_json) = resp.json::<Value>().await {
                             if let Some(data) = res_json.get("data").and_then(|d| d.get(0)) {
-                                if let Some(b64_str) = data.get("b64_json").and_then(|s| s.as_str()) {
+                                if let Some(b64_str) = data.get("b64_json").and_then(|s| s.as_str())
+                                {
                                     use base64::Engine;
-                                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64_str) {
-                                        return (true, Some(bytes), format!("OpenAI Compatible ({})", p.name));
+                                    if let Ok(bytes) =
+                                        base64::engine::general_purpose::STANDARD.decode(b64_str)
+                                    {
+                                        return (
+                                            true,
+                                            Some(bytes),
+                                            format!("OpenAI Compatible ({})", p.name),
+                                        );
                                     }
-                                } else if let Some(img_url) = data.get("url").and_then(|s| s.as_str()) {
+                                } else if let Some(img_url) =
+                                    data.get("url").and_then(|s| s.as_str())
+                                {
                                     if let Ok(img_resp) = self.client.get(img_url).send().await {
                                         if img_resp.status().is_success() {
                                             if let Ok(bytes) = img_resp.bytes().await {
-                                                return (true, Some(bytes.to_vec()), format!("OpenAI Compatible ({})", p.name));
+                                                return (
+                                                    true,
+                                                    Some(bytes.to_vec()),
+                                                    format!("OpenAI Compatible ({})", p.name),
+                                                );
                                             }
                                         }
                                     }
@@ -1623,32 +1499,101 @@ impl AIChatService {
             }
         }
 
-        // 2. Universal High-Performance Fallback Engine (FLUX.1 via Pollinations)
+        // 2. Optional external fallback. Disabled by default to avoid silently
+        // sending user prompts to a provider they did not select.
+        let fallback = match std::env::var("IMAGE_FALLBACK_PROVIDER") {
+            Ok(value) => value,
+            Err(_) => load_app_setting_async("IMAGE_FALLBACK_PROVIDER")
+                .await
+                .unwrap_or_else(|| "none".to_string()),
+        };
+        if !fallback.eq_ignore_ascii_case("pollinations") {
+            return (
+                false,
+                None,
+                "Provider aktif tidak menghasilkan gambar dan fallback eksternal dinonaktifkan. Set IMAGE_FALLBACK_PROVIDER=pollinations untuk opt-in.".to_string(),
+            );
+        }
+
         let encoded_prompt = urlencoding::encode(clean_prompt);
         let poll_url = format!(
             "https://image.pollinations.ai/prompt/{}?width={}&height={}&model=flux&nologo=true&enhance=true",
             encoded_prompt, width, height
         );
 
-        match self.client.get(&poll_url).timeout(Duration::from_secs(60)).send().await {
+        match self
+            .client
+            .get(&poll_url)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+        {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
                     match resp.bytes().await {
-                        Ok(bytes) if bytes.len() > 1000 => (true, Some(bytes.to_vec()), "FLUX.1 (Ultra HD)".to_string()),
-                        _ => (false, None, "Respon gambar rusak atau terlalu kecil.".to_string()),
+                        Ok(bytes) if bytes.len() > 1000 => {
+                            (true, Some(bytes.to_vec()), "FLUX.1 (Ultra HD)".to_string())
+                        }
+                        _ => (
+                            false,
+                            None,
+                            "Respon gambar rusak atau terlalu kecil.".to_string(),
+                        ),
                     }
                 } else {
-                    (false, None, format!("HTTP Error {} saat membuat gambar.", status.as_u16()))
+                    (
+                        false,
+                        None,
+                        format!("HTTP Error {} saat membuat gambar.", status.as_u16()),
+                    )
                 }
             }
             Err(e) => {
                 if e.is_timeout() {
-                    (false, None, "Waktu generate gambar habis (Timeout). Silakan coba lagi.".to_string())
+                    (
+                        false,
+                        None,
+                        "Waktu generate gambar habis (Timeout). Silakan coba lagi.".to_string(),
+                    )
                 } else {
                     (false, None, format!("Gagal membuat gambar: {e}"))
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(id: usize) -> ChatSession {
+        ChatSession {
+            id,
+            name: format!("Session {id}"),
+            messages: Vec::new(),
+            created_at: "now".to_string(),
+        }
+    }
+
+    #[test]
+    fn legacy_active_index_maps_to_stable_session_id() {
+        let sessions = vec![session(3), session(8), session(20)];
+        assert_eq!(
+            crate::ai::storage::legacy_active_session_id(Some(1), &sessions),
+            Some(8)
+        );
+        assert_eq!(
+            crate::ai::storage::legacy_active_session_id(Some(99), &sessions),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn session_id_counter_never_reuses_deleted_high_water_mark() {
+        assert_eq!(crate::ai::storage::compute_next_session_id(Some(21), 8), 21);
+        assert_eq!(crate::ai::storage::compute_next_session_id(Some(4), 8), 9);
+        assert_eq!(crate::ai::storage::compute_next_session_id(None, 8), 9);
     }
 }
