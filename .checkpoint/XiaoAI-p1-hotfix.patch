@@ -1,8 +1,104 @@
+diff --git a/src/ai/provider.rs b/src/ai/provider.rs
+index 4fb96ab..c319a17 100644
+--- a/src/ai/provider.rs
++++ b/src/ai/provider.rs
+@@ -79,68 +79,6 @@ impl AIChatService {
+         true
+     }
+ 
+-    pub async fn add_user_provider(
+-        &self,
+-        _user_id: i64,
+-        endpoint: &str,
+-        api_key: &str,
+-        alias: &str,
+-        models: Vec<String>,
+-    ) -> ProviderConfig {
+-        use rand::Rng;
+-        let random_suffix: String = rand::thread_rng()
+-            .sample_iter(&rand::distributions::Alphanumeric)
+-            .take(6)
+-            .map(char::from)
+-            .collect();
+-        let provider_id = format!("prov_{}", random_suffix.to_lowercase());
+-
+-        let default_model = models
+-            .first()
+-            .cloned()
+-            .unwrap_or_else(|| "gpt-4o".to_string());
+-        let provider = ProviderConfig {
+-            id: provider_id.clone(),
+-            name: if alias.trim().is_empty() {
+-                "Custom Provider".to_string()
+-            } else {
+-                alias.trim().to_string()
+-            },
+-            endpoint: endpoint.trim().trim_end_matches('/').to_string(),
+-            api_key: api_key.trim().to_string(),
+-            models,
+-            active_model: default_model,
+-        };
+-
+-        let snapshot = {
+-            let mut store = self.provider_store.write().await;
+-            store.providers.push(provider.clone());
+-            store.active_id = Some(provider_id);
+-            store.clone()
+-        };
+-        let _ = persist_provider_state(snapshot).await;
+-        provider
+-    }
+-
+-    pub async fn remove_user_provider(&self, _user_id: i64, provider_id: &str) -> bool {
+-        let snapshot = {
+-            let mut store = self.provider_store.write().await;
+-            let Some(pos) = store
+-                .providers
+-                .iter()
+-                .position(|provider| provider.id == provider_id)
+-            else {
+-                return false;
+-            };
+-            store.providers.remove(pos);
+-            if store.active_id.as_deref() == Some(provider_id) {
+-                store.active_id = store.providers.first().map(|provider| provider.id.clone());
+-            }
+-            store.clone()
+-        };
+-        persist_provider_state(snapshot).await
+-    }
+-
+     pub async fn update_provider_models(
+         &self,
+         _user_id: i64,
 diff --git a/src/cli.rs b/src/cli.rs
+index 146270b..0227dd3 100644
 --- a/src/cli.rs
 +++ b/src/cli.rs
 @@ -1,3 +1,4 @@
 +use rand::Rng;
  use std::env;
  use std::io::{self, BufRead, Write};
+ 
+diff --git a/src/document.rs b/src/document.rs
+index 69d68fb..14b9efc 100644
+--- a/src/document.rs
++++ b/src/document.rs
+@@ -183,7 +183,7 @@ fn extract_docx_text(data: &[u8]) -> Result<String, String> {
+     let xml = breaks.replace_all(&xml, "\n");
+     let stripped = tags.replace_all(&xml, "");
+     Ok(normalize_extracted_text(
+-        &html_escape::decode_html_entities(&stripped).to_string(),
++        html_escape::decode_html_entities(&stripped).as_ref(),
+     ))
+ }
+ 
+@@ -385,7 +385,7 @@ async fn render_scanned_pdf_pages(data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+     Ok(pages)
+ }
+ 
+-fn rendered_page_path(prefix: &PathBuf, index: usize) -> PathBuf {
++fn rendered_page_path(prefix: &Path, index: usize) -> PathBuf {
+     PathBuf::from(format!("{}-{index}.png", prefix.display()))
+ }
  
