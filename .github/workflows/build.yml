@@ -64,9 +64,7 @@ jobs:
         run: cargo install cargo-ndk --locked
 
       - name: Build
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/26.3.11579264
-        run: cargo ndk -t arm64-v8a -p 26 build --release
+        run: cargo ndk -t arm64-v8a -P 26 build --release
 
       - name: Upload Android binary
         uses: actions/upload-artifact@v4
