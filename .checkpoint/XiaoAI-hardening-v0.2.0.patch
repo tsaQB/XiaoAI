@@ -7287,10 +7287,10 @@ index d71ed44..5c9b852 100644
              debug!("Failed to sync draft update: {e}");
 diff --git a/src/util.rs b/src/util.rs
 new file mode 100644
-index 0000000..0b3d4e3
+index 0000000..b780ef0
 --- /dev/null
 +++ b/src/util.rs
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,116 @@
 +pub fn truncate_chars(input: &str, max_chars: usize) -> String {
 +    input.chars().take(max_chars).collect()
 +}
@@ -7328,11 +7328,48 @@ index 0000000..0b3d4e3
 +
 +    let lower = file_name.to_ascii_lowercase();
 +    [
-+        ".txt", ".md", ".markdown", ".json", ".jsonl", ".xml", ".yaml", ".yml",
-+        ".toml", ".csv", ".tsv", ".log", ".rs", ".go", ".py", ".js", ".ts",
-+        ".jsx", ".tsx", ".java", ".kt", ".kts", ".c", ".h", ".cpp", ".hpp",
-+        ".cs", ".php", ".rb", ".sh", ".bash", ".zsh", ".fish", ".sql", ".html",
-+        ".htm", ".css", ".scss", ".ini", ".cfg", ".conf", ".env",
++        ".txt",
++        ".md",
++        ".markdown",
++        ".json",
++        ".jsonl",
++        ".xml",
++        ".yaml",
++        ".yml",
++        ".toml",
++        ".csv",
++        ".tsv",
++        ".log",
++        ".rs",
++        ".go",
++        ".py",
++        ".js",
++        ".ts",
++        ".jsx",
++        ".tsx",
++        ".java",
++        ".kt",
++        ".kts",
++        ".c",
++        ".h",
++        ".cpp",
++        ".hpp",
++        ".cs",
++        ".php",
++        ".rb",
++        ".sh",
++        ".bash",
++        ".zsh",
++        ".fish",
++        ".sql",
++        ".html",
++        ".htm",
++        ".css",
++        ".scss",
++        ".ini",
++        ".cfg",
++        ".conf",
++        ".env",
 +    ]
 +    .iter()
 +    .any(|ext| lower.ends_with(ext))
@@ -7350,13 +7387,19 @@ index 0000000..0b3d4e3
 +
 +    #[test]
 +    fn html_is_escaped() {
-+        assert_eq!(escape_html("<b>&\"x\"</b>"), "&lt;b&gt;&amp;\"x\"&lt;/b&gt;");
++        assert_eq!(
++            escape_html("<b>&\"x\"</b>"),
++            "&lt;b&gt;&amp;\"x\"&lt;/b&gt;"
++        );
 +    }
 +
 +    #[test]
 +    fn text_document_detection_rejects_binary_containers() {
 +        assert!(is_supported_text_document("text/plain", "notes.txt"));
-+        assert!(is_supported_text_document("application/octet-stream", "main.rs"));
++        assert!(is_supported_text_document(
++            "application/octet-stream",
++            "main.rs"
++        ));
 +        assert!(!is_supported_text_document("application/pdf", "report.pdf"));
 +        assert!(!is_supported_text_document(
 +            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
