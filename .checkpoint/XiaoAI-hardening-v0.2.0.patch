@@ -1,0 +1,3612 @@
+diff --git a/.env.example b/.env.example
+index e6ae22d..9d47d59 100644
+--- a/.env.example
++++ b/.env.example
+@@ -1,7 +1,19 @@
+ # Telegram Bot Token dari @BotFather
+ BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN_HERE
+ 
++# Hard security invariant: hanya Telegram user ID ini yang boleh memakai XiaoAI.
++# Dapat diatur lewat: xiao telegram owner <telegram_user_id>
++OWNER_USER_ID=123456789
++
++# Opsional: chat/group tambahan tempat OWNER_USER_ID boleh memakai bot.
++# Pisahkan beberapa chat ID dengan koma. Kosongkan untuk private chat owner saja.
++ALLOWED_CHAT_IDS=
++
+ # Konfigurasi endpoint AI OpenAI-compatible
+ AI_ENDPOINT=http://127.0.0.1:8317/v1
+ AI_API_KEY=xiao
+ AI_MODEL=gemini-3.7-flash-high
++
++# Fallback image eksternal bersifat opt-in. Nilai aman default: none
++# Set ke pollinations hanya jika Anda menyetujui prompt gambar dikirim ke layanan tersebut.
++IMAGE_FALLBACK_PROVIDER=none
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index 78b2ffa..1e0bb8b 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -9,65 +9,112 @@ on:
+ permissions:
+   contents: read
+ 
++concurrency:
++  group: xiao-${{ github.workflow }}-${{ github.ref }}
++  cancel-in-progress: true
++
++env:
++  CARGO_TERM_COLOR: always
++
+ jobs:
++  quality:
++    name: Rust quality gates
++    runs-on: ubuntu-22.04
++    timeout-minutes: 20
++    steps:
++      - name: Checkout
++        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
++        with:
++          persist-credentials: false
++
++      - name: Install Rust
++        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
++        with:
++          toolchain: stable
++          components: rustfmt, clippy
++
++      - name: Format
++        run: cargo fmt --all -- --check
++
++      - name: Check
++        run: cargo check --locked
++
++      - name: Test
++        run: cargo test --locked
++
++      - name: Clippy
++        run: cargo clippy --locked --all-targets --all-features
++
+   armbian:
+     name: Linux ARM64 (Armbian)
++    needs: quality
+     runs-on: ubuntu-22.04
++    timeout-minutes: 30
+     steps:
+       - name: Checkout
+-        uses: actions/checkout@v4
++        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
++        with:
++          persist-credentials: false
+ 
+       - name: Install ARM64 toolchain
+-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
++        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+ 
+       - name: Install Rust target
+-        uses: dtolnay/rust-toolchain@stable
++        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+         with:
++          toolchain: stable
+           targets: aarch64-unknown-linux-gnu
+ 
+       - name: Build
+         env:
+           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+-        run: cargo build --release --target aarch64-unknown-linux-gnu
++        run: cargo build --release --locked --target aarch64-unknown-linux-gnu
+ 
+       - name: Upload Armbian binary
+-        uses: actions/upload-artifact@v4
++        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+         with:
+           name: xiao-linux-arm64-armbian
+           path: target/aarch64-unknown-linux-gnu/release/xiao
++          if-no-files-found: error
+ 
+   android:
+     name: Android ARM64
++    needs: quality
+     runs-on: ubuntu-22.04
++    timeout-minutes: 30
+     steps:
+       - name: Checkout
+-        uses: actions/checkout@v4
++        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
++        with:
++          persist-credentials: false
+ 
+       - name: Setup JDK 17
+-        uses: actions/setup-java@v4
++        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4.8.0
+         with:
+           distribution: temurin
+           java-version: '17'
+ 
+       - name: Setup Android SDK
+-        uses: android-actions/setup-android@v3
++        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3.2.2
+ 
+       - name: Install Android NDK
+         run: sdkmanager --install "ndk;26.3.11579264"
+ 
+-      - name: Install Rust and cargo-ndk
+-        uses: dtolnay/rust-toolchain@stable
++      - name: Install Rust target
++        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+         with:
++          toolchain: stable
+           targets: aarch64-linux-android
+ 
+       - name: Install cargo-ndk
+-        run: cargo install cargo-ndk --locked
++        run: cargo install cargo-ndk --version 4.1.2 --locked
+ 
+       - name: Build
+-        run: cargo ndk -t arm64-v8a -P 26 build --release
++        run: cargo ndk -t arm64-v8a -P 26 build --release --locked
+ 
+       - name: Upload Android binary
+-        uses: actions/upload-artifact@v4
++        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+         with:
+           name: xiao-android-arm64
+           path: target/aarch64-linux-android/release/xiao
++          if-no-files-found: error
+diff --git a/AGENTS.md b/AGENTS.md
+index 7e3b960..9525387 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -1,51 +1,66 @@
+-# XiaoAI - Telegram Bot API 10.2 Showcase & Live Execution Engine (Rust Edition)
++# XiaoAI 0.2.0 — Rust Telegram AI Assistant
+ 
+-This repository is a high-performance, standalone asynchronous Rust application (**XiaoAI**) implementing the full **Telegram Bot API 10.2** specification, rich message AST formatting, streaming execution timelines, and multi-provider AI routing.
++XiaoAI is a standalone asynchronous Rust application using the **Telegram Bot API 10.3 subset required by XiaoAI**, Rich Message AST formatting, cancellable streaming drafts, SQLite sessions, and multi-provider OpenAI-compatible AI routing. Do not describe the client as a full Bot API implementation.
++
++## Required Quality Gates
++
++Run before declaring a change ready:
++
++- `cargo fmt --all -- --check`
++- `cargo check --locked`
++- `cargo test --locked`
++- `cargo clippy --locked --all-targets --all-features`
+ 
+ ## Essential CLI Commands
+ 
+-- `cargo check`: Check code
+-- `cargo build --release`: Build release binary
+-- `cp target/release/xiao $PREFIX/bin/xiao`: Install binary to PATH
+-- `xiao start`: Run Telegram bot
+-- `xiao setup`: Quickstart setup wizard
+-- `xiao provider [add] [del] [status]`: Manage AI providers
+-- `xiao telegram [check] [bind] [change]`: Manage Telegram bot token
+-- `xiao model [query]`: Select or search model
+-- `xiao status`: System health check
+-- `xiao help`: Show this help
++- `xiao start`
++- `xiao setup`
++- `xiao provider [add] [del] [status]`
++- `xiao telegram [check] [bind] [change]`
++- `xiao telegram owner <telegram_user_id>`
++- `xiao model [query]`
++- `xiao model probe`
++- `xiao model pick`
++- `xiao status`
++
++## Security & Session Invariants
+ 
+-## Architecture & Code Organization
++1. `OWNER_USER_ID` is required. Only that Telegram user may operate XiaoAI; `ALLOWED_CHAT_IDS` extends where the owner may use the bot, not who may use it.
++2. Never log a URL that contains `BOT_TOKEN`.
++3. Session identity is the stable SQLite `session_id`, never a vector/list index.
++4. New session IDs must come from the persistent high-water sequence and must not reuse deleted IDs.
++5. Every AI request captures its originating `session_id`; late output must never be written into whichever session is active later.
++6. If the originating session is deleted while generation is running, discard the late persistence write.
++7. User generations are serialized so concurrent prompts cannot reorder the same owner's history.
++8. Telegram `stopped_message_generation` must cancel the matching `(chat_id, draft_id)` provider stream.
++9. Binary documents must fail closed until an explicit extractor exists; never reinterpret PDF/DOCX/XLSX bytes as UTF-8.
++10. External image fallback is opt-in only (`IMAGE_FALLBACK_PROVIDER=pollinations`).
++
++## Architecture
+ 
+ ```text
+ src/
+-├── main.rs         # Application entry point, update router, interactive wizards, keyboard builders
++├── main.rs         # CLI, access policy, update routing, Telegram UI handlers
++├── util.rs         # Unicode-safe truncation, HTML escaping, text-document detection
+ ├── bot/
+-│   ├── mod.rs      # Bot module exports
+-│   ├── client.rs   # TelegramBotClient wrapping reqwest (supports Bot API 10.2 methods + HTML fallback)
+-│   └── models.rs   # Strongly-typed serde structures for Bot API 10.2 (InputRichMessage, Keyboards, Updates)
++│   ├── client.rs   # Telegram HTTP client + 10.3 methods used by XiaoAI
++│   └── models.rs   # Telegram/Rich Message serde models
+ ├── ai/
+-│   ├── mod.rs      # AI module exports
+-│   └── service.rs  # AIChatService: OpenAI-compatible SSE streaming, Whisper STT, FLUX.1 image generator, session management
+-├── parser.rs       # Markdown to Telegram Bot API 10.2 Rich Message AST Parser (supports tables, code, math, quotes)
+-└── timeline.rs     # Live Execution Timeline engine streaming rich drafts with elapsed timer & state machine
++│   └── service.rs  # OpenAI-compatible provider, SSE, stable sessions, SQLite, STT/image
++├── parser.rs       # Markdown -> Telegram Rich Message AST
++└── timeline.rs     # Cancellable/streaming draft presentation state
+ ```
+ 
+-## Non-Obvious Patterns & Gotchas
++## Telegram 10.3 Notes
++
++The currently modeled 10.3 surface includes native generation stop (`can_stop`, `keep_on_stop`, `stopped_message_generation`), disabled buttons, Rich Message buttons, expandable quotations, document blocks, compact tables, `force_reply`, and `EphemeralMessageParameters` where used by the client.
++
++Execution/status UI must describe observable application state. Do not infer fake tool execution such as “Searching”, “Testing”, or “Coding” solely from prompt/reasoning keywords.
+ 
+-1. **Auto-Chunking & HTML Fallbacks**:
+-   - `TelegramBotClient::send_message` automatically splits texts exceeding 4000 characters cleanly across paragraph breaks (`\n\n`) and lines.
+-   - `TelegramBotClient::send_rich_message` tries the native Telegram `sendRichMessage` method first; if unsupported by the client endpoint, it gracefully falls back to chunked rich HTML and rendered Unicode box tables (`<pre>`).
++## Persistence Notes
+ 
+-2. **Live Execution Timeline**:
+-   - Updates during AI processing are pushed as lightweight drafts via `send_rich_message_draft`.
+-   - Rate limiting is enforced natively with a mutex and min-sync interval (1200ms) to prevent Telegram API 429 errors.
+-   - The final response replaces the draft using `send_rich_message`.
++SQLite is the runtime source of truth for sessions, active session identity, settings, providers/model selections, and migration markers. Legacy JSON/.env values may be imported for compatibility, but documentation and new code should not treat legacy files as the primary persistent state.
+ 
+-3. **Markdown AST Parser (`parser.rs`)**:
+-   - Bypasses raw markdown transmission. Markdown headings, tables (Markdown, ASCII, Unicode Box), code blocks, math formulas (`$$` or `\[`), blockquotes, and lists are converted into structured `RichBlock` AST objects.
+-   - Leaked HTML tags are sanitized before parsing.
++## Known Follow-ups
+ 
+-4. **Multi-Session & Provider Engine (`ai/service.rs`)**:
+-   - All state is managed thread-safely in-memory using `Arc<RwLock<...>>` structures.
+-   - Custom provider discovery calls `/models` on user-specified endpoints to dynamically populate available AI models.
++Synchronous `rusqlite` calls still exist inside the async application, PDF/DOCX/XLSX extraction/OCR is not implemented, and `main.rs`/`ai/service.rs` remain larger than the target architecture. Prefer incremental refactors that preserve the invariants above over a rewrite.
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+new file mode 100644
+index 0000000..08f1080
+--- /dev/null
++++ b/CHANGELOG.md
+@@ -0,0 +1,35 @@
++# Changelog
++
++## 0.2.0 — Hardening & Telegram Bot API 10.3
++
++### Security
++- Require a single `OWNER_USER_ID` and optionally restrict owner usage to `ALLOWED_CHAT_IDS`.
++- Stop logging Telegram file URLs that contain the bot token.
++- Add bounded Telegram media downloads and bounded text-document ingestion.
++- Make external Pollinations image fallback opt-in.
++- Escape dynamic values before HTML fallback/UI rendering.
++- Reject unsupported binary documents instead of lossy UTF-8 interpretation.
++
++### Session & reliability
++- Replace vector-index session identity with stable persistent session IDs.
++- Add persistent high-water session ID allocation so deleted IDs are not reused.
++- Migrate legacy active-session indexes to stable IDs.
++- Delete sessions/messages from SQLite rather than hiding them only in memory.
++- Bind generation writes to the request's original session and discard late writes for deleted sessions.
++- Serialize owner generation requests to prevent history reorder races.
++- Convert normal message persistence to append-style writes.
++- Remove unsafe UTF-8 byte truncation/prefix slicing in user/provider-facing paths.
++- Mark interrupted provider streams as partial instead of silently treating them as complete.
++
++### Telegram Bot API 10.3
++- Add native generation-stop flow using `can_stop`, `keep_on_stop`, and `stopped_message_generation`.
++- Add cancellation registry keyed by chat/draft ID.
++- Add disabled inline buttons and Rich Message buttons.
++- Add expandable quotation, document block, compact table, `force_reply`, and ephemeral parameter models used by XiaoAI.
++- Stream partial answer text into Telegram drafts.
++- Update runtime/version wording to Bot API 10.3 without claiming full API coverage.
++
++### Quality
++- Add regression tests for Unicode helpers/parser behavior, Telegram 10.3 serialization, legacy session migration, and session-ID high-water allocation.
++- Add CI gates for `cargo fmt`, `cargo check`, `cargo test`, and `cargo clippy` before ARM64/Android builds.
++- Pin GitHub Actions to full commit SHAs and disable persisted checkout credentials.
+diff --git a/Cargo.lock b/Cargo.lock
+index 07c0168..982400d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4,7 +4,7 @@ version = 4
+ 
+ [[package]]
+ name = "XiaoAI"
+-version = "0.1.2"
++version = "0.2.0"
+ dependencies = [
+  "base64",
+  "chrono",
+diff --git a/Cargo.toml b/Cargo.toml
+index bcddf3c..29682cb 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,9 +1,9 @@
+ [package]
+ name = "XiaoAI"
+-version = "0.1.2"
++version = "0.2.0"
+ edition = "2021"
+ authors = ["Assaqib <264941327+tsaQB@users.noreply.github.com>"]
+-description = "XiaoAI - Telegram Bot API 10.2 Full Live Execution Timeline AI Bot in Rust"
++description = "XiaoAI - hardened Telegram Bot API 10.3 AI assistant with Rich Messages, streaming drafts, sessions, and OpenAI-compatible providers"
+ 
+ [[bin]]
+ name = "xiao"
+diff --git a/README.md b/README.md
+index 2026d17..b136526 100644
+--- a/README.md
++++ b/README.md
+@@ -1,119 +1,181 @@
+-# XiaoAI
++# XiaoAI 0.2.0
+ 
+-XiaoAI adalah bot Telegram asynchronous berbasis Rust untuk endpoint AI yang kompatibel dengan OpenAI. Aplikasi ini menangani provider/model, session percakapan, streaming timeline, rich message Telegram, gambar, dokumen, audio, dan video dari satu binary.
++XiaoAI adalah bot Telegram asynchronous berbasis Rust untuk endpoint AI yang kompatibel dengan OpenAI. Versi 0.2.0 berfokus pada **session/data-integrity hardening, owner-only security, streaming yang dapat dibatalkan, serta integrasi fitur Telegram Bot API 10.3 yang dipakai XiaoAI**.
+ 
+-## Fitur Saat Ini
++> XiaoAI tidak mengklaim mengimplementasikan seluruh Telegram Bot API. Client hanya memodelkan method dan update yang dibutuhkan aplikasi.
+ 
+-- Rich message Telegram menggunakan `sendRichMessage` dan `editMessageText` dengan `rich_message`; jika endpoint rich message menolak request, XiaoAI memakai fallback HTML/monospace.
+-- Parser Markdown membentuk blok heading, paragraf, list, quote, code block, math, divider, dan tabel native Telegram.
+-- Session manager menampilkan maksimal lima session per halaman, dengan tombol pilih session, pagination saat diperlukan, `Delete`, `Rename`, `New`, dan `Close`.
+-- Menu `context` menunjukkan capability model serta penggunaan konteks dengan progress bar monospace.
+-- Provider OpenAI-compatible dikelola dari CLI dan katalog model dapat diambil dari endpoint `/models`.
+-- Whitelist model Telegram dikelola dari `xiao model pick`; maksimal 10 model, dibedakan berdasarkan provider/alias, dan hanya daftar tersebut yang muncul pada menu model Telegram.
+-- Registry capability model disimpan terpisah di `~/.xiao_model_capabilities.json`; jalankan `xiao model probe` untuk menyegarkan metadata capability dari setiap endpoint.
+-- Session dan message history disimpan persisten di `~/.local/share/xiaoai/xiaoai.db` menggunakan SQLite, sehingga konteks tetap tersedia setelah restart.
+-- Provider, API key, model aktif, whitelist Telegram, dan capability registry juga disimpan pada database SQLite yang sama. File JSON lama hanya dibaca sekali untuk migrasi kompatibilitas.
+-- Pesan suara ditranskripsi melalui endpoint `/audio/transcriptions` bila provider mendukungnya. Gambar dikirim sebagai data URL ke input vision.
+-- Video diteruskan sebagai data URL `video/*` ke input `image_url`. Ini hanya bekerja pada endpoint yang secara eksplisit menerima video pada format tersebut; banyak endpoint OpenAI-compatible menolaknya.
+-- Pembuatan gambar memakai endpoint/provider yang tersedia pada konfigurasi.
++## Fitur Utama
+ 
+-## Batasan Multimedia
++- Rich Message Telegram dengan AST heading, paragraph, list, quote, code, math, divider, table, buttons, document block, dan expandable quotation.
++- Streaming draft jawaban AI melalui `sendRichMessageDraft`, termasuk partial answer selama provider masih menghasilkan respons.
++- Native generation stop Bot API 10.3 di private chat owner: draft memakai `can_stop`/`keep_on_stop`, lalu update `stopped_message_generation` membatalkan stream provider aktif. Di group, Stop tidak diaktifkan karena event stop tidak membawa identitas user penekan tombol.
++- Native disabled inline button dan Rich Message buttons Bot API 10.3.
++- Session persisten di SQLite dengan stable `session_id`, active-session migration, monotonic ID allocation, delete nyata, dan late-result protection.
++- Request generation per owner diserialisasi agar dua prompt cepat tidak saling menyalip history/session.
++- Provider OpenAI-compatible, discovery model `/models`, STT `/audio/transcriptions`, SSE chat completion, dan image generation.
++- Owner-only authorization melalui `OWNER_USER_ID`; `ALLOWED_CHAT_IDS` hanya mengatur chat tambahan tempat owner boleh menggunakan XiaoAI.
++- Batas download media dan fallback image eksternal yang default-nya nonaktif.
++- Unicode-safe truncation/prefix handling serta HTML escaping untuk data dinamis yang masuk ke `parse_mode=HTML`.
+ 
+-- Capability berdasarkan nama model bersifat indikatif; capability aktual ditentukan oleh endpoint provider.
+-- Endpoint yang tidak mendukung `input_audio` akan menolak audio. Gunakan provider dengan STT atau transkripsikan audio terlebih dahulu.
+-- Endpoint yang tidak menerima `video/*` dalam `image_url` akan menolak video. Ekstraksi frame/audio dengan FFmpeg sebagai fallback hybrid belum diimplementasikan.
++## Telegram Bot API 10.3 yang Digunakan
+ 
+----
++XiaoAI 0.2.0 memakai subset 10.3 yang relevan untuk UI/AI flow:
+ 
+-## 📁 Struktur Direktori
++- `can_stop` dan `keep_on_stop` pada streaming draft.
++- update `stopped_message_generation` / `MessageGenerationStopped`.
++- `DisabledButton` pada inline keyboard.
++- `force_reply` pada keyboard markup yang dimodelkan XiaoAI.
++- `RichMessageButton`, `RichBlockButtons`, dan style button.
++- `RichBlockExpandableBlockQuotation`.
++- `RichBlockDocument`.
++- `is_compact` pada Rich Table.
++- `EphemeralMessageParameters` pada method yang dipakai client.
+ 
+-```text
+-XiaoAI/
+-├── Cargo.toml            # Manifest & dependensi Rust
+-├── src/
+-│   ├── main.rs           # Entry point CLI, bot handlers, keyboard dan UI builders
+-│   ├── bot/
+-│   │   ├── mod.rs        # Modul bot Telegram
+-│   │   ├── client.rs     # Asynchronous Telegram Bot API 10.2 HTTP Client
+-│   │   └── models.rs     # Data models & serialisasi AST Bot API 10.2
+-│   ├── ai/
+-│   │   ├── mod.rs        # Modul integrasi AI
+-│   │   └── service.rs    # Provider, session, SSE chat, STT dan image generation
+-│   ├── parser.rs         # Markdown ke Rich Message AST
+-│   └── timeline.rs       # Streaming execution timeline
+-├── .env                  # Token bot dan konfigurasi endpoint lokal (jangan commit)
+-├── .env.example          # Template environment
+-└── README.md             # Dokumentasi lengkap
+-```
++## Security & Data Integrity 0.2.0
+ 
+----
++### Owner wajib
+ 
+-## 🚀 Perintah CLI `xiao`
++`OWNER_USER_ID` adalah hard invariant. XiaoAI menolak start jika owner belum dikonfigurasi.
+ 
+ ```bash
+-xiao start                               # Run Telegram bot
+-xiao setup                               # Quickstart setup wizard
+-xiao provider [add] [del] [status]       # Manage AI providers
+-xiao telegram [check] [bind] [change]    # Manage Telegram bot token
+-xiao model [name]                        # Select/search model dari CLI
+-xiao model probe                         # Refresh capability registry dari /models
+-xiao model pick                          # Pilih maksimal 10 model untuk Telegram
+-xiao model [name] pick                   # Alias untuk membuka model whitelist picker
+-xiao status                              # System health check
+-xiao help                                # Show this help
++xiao telegram owner 123456789
++# atau
++xiao setup
+ ```
+ 
+-`xiao model pick` menyimpan whitelist ke `~/.xiao_providers.json` sebagai pasangan provider dan model. Tekan `Space` untuk toggle pilihan, ketik untuk filter, dan `Enter` atau `Esc` untuk menyimpan.
++Secara default owner hanya dapat menggunakan bot di private chat miliknya. Tambahkan group/chat ID secara eksplisit melalui `ALLOWED_CHAT_IDS` bila diperlukan.
+ 
+----
++### Session identity
+ 
+-## 🛠️ Build & Instalasi Global `xiao`
+-```bash
+-# 1. Kompilasi binary release
+-cargo build --release
++Session tidak lagi menggunakan posisi vector sebagai identitas. `session_id` stabil disimpan di SQLite, ID baru berasal dari persistent high-water counter, session yang dihapus benar-benar dihapus dari DB, dan hasil generation yang selesai terlambat tidak boleh berpindah ke session lain.
++
++### Credential/logging
++
++URL Telegram yang mengandung bot token tidak dicetak pada error log. Hindari menjalankan binary dengan logging HTTP library yang sangat verbose bila log akan dibagikan ke pihak lain.
+ 
+-# 2. Salin binary ke PATH agar bisa dipanggil langsung dari mana saja
+-cp target/release/xiao $PREFIX/bin/xiao
+-chmod +x $PREFIX/bin/xiao
++### External image fallback
++
++Fallback ke layanan image eksternal nonaktif secara default:
++
++```dotenv
++IMAGE_FALLBACK_PROVIDER=none
++```
++
++Untuk opt-in Pollinations:
++
++```dotenv
++IMAGE_FALLBACK_PROVIDER=pollinations
+ ```
+ 
+-Setelah disalin ke `$PREFIX/bin/` (atau `/usr/local/bin/`), Anda dapat langsung menjalankan perintah `xiao` dari folder mana pun tanpa path lokal.
++Mengaktifkannya berarti prompt image dapat dikirim ke provider eksternal tersebut bila provider aktif gagal/tidak mendukung image generation.
++
++## Multimedia & Document Boundaries
+ 
+-## Build Otomatis
++- Image dikirim sebagai data URL ke input vision bila endpoint mendukungnya.
++- Audio/voice dapat ditranskripsi melalui `/audio/transcriptions` bila provider mendukung STT.
++- Video dapat diteruskan sebagai data URL `video/*` melalui jalur kompatibilitas saat endpoint memang menerima format tersebut.
++- Dokumen text-like (`text/*`, Markdown, JSON, CSV, XML, source code, dan format teks lain yang dikenali) dapat dimasukkan sebagai teks dengan batas ukuran.
++- **PDF, DOCX, XLSX, ZIP, dan binary document lain tidak dipaksa menjadi UTF-8.** XiaoAI 0.2.0 menolaknya secara aman sampai extractor/OCR khusus tersedia.
++- Capability model yang berasal dari nama/metadata bersifat indikatif. Provider tetap menjadi source of truth saat request aktual dieksekusi.
+ 
+-Workflow GitHub Actions `.github/workflows/build.yml` membuat artifact release untuk:
++## Struktur Direktori
+ 
+-- `xiao-linux-arm64-armbian`: Linux ARM64 GNU untuk Armbian/STB ARM64.
+-- `xiao-android-arm64`: Android ARM64 untuk Termux.
++```text
++XiaoAI/
++├── Cargo.toml
++├── src/
++│   ├── main.rs           # CLI, update router, authorization, Telegram UI handlers
++│   ├── util.rs           # Unicode/HTML/document safety helpers
++│   ├── bot/
++│   │   ├── mod.rs
++│   │   ├── client.rs     # Telegram HTTP client + Bot API 10.3 surface used by XiaoAI
++│   │   └── models.rs     # Telegram/Rich Message serde models
++│   ├── ai/
++│   │   ├── mod.rs
++│   │   └── service.rs    # Provider, stable sessions, SQLite, SSE, STT, image generation
++│   ├── parser.rs         # Markdown -> Rich Message AST
++│   └── timeline.rs       # Draft streaming state/timeline
++├── .github/workflows/build.yml
++├── .env.example
++└── CHANGELOG.md
++```
++
++## Perintah CLI
+ 
+-Workflow berjalan saat push, pull request, atau dapat dijalankan manual dari tab **Actions**. Artifact tersedia pada halaman workflow run yang selesai.
++```bash
++xiao start
++xiao setup
++xiao provider [add] [del] [status]
++xiao telegram [check] [bind] [change]
++xiao telegram owner <telegram_user_id>
++xiao model [name]
++xiao model probe
++xiao model pick
++xiao status
++xiao help
++```
++
++`xiao model pick` mengelola whitelist model Telegram di SQLite. File JSON legacy hanya digunakan sebagai sumber migrasi kompatibilitas bila masih ditemukan. Environment/.env dapat menjadi bootstrap input, tetapi SQLite adalah runtime source of truth.
+ 
+ ## Konfigurasi Environment
+ 
+-Salin `.env.example` menjadi `.env`, lalu isi:
++Salin `.env.example` menjadi `.env`:
+ 
+ ```dotenv
+ BOT_TOKEN=123456:telegram-bot-token
++OWNER_USER_ID=123456789
++ALLOWED_CHAT_IDS=
+ AI_ENDPOINT=https://provider.example/v1
+ AI_API_KEY=provider-api-key
+ AI_MODEL=model-name
++IMAGE_FALLBACK_PROVIDER=none
++```
++
++`AI_ENDPOINT` dan `AI_API_KEY` bersifat generik untuk endpoint OpenAI-compatible.
++
++## Build & Validation
++
++```bash
++cargo fmt --all -- --check
++cargo check --locked
++cargo test --locked
++cargo clippy --locked --all-targets --all-features
++cargo build --release --locked
+ ```
+ 
+-`AI_ENDPOINT` dan `AI_API_KEY` bersifat generik untuk semua provider yang kompatibel dengan OpenAI; tidak ada konfigurasi yang dikunci ke provider tertentu.
++GitHub Actions menjalankan quality gates tersebut sebelum build Linux ARM64 dan Android ARM64. Action pihak ketiga dipin ke commit SHA dan checkout tidak menyimpan credential repository.
+ 
+----
++Untuk instalasi lokal:
+ 
+-## 💬 Daftar Perintah Bot Telegram
++```bash
++cargo build --release --locked
++cp target/release/xiao "$PREFIX/bin/xiao"
++chmod +x "$PREFIX/bin/xiao"
++```
+ 
+-| Perintah / Aksi | Deskripsi |
+-| :--- | :--- |
+-| *Kirim Pesan / File* | Mengobrol dengan AI, gambar, dokumen, audio, atau video sesuai dukungan endpoint |
+-| `/start` | Membuka menu sambutan & status model aktif |
+-| `/menu` | Menampilkan menu navigasi utama interaktif |
+-| `/model` | Mengganti model dari whitelist yang dikonfigurasi dengan `xiao model pick` |
+-| `/image` | Menghasilkan gambar AI dari prompt teks |
+-| `/context` | Monitor kapasitas token memori & kapabilitas model |
+-| `/session` | Membuka Session Manager & tabel sesi aktif |
+-| `/new` | Membuat sesi percakapan baru |
+-| `/clear` | Mereset memori riwayat sesi saat ini |
+-| `/help` | Menampilkan panduan dan daftar seluruh perintah |
++## Perintah Bot Telegram
++
++| Perintah / aksi | Deskripsi |
++| --- | --- |
++| Kirim pesan | Chat dengan model aktif |
++| Kirim image/audio/video/text document | Multimodal sesuai dukungan provider dan batas XiaoAI |
++| `/start` | Menu sambutan dan status model |
++| `/menu` | Menu navigasi |
++| `/model` | Pilih model dari whitelist |
++| `/image` | Generate image |
++| `/context` | Estimasi context dan capability |
++| `/session` | Session manager |
++| `/new` | Session baru |
++| `/clear` | Hapus history session aktif |
++| `/help` | Bantuan |
++
++## Known P1 Follow-ups
++
++0.2.0 sengaja memprioritaskan correctness/security. Beberapa pekerjaan lanjutan masih terbuka:
++
++- Memindahkan operasi `rusqlite` synchronous dari async worker ke DB actor/`spawn_blocking`/async adapter.
++- Extractor PDF/DOCX/XLSX dan scanned-PDF OCR/vision pipeline.
++- Mengurangi buffering media lebih lanjut melalui streaming/temp-file pipeline.
++- Provider capability probing `Supported / Unsupported / Unknown` yang lebih lengkap.
++- Memecah `main.rs` dan `ai/service.rs` menjadi application/domain/repository/provider modules yang lebih kecil.
++- Mengganti parser SSE custom dengan parser event-stream yang lebih battle-tested dan menambah retry/backoff 429/5xx.
+diff --git a/src/ai/service.rs b/src/ai/service.rs
+index 3b94755..72ab5c1 100644
+--- a/src/ai/service.rs
++++ b/src/ai/service.rs
+@@ -9,14 +9,13 @@ use reqwest::multipart::{Form, Part};
+ use reqwest::Client;
+ use serde::{Deserialize, Serialize};
+ use serde_json::{json, Value};
+-use tokio::sync::RwLock;
++use tokio::sync::{watch, Mutex, RwLock};
+ use rusqlite::{params, Connection};
+ use tracing::{error, warn};
+ 
+-use crate::timeline::{
+-    classify_text_activity, generate_contextual_stages, ExecutionTimeline, ProgressActivity,
+-    ProgressState,
+-};
++use crate::util::{truncate_chars, truncate_chars_with_ellipsis};
++
++use crate::timeline::{ExecutionTimeline, ProgressActivity, ProgressState};
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub struct ProviderConfig {
+@@ -109,6 +108,9 @@ fn open_session_db() -> rusqlite::Result<Connection> {
+         );
+         CREATE TABLE IF NOT EXISTS active_sessions (
+             user_id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL
++        );
++        CREATE TABLE IF NOT EXISTS session_counters (
++            user_id INTEGER PRIMARY KEY, next_session_id INTEGER NOT NULL
+         );")?;
+     Ok(conn)
+ }
+@@ -132,14 +134,152 @@ fn load_sessions_db(user_id: i64) -> rusqlite::Result<Vec<ChatSession>> {
+     Ok(sessions)
+ }
+ 
+-fn save_session_db(user_id: i64, session: &ChatSession) -> rusqlite::Result<()> {
++fn compute_next_session_id(stored_next: Option<usize>, max_existing: usize) -> usize {
++    stored_next
++        .unwrap_or_else(|| max_existing.saturating_add(1))
++        .max(max_existing.saturating_add(1))
++        .max(1)
++}
++
++fn legacy_active_session_id(legacy_index: Option<usize>, sessions: &[ChatSession]) -> Option<usize> {
++    if sessions.is_empty() {
++        return None;
++    }
++    Some(
++        legacy_index
++            .and_then(|index| sessions.get(index).map(|session| session.id))
++            .unwrap_or(sessions[0].id),
++    )
++}
++
++fn allocate_session_id_db(user_id: i64) -> rusqlite::Result<usize> {
++    let mut conn = open_session_db()?;
++    let tx = conn.transaction()?;
++    let max_existing: usize = tx.query_row(
++        "SELECT COALESCE(MAX(session_id),0) FROM sessions WHERE user_id=?1",
++        params![user_id],
++        |row| row.get(0),
++    )?;
++    let stored_next = tx
++        .query_row(
++            "SELECT next_session_id FROM session_counters WHERE user_id=?1",
++            params![user_id],
++            |row| row.get::<_, usize>(0),
++        )
++        .ok();
++    let next_id = compute_next_session_id(stored_next, max_existing);
++    tx.execute(
++        "INSERT INTO session_counters(user_id,next_session_id) VALUES(?1,?2)
++         ON CONFLICT(user_id) DO UPDATE SET next_session_id=excluded.next_session_id",
++        params![user_id, next_id.saturating_add(1)],
++    )?;
++    tx.commit()?;
++    Ok(next_id)
++}
++
++fn save_session_metadata_db(user_id: i64, session: &ChatSession) -> rusqlite::Result<()> {
+     let conn = open_session_db()?;
+     let now = Local::now().to_rfc3339();
+-    conn.execute("INSERT INTO sessions(user_id,session_id,name,created_at,updated_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(user_id,session_id) DO UPDATE SET name=excluded.name,updated_at=excluded.updated_at", params![user_id, session.id, session.name, session.created_at, now])?;
+-    conn.execute("DELETE FROM messages WHERE user_id=?1 AND session_id=?2", params![user_id, session.id])?;
++    conn.execute(
++        "INSERT INTO sessions(user_id,session_id,name,created_at,updated_at) VALUES(?1,?2,?3,?4,?5)
++         ON CONFLICT(user_id,session_id) DO UPDATE SET name=excluded.name,updated_at=excluded.updated_at",
++        params![user_id, session.id, session.name, session.created_at, now],
++    )?;
++    Ok(())
++}
++
++fn replace_session_messages_db(user_id: i64, session: &ChatSession) -> rusqlite::Result<()> {
++    let mut conn = open_session_db()?;
++    let tx = conn.transaction()?;
++    let now = Local::now().to_rfc3339();
++    tx.execute(
++        "INSERT INTO sessions(user_id,session_id,name,created_at,updated_at) VALUES(?1,?2,?3,?4,?5)
++         ON CONFLICT(user_id,session_id) DO UPDATE SET name=excluded.name,updated_at=excluded.updated_at",
++        params![user_id, session.id, session.name, session.created_at, now],
++    )?;
++    tx.execute("DELETE FROM messages WHERE user_id=?1 AND session_id=?2", params![user_id, session.id])?;
+     for message in &session.messages {
+-        conn.execute("INSERT INTO messages(user_id,session_id,role,content,created_at) VALUES(?1,?2,?3,?4,?5)", params![user_id, session.id, message.role, serde_json::to_string(&message.content).unwrap_or_default(), now])?;
++        let content = serde_json::to_string(&message.content).unwrap_or_default();
++        tx.execute(
++            "INSERT INTO messages(user_id,session_id,role,content,created_at) VALUES(?1,?2,?3,?4,?5)",
++            params![user_id, session.id, message.role, content, now],
++        )?;
++    }
++    tx.commit()?;
++    Ok(())
++}
++
++fn append_session_messages_db(user_id: i64, session: &ChatSession, messages: &[ChatMessage]) -> rusqlite::Result<()> {
++    let mut conn = open_session_db()?;
++    let tx = conn.transaction()?;
++    let now = Local::now().to_rfc3339();
++    tx.execute(
++        "UPDATE sessions SET name=?3,updated_at=?4 WHERE user_id=?1 AND session_id=?2",
++        params![user_id, session.id, session.name, now],
++    )?;
++    for message in messages {
++        let content = serde_json::to_string(&message.content).unwrap_or_default();
++        tx.execute(
++            "INSERT INTO messages(user_id,session_id,role,content,created_at) VALUES(?1,?2,?3,?4,?5)",
++            params![user_id, session.id, message.role, content, now],
++        )?;
+     }
++    tx.commit()?;
++    Ok(())
++}
++
++fn delete_session_db(user_id: i64, session_id: usize) -> rusqlite::Result<()> {
++    let mut conn = open_session_db()?;
++    let tx = conn.transaction()?;
++    tx.execute("DELETE FROM messages WHERE user_id=?1 AND session_id=?2", params![user_id, session_id])?;
++    tx.execute("DELETE FROM sessions WHERE user_id=?1 AND session_id=?2", params![user_id, session_id])?;
++    tx.commit()?;
++    Ok(())
++}
++
++fn save_active_session_db(user_id: i64, session_id: usize) -> rusqlite::Result<()> {
++    let conn = open_session_db()?;
++    conn.execute(
++        "INSERT INTO active_sessions(user_id,session_id) VALUES(?1,?2)
++         ON CONFLICT(user_id) DO UPDATE SET session_id=excluded.session_id",
++        params![user_id, session_id],
++    )?;
++    Ok(())
++}
++
++fn ensure_session_identity_v2_db(user_id: i64, sessions: &[ChatSession]) -> rusqlite::Result<()> {
++    if sessions.is_empty() {
++        return Ok(());
++    }
++    let conn = open_session_db()?;
++    let marker = format!("session_identity_v2:{user_id}");
++    let migrated = conn
++        .query_row("SELECT value FROM settings WHERE key=?1", params![&marker], |row| row.get::<_, String>(0))
++        .ok()
++        .is_some();
++
++    if !migrated {
++        let legacy_value = conn
++            .query_row(
++                "SELECT session_id FROM active_sessions WHERE user_id=?1",
++                params![user_id],
++                |row| row.get::<_, usize>(0),
++            )
++            .ok();
++        let stable_id = legacy_active_session_id(legacy_value, sessions).unwrap_or(sessions[0].id);
++        save_active_session_db(user_id, stable_id)?;
++        conn.execute(
++            "INSERT INTO settings(key,value) VALUES(?1,'1') ON CONFLICT(key) DO UPDATE SET value='1'",
++            params![&marker],
++        )?;
++    }
++
++    let next_id = sessions.iter().map(|session| session.id).max().unwrap_or(0).saturating_add(1).max(1);
++    conn.execute(
++        "INSERT INTO session_counters(user_id,next_session_id) VALUES(?1,?2)
++         ON CONFLICT(user_id) DO UPDATE SET next_session_id=MAX(next_session_id,excluded.next_session_id)",
++        params![user_id, next_id],
++    )?;
+     Ok(())
+ }
+ 
+@@ -181,15 +321,15 @@ pub fn get_model_capabilities(model_name: &str) -> ModelCapability {
+             context_limit,
+             context_str,
+             vision: true,
+-            vision_desc: "✅ Didukung Penuh (Ultra High-Res OCR & Vision)".to_string(),
++            vision_desc: "⚠️ Perkiraan dari nama model: vision kemungkinan didukung; verifikasi lewat metadata/probe provider".to_string(),
+             video: true,
+-            video_desc: "✅ Native Video Vision (Analisis Video Langsung)".to_string(),
++            video_desc: "⚠️ Perkiraan dari nama model: video mungkin didukung; verifikasi provider".to_string(),
+             documents: true,
+-            docs_desc: "✅ Didukung Penuh (Membaca file PDF/TXT/Code)".to_string(),
++            docs_desc: "✅ Xiao mendukung TXT/MD/JSON/kode sebagai teks; PDF/DOCX belum diekstrak".to_string(),
+             audio: true,
+-            audio_desc: "✅ Native Audio (Bisa langsung mendengar pesan suara)".to_string(),
++            audio_desc: "⚠️ Perkiraan dari nama model: audio mungkin didukung; verifikasi provider".to_string(),
+             thinking,
+-            thinking_desc: "✅ Adaptive Thinking & High Reasoning Engine".to_string(),
++            thinking_desc: "⚠️ Reasoning diperkirakan dari nama model; chain-of-thought tidak ditampilkan".to_string(),
+             strengths: "Konteks masif (1M-2M), video & audio langsung, kecepatan tinggi, penalaran multimodal adaptif".to_string(),
+         }
+     } else if m.contains("claude") {
+@@ -200,15 +340,15 @@ pub fn get_model_capabilities(model_name: &str) -> ModelCapability {
+             context_limit: 200000,
+             context_str: "200,000 tokens (200k Luas)".to_string(),
+             vision: true,
+-            vision_desc: "✅ Didukung Penuh (Diagram, Arsitektur UI & OCR)".to_string(),
++            vision_desc: "⚠️ Perkiraan dari nama model: vision kemungkinan didukung; verifikasi provider".to_string(),
+             video: false,
+             video_desc: "❌ Belum Didukung Langsung".to_string(),
+             documents: true,
+-            docs_desc: "✅ Didukung Penuh (Analisis Dokumen Kompleks & Codebase)".to_string(),
++            docs_desc: "✅ Xiao mendukung dokumen teks/kode setelah ekstraksi; PDF/DOCX belum diekstrak".to_string(),
+             audio: false,
+             audio_desc: "❌ Belum Didukung Langsung (Ketik via teks / butuh Whisper)".to_string(),
+             thinking: true,
+-            thinking_desc: "✅ Extended Thinking & Chain-of-Thought".to_string(),
++            thinking_desc: "⚠️ Reasoning mungkin tersedia; chain-of-thought tidak ditampilkan".to_string(),
+             strengths: "Kualitas penulisan prosa alami, pemahaman instruksi kompleks, arsitektur & refactoring kode tingkat lanjut".to_string(),
+         }
+     } else if ["gpt", "codex", "o1", "o3"].iter().any(|k| m.contains(k)) {
+@@ -230,15 +370,15 @@ pub fn get_model_capabilities(model_name: &str) -> ModelCapability {
+             context_limit,
+             context_str,
+             vision,
+-            vision_desc: if vision { "✅ Didukung Penuh (Visi Gambar & Analisis Grafis)".to_string() } else { "❌ Model Khusus Kode".to_string() },
++            vision_desc: if vision { "⚠️ Perkiraan dari nama model: vision kemungkinan didukung; verifikasi provider".to_string() } else { "❌ Model Khusus Kode".to_string() },
+             video: false,
+             video_desc: "❌ Belum Didukung Langsung".to_string(),
+             documents: true,
+-            docs_desc: "✅ Didukung Penuh (Membaca Dokumen & Kode)".to_string(),
++            docs_desc: "✅ Xiao mendukung dokumen teks/kode setelah ekstraksi; PDF/DOCX belum diekstrak".to_string(),
+             audio,
+-            audio_desc: if audio { "✅ Native Audio Supported".to_string() } else { "❌ Belum Didukung Langsung (Ketik via teks)".to_string() },
++            audio_desc: if audio { "⚠️ Perkiraan dari nama model: audio mungkin didukung; verifikasi provider".to_string() } else { "❌ Belum Didukung Langsung (Ketik via teks)".to_string() },
+             thinking: true,
+-            thinking_desc: "✅ Next-Gen CoT Reasoning & Code Synthesis".to_string(),
++            thinking_desc: "⚠️ Reasoning diperkirakan dari nama model; chain-of-thought tidak ditampilkan".to_string(),
+             strengths: "Presisi logika matematika, sintesis & perbaikan kode, manipulasi data terstruktur".to_string(),
+         }
+     } else if m.contains("minimax") {
+@@ -249,11 +389,11 @@ pub fn get_model_capabilities(model_name: &str) -> ModelCapability {
+             context_limit: 245760,
+             context_str: "245,760 tokens (245k Luas)".to_string(),
+             vision: true,
+-            vision_desc: "✅ Didukung Penuh (Visual OCR & Vision)".to_string(),
++            vision_desc: "⚠️ Perkiraan dari nama model: vision kemungkinan didukung; verifikasi provider".to_string(),
+             video: true,
+-            video_desc: "✅ Native Video & Vision Sequences Supported".to_string(),
++            video_desc: "⚠️ Perkiraan dari nama model: video mungkin didukung; verifikasi provider".to_string(),
+             documents: true,
+-            docs_desc: "✅ Didukung Penuh (Dokumen Teks, PDF & Code)".to_string(),
++            docs_desc: "✅ Xiao dapat menyisipkan dokumen teks/kode; PDF/DOCX belum diekstrak".to_string(),
+             audio: false,
+             audio_desc: "❌ Belum Didukung Langsung (Ketik via teks / Whisper)".to_string(),
+             thinking: false,
+@@ -270,15 +410,15 @@ pub fn get_model_capabilities(model_name: &str) -> ModelCapability {
+             context_limit: 131072,
+             context_str: "131,072 tokens (128k Luas)".to_string(),
+             vision: true,
+-            vision_desc: "✅ Didukung (Qwen-VL Multimodal)".to_string(),
++            vision_desc: "⚠️ Perkiraan nama model (Qwen-VL); verifikasi provider".to_string(),
+             video: is_video,
+-            video_desc: if is_video { "✅ Native Video Vision Supported".to_string() } else { "❌ Belum Didukung Langsung".to_string() },
++            video_desc: if is_video { "⚠️ Perkiraan nama model: video mungkin didukung; verifikasi provider".to_string() } else { "❌ Belum Didukung Langsung".to_string() },
+             documents: true,
+-            docs_desc: "✅ Didukung (Dokumen Teks & Codebase)".to_string(),
++            docs_desc: "✅ Xiao mendukung dokumen teks/kode setelah ekstraksi".to_string(),
+             audio: false,
+             audio_desc: "❌ Belum Didukung Langsung".to_string(),
+             thinking: is_thinking,
+-            thinking_desc: if is_thinking { "✅ QVQ / CoT Visual Reasoning".to_string() } else { "Standar (Direct Prompting)".to_string() },
++            thinking_desc: if is_thinking { "⚠️ Reasoning diperkirakan dari nama model; chain-of-thought tidak ditampilkan".to_string() } else { "Standar (Direct Prompting)".to_string() },
+             strengths: "Keunggulan visual reasoning (Qwen VL/QVQ), coding, instruksi multibahasa tingkat tinggi".to_string(),
+         }
+     } else if m.contains("deepseek") {
+@@ -292,15 +432,15 @@ pub fn get_model_capabilities(model_name: &str) -> ModelCapability {
+             context_limit: 128000,
+             context_str: "128,000 tokens (128k)".to_string(),
+             vision,
+-            vision_desc: if vision { "✅ Didukung (DeepSeek-VL)".to_string() } else { "❌ Model Teks Murni".to_string() },
++            vision_desc: if vision { "⚠️ Perkiraan nama model (DeepSeek-VL); verifikasi provider".to_string() } else { "❌ Model Teks Murni".to_string() },
+             video: false,
+             video_desc: "❌ Tidak Didukung".to_string(),
+             documents: true,
+-            docs_desc: "✅ Didukung (Dokumen Teks & Kode)".to_string(),
++            docs_desc: "✅ Xiao mendukung dokumen teks/kode setelah ekstraksi".to_string(),
+             audio: false,
+             audio_desc: "❌ Tidak Didukung (Ketik via teks)".to_string(),
+             thinking,
+-            thinking_desc: if thinking { "✅ DeepSeek-R1 Deep Reasoning CoT".to_string() } else { "Standar (Direct Prompting)".to_string() },
++            thinking_desc: if thinking { "⚠️ Reasoning diperkirakan dari nama model; chain-of-thought tidak ditampilkan".to_string() } else { "Standar (Direct Prompting)".to_string() },
+             strengths: "Kemampuan matematika murni, algoritma pemrograman, logika penalaran terbuka".to_string(),
+         }
+     } else {
+@@ -310,21 +450,21 @@ pub fn get_model_capabilities(model_name: &str) -> ModelCapability {
+ 
+         ModelCapability {
+             model_name: model_name.to_string(),
+-            family: "OpenAI-Compatible Multimodal Model".to_string(),
++            family: "OpenAI-Compatible Model (capability unknown until probed)".to_string(),
+             provider_icon: "⚡".to_string(),
+             context_limit: 128000,
+             context_str: "128,000 tokens (128k)".to_string(),
+-            vision: true,
+-            vision_desc: "✅ Didukung (Multimodal Image)".to_string(),
++            vision: false,
++            vision_desc: "⚪ Unknown: metadata/probe provider belum membuktikan dukungan vision".to_string(),
+             video: has_video,
+-            video_desc: if has_video { "✅ Native Video Vision Supported".to_string() } else { "❌ Belum Didukung Langsung".to_string() },
++            video_desc: if has_video { "⚠️ Perkiraan nama model: video mungkin didukung; verifikasi provider".to_string() } else { "❌ Belum Didukung Langsung".to_string() },
+             documents: true,
+-            docs_desc: "✅ Didukung (Dokumen Teks & PDF)".to_string(),
++            docs_desc: "✅ Xiao dapat menyisipkan dokumen teks/kode; PDF/DOCX belum diekstrak".to_string(),
+             audio: has_audio,
+-            audio_desc: if has_audio { "✅ Native Audio Supported".to_string() } else { "❌ Belum Didukung Langsung".to_string() },
++            audio_desc: if has_audio { "⚠️ Perkiraan dari nama model: audio mungkin didukung; verifikasi provider".to_string() } else { "❌ Belum Didukung Langsung".to_string() },
+             thinking: has_thinking,
+-            thinking_desc: if has_thinking { "✅ Reasoning Chain-of-Thought".to_string() } else { "Standar (Direct Prompting)".to_string() },
+-            strengths: "Pemrosesan multimodal, penalaran kontekstual, dan pemahaman konten luas".to_string(),
++            thinking_desc: if has_thinking { "⚠️ Reasoning mungkin tersedia; chain-of-thought tidak ditampilkan".to_string() } else { "Standar (Direct Prompting)".to_string() },
++            strengths: "Kemampuan model belum dipastikan; gunakan metadata/probe provider sebagai sumber utama".to_string(),
+         }
+     }
+ }
+@@ -442,9 +582,9 @@ pub fn get_model_capabilities_with_meta(model_name: &str, meta: Option<&ModelMet
+             cap.vision = mod_low.contains("image") || mod_low.contains("vision") || mod_low.contains("multimodal");
+             cap.video = mod_low.contains("video");
+             cap.audio = mod_low.contains("audio");
+-            cap.vision_desc = if cap.vision { "✅ Didukung (Endpoint modality)" } else { "❌ Tidak dipublikasikan endpoint" }.to_string();
+-            cap.video_desc = if cap.video { "✅ Didukung (Endpoint modality)" } else { "❌ Tidak didukung endpoint" }.to_string();
+-            cap.audio_desc = if cap.audio { "✅ Didukung (Endpoint modality)" } else { "❌ Tidak didukung endpoint" }.to_string();
++            cap.vision_desc = if cap.vision { "✅ Dipublikasikan oleh metadata endpoint" } else { "⚪ Tidak dipublikasikan oleh metadata endpoint" }.to_string();
++            cap.video_desc = if cap.video { "✅ Dipublikasikan oleh metadata endpoint" } else { "⚪ Tidak dipublikasikan oleh metadata endpoint" }.to_string();
++            cap.audio_desc = if cap.audio { "✅ Dipublikasikan oleh metadata endpoint" } else { "⚪ Tidak dipublikasikan oleh metadata endpoint" }.to_string();
+         }
+     }
+ 
+@@ -483,7 +623,9 @@ pub struct AIChatService {
+     client: Client,
+     user_models: Arc<RwLock<HashMap<i64, String>>>,
+     user_sessions: Arc<RwLock<HashMap<i64, Vec<ChatSession>>>>,
+-    active_session_idx: Arc<RwLock<HashMap<i64, usize>>>,
++    active_session_id: Arc<RwLock<HashMap<i64, usize>>>,
++    generation_locks: Arc<RwLock<HashMap<i64, Arc<Mutex<()>>>>>,
++    active_generations: Arc<RwLock<HashMap<(i64, i64), watch::Sender<bool>>>>,
+     pub user_waiting_rename: Arc<RwLock<HashMap<i64, usize>>>,
+     pub user_rename_msg_id: Arc<RwLock<HashMap<i64, i64>>>,
+     pub user_session_msg_id: Arc<RwLock<HashMap<i64, i64>>>,
+@@ -495,7 +637,7 @@ pub struct AIChatService {
+ 
+ impl AIChatService {
+     pub fn new() -> Self {
+-        for key in ["BOT_TOKEN", "AI_ENDPOINT", "AI_API_KEY", "AI_MODEL"] {
++        for key in ["BOT_TOKEN", "AI_ENDPOINT", "AI_API_KEY", "AI_MODEL", "OWNER_USER_ID", "ALLOWED_CHAT_IDS", "IMAGE_FALLBACK_PROVIDER"] {
+             if load_app_setting(key).is_none() {
+                 if let Ok(value) = std::env::var(key) {
+                     if !value.trim().is_empty() {
+@@ -513,7 +655,9 @@ impl AIChatService {
+             client,
+             user_models: Arc::new(RwLock::new(HashMap::new())),
+             user_sessions: Arc::new(RwLock::new(HashMap::new())),
+-            active_session_idx: Arc::new(RwLock::new(HashMap::new())),
++            active_session_id: Arc::new(RwLock::new(HashMap::new())),
++            generation_locks: Arc::new(RwLock::new(HashMap::new())),
++            active_generations: Arc::new(RwLock::new(HashMap::new())),
+             user_waiting_rename: Arc::new(RwLock::new(HashMap::new())),
+             user_rename_msg_id: Arc::new(RwLock::new(HashMap::new())),
+             user_session_msg_id: Arc::new(RwLock::new(HashMap::new())),
+@@ -849,7 +993,7 @@ impl AIChatService {
+                     (false, Err(format!("HTTP 404 Not Found: Path /models tidak ditemukan di {clean_endpoint}. Pastikan format endpoint URL benar (misal: https://api.openai.com/v1).")))
+                 } else {
+                     let err_text = resp.text().await.unwrap_or_default();
+-                    (false, Err(format!("HTTP {}: {}", status.as_u16(), &err_text[..err_text.len().min(150)])))
++                    (false, Err(format!("HTTP {}: {}", status.as_u16(), truncate_chars(&err_text, 150).as_str())))
+                 }
+             }
+             Err(e) => {
+@@ -886,126 +1030,190 @@ impl AIChatService {
+     // ==========================================
+ 
+     pub async fn get_sessions(&self, user_id: i64) -> Vec<ChatSession> {
+-        let mut sessions_map = self.user_sessions.write().await;
+-        let list = sessions_map.entry(user_id).or_insert_with(|| {
+-            if let Ok(existing) = load_sessions_db(user_id) {
+-                if !existing.is_empty() {
+-                    return existing;
+-                }
++        {
++            let sessions_map = self.user_sessions.read().await;
++            if let Some(list) = sessions_map.get(&user_id) {
++                return list.clone();
+             }
++        }
++
++        // Double-check under the write lock so concurrent first updates cannot both
++        // create an initial session and leave a ghost row in SQLite.
++        let mut sessions_map = self.user_sessions.write().await;
++        if let Some(list) = sessions_map.get(&user_id) {
++            return list.clone();
++        }
++
++        let mut existing = load_sessions_db(user_id).unwrap_or_default();
++        if existing.is_empty() {
+             let now_str = Local::now().format("%d %b %H:%M").to_string();
+             let session = ChatSession {
+-                id: 1,
++                id: allocate_session_id_db(user_id).unwrap_or(1),
+                 name: format!("Session {now_str}"),
+                 messages: Vec::new(),
+                 created_at: now_str,
+             };
+-            let _ = save_session_db(user_id, &session);
+-            vec![session]
+-        });
+-        list.clone()
++            let _ = save_session_metadata_db(user_id, &session);
++            existing.push(session);
++        }
++        let _ = ensure_session_identity_v2_db(user_id, &existing);
++        sessions_map.insert(user_id, existing.clone());
++        existing
+     }
+ 
+-    pub async fn get_active_session_index(&self, user_id: i64) -> usize {
+-        let _ = self.get_sessions(user_id).await;
+-        let mut active_map = self.active_session_idx.write().await;
+-        let idx = if let Some(value) = active_map.get(&user_id).copied() {
+-            value
+-        } else {
+-            let stored = open_session_db().ok().and_then(|conn| conn.query_row("SELECT session_id FROM active_sessions WHERE user_id=?1", params![user_id], |row| row.get::<_, usize>(0)).ok()).unwrap_or(0);
+-            active_map.insert(user_id, stored);
+-            stored
+-        };
+-
+-        let sessions_map = self.user_sessions.read().await;
+-        if let Some(list) = sessions_map.get(&user_id) {
+-            if idx >= list.len() {
+-                let fixed = list.len().saturating_sub(1);
+-                active_map.insert(user_id, fixed);
+-                return fixed;
++    pub async fn get_active_session_id(&self, user_id: i64) -> usize {
++        let sessions = self.get_sessions(user_id).await;
++        if let Some(id) = self.active_session_id.read().await.get(&user_id).copied() {
++            if sessions.iter().any(|session| session.id == id) {
++                return id;
+             }
+         }
+-        idx
++
++        let stored_id = open_session_db()
++            .ok()
++            .and_then(|conn| {
++                conn.query_row(
++                    "SELECT session_id FROM active_sessions WHERE user_id=?1",
++                    params![user_id],
++                    |row| row.get::<_, usize>(0),
++                )
++                .ok()
++            })
++            .filter(|id| sessions.iter().any(|session| session.id == *id))
++            .unwrap_or(sessions[0].id);
++
++        self.active_session_id.write().await.insert(user_id, stored_id);
++        let _ = save_active_session_db(user_id, stored_id);
++        stored_id
++    }
++
++    pub async fn get_active_session_index(&self, user_id: i64) -> usize {
++        let sessions = self.get_sessions(user_id).await;
++        let active_id = self.get_active_session_id(user_id).await;
++        sessions.iter().position(|session| session.id == active_id).unwrap_or(0)
+     }
+ 
+     pub async fn get_active_session(&self, user_id: i64) -> ChatSession {
+         let sessions = self.get_sessions(user_id).await;
+-        let idx = self.get_active_session_index(user_id).await;
+-        sessions.get(idx).cloned().unwrap_or_else(|| sessions[0].clone())
++        let active_id = self.get_active_session_id(user_id).await;
++        sessions
++            .iter()
++            .find(|session| session.id == active_id)
++            .cloned()
++            .unwrap_or_else(|| sessions[0].clone())
+     }
+ 
+     pub async fn create_new_session(&self, user_id: i64, custom_name: Option<&str>) -> ChatSession {
+         let _ = self.get_sessions(user_id).await;
+-        let mut sessions_map = self.user_sessions.write().await;
+-        let list = sessions_map.entry(user_id).or_default();
+         let now_str = Local::now().format("%d %b %H:%M").to_string();
+-        let new_id = list.len() + 1;
++        let fallback_next_id = {
++            let sessions_map = self.user_sessions.read().await;
++            sessions_map
++                .get(&user_id)
++                .and_then(|list| list.iter().map(|session| session.id).max())
++                .unwrap_or(0)
++                .saturating_add(1)
++                .max(1)
++        };
++        let new_id = allocate_session_id_db(user_id).unwrap_or(fallback_next_id);
+         let name = custom_name
+-            .map(|s| s.to_string())
++            .map(|value| truncate_chars(value.trim(), 60))
++            .filter(|value| !value.is_empty())
+             .unwrap_or_else(|| format!("Session {now_str}"));
++        let session = ChatSession { id: new_id, name, messages: Vec::new(), created_at: now_str };
+ 
+-        let session = ChatSession {
+-            id: new_id,
+-            name,
+-            messages: Vec::new(),
+-            created_at: now_str,
+-        };
+-        list.push(session.clone());
+-        let _ = save_session_db(user_id, &session);
+-
+-        let new_idx = list.len() - 1;
+-        drop(sessions_map);
+-
+-        self.active_session_idx.write().await.insert(user_id, new_idx);
+-        if let Ok(conn) = open_session_db() {
+-            let _ = conn.execute("INSERT INTO active_sessions(user_id,session_id) VALUES(?1,?2) ON CONFLICT(user_id) DO UPDATE SET session_id=excluded.session_id", params![user_id, new_idx]);
++        {
++            let mut sessions_map = self.user_sessions.write().await;
++            sessions_map.entry(user_id).or_default().push(session.clone());
+         }
++        let _ = save_session_metadata_db(user_id, &session);
++        self.active_session_id.write().await.insert(user_id, new_id);
++        let _ = save_active_session_db(user_id, new_id);
+         session
+     }
+ 
+-    pub async fn switch_session(&self, user_id: i64, index: usize) -> bool {
++    pub async fn switch_session_by_id(&self, user_id: i64, session_id: usize) -> bool {
+         let sessions = self.get_sessions(user_id).await;
+-        if index < sessions.len() {
+-            self.active_session_idx.write().await.insert(user_id, index);
+-            if let Ok(conn) = open_session_db() {
+-                let _ = conn.execute("INSERT INTO active_sessions(user_id,session_id) VALUES(?1,?2) ON CONFLICT(user_id) DO UPDATE SET session_id=excluded.session_id", params![user_id, index]);
+-            }
++        if sessions.iter().any(|session| session.id == session_id) {
++            self.active_session_id.write().await.insert(user_id, session_id);
++            let _ = save_active_session_db(user_id, session_id);
+             return true;
+         }
+         false
+     }
+ 
++    pub async fn switch_session(&self, user_id: i64, index: usize) -> bool {
++        let sessions = self.get_sessions(user_id).await;
++        let Some(session_id) = sessions.get(index).map(|session| session.id) else {
++            return false;
++        };
++        self.switch_session_by_id(user_id, session_id).await
++    }
++
++    pub async fn remove_session_by_id(&self, user_id: i64, session_id: usize) -> bool {
++        let active_id = self.get_active_session_id(user_id).await;
++        let (removed_id, mut new_active_id, create_replacement) = {
++            let mut sessions_map = self.user_sessions.write().await;
++            let Some(list) = sessions_map.get_mut(&user_id) else { return false; };
++            let Some(index) = list.iter().position(|session| session.id == session_id) else {
++                return false;
++            };
++            let removed = list.remove(index);
++            let create_replacement = list.is_empty();
++            let new_active_id = if !create_replacement
++                && (removed.id == active_id || !list.iter().any(|session| session.id == active_id))
++            {
++                let target_index = index.min(list.len().saturating_sub(1));
++                list[target_index].id
++            } else {
++                active_id
++            };
++            (removed.id, new_active_id, create_replacement)
++        };
++
++        let _ = delete_session_db(user_id, removed_id);
++
++        if create_replacement {
++            let now_str = Local::now().format("%d %b %H:%M").to_string();
++            let replacement = ChatSession {
++                id: allocate_session_id_db(user_id).unwrap_or(active_id.saturating_add(1).max(1)),
++                name: format!("Session {now_str}"),
++                messages: Vec::new(),
++                created_at: now_str,
++            };
++            let _ = save_session_metadata_db(user_id, &replacement);
++            new_active_id = replacement.id;
++            self.user_sessions
++                .write()
++                .await
++                .entry(user_id)
++                .or_default()
++                .push(replacement);
++        }
++
++        self.active_session_id.write().await.insert(user_id, new_active_id);
++        let _ = save_active_session_db(user_id, new_active_id);
++        true
++    }
++
+     pub async fn remove_session(&self, user_id: i64, index: usize) -> bool {
++        let sessions = self.get_sessions(user_id).await;
++        let Some(session_id) = sessions.get(index).map(|session| session.id) else {
++            return false;
++        };
++        self.remove_session_by_id(user_id, session_id).await
++    }
++
++    pub async fn rename_session_by_id(&self, user_id: i64, session_id: usize, new_name: &str) -> bool {
+         let mut sessions_map = self.user_sessions.write().await;
+         if let Some(list) = sessions_map.get_mut(&user_id) {
+-            if index < list.len() {
+-                list.remove(index);
+-                if list.is_empty() {
+-                    let now_str = Local::now().format("%d %b %H:%M").to_string();
+-                    list.push(ChatSession {
+-                        id: 1,
+-                        name: format!("Session {now_str}"),
+-                        messages: Vec::new(),
+-                        created_at: now_str,
+-                    });
+-                    let _ = save_session_db(user_id, &list[0]);
+-                    self.active_session_idx.write().await.insert(user_id, 0);
+-                } else {
+-                    let mut active_map = self.active_session_idx.write().await;
+-                    let curr = active_map.get(&user_id).copied().unwrap_or(0);
+-                    if curr >= list.len() {
+-                        active_map.insert(user_id, list.len() - 1);
+-                    } else if curr == index {
+-                        active_map.insert(user_id, index.saturating_sub(1));
+-                    }
+-                }
+-                for session in list.iter() {
+-                    let _ = save_session_db(user_id, session);
+-                }
+-                let active_idx = *self.active_session_idx.read().await.get(&user_id).unwrap_or(&0);
+-                if let Ok(conn) = open_session_db() {
+-                    let _ = conn.execute("INSERT INTO active_sessions(user_id,session_id) VALUES(?1,?2) ON CONFLICT(user_id) DO UPDATE SET session_id=excluded.session_id", params![user_id, active_idx]);
++            if let Some(session) = list.iter_mut().find(|session| session.id == session_id) {
++                let name = truncate_chars(new_name.trim(), 60);
++                if name.is_empty() {
++                    return false;
+                 }
++                session.name = name;
++                let _ = save_session_metadata_db(user_id, session);
+                 return true;
+             }
+         }
+@@ -1013,29 +1221,47 @@ impl AIChatService {
+     }
+ 
+     pub async fn rename_session(&self, user_id: i64, index: usize, new_name: &str) -> bool {
+-        let mut sessions_map = self.user_sessions.write().await;
+-        if let Some(list) = sessions_map.get_mut(&user_id) {
+-            if let Some(sess) = list.get_mut(index) {
+-                let trimmed = new_name.trim();
+-                sess.name = trimmed[..trimmed.len().min(60)].to_string();
+-                let _ = save_session_db(user_id, sess);
+-                return true;
+-            }
+-        }
+-        false
++        let sessions = self.get_sessions(user_id).await;
++        let Some(session_id) = sessions.get(index).map(|session| session.id) else {
++            return false;
++        };
++        self.rename_session_by_id(user_id, session_id, new_name).await
+     }
+ 
+     pub async fn clear_history(&self, user_id: i64) {
+-        let idx = self.get_active_session_index(user_id).await;
++        let active_id = self.get_active_session_id(user_id).await;
+         let mut sessions_map = self.user_sessions.write().await;
+         if let Some(list) = sessions_map.get_mut(&user_id) {
+-            if let Some(sess) = list.get_mut(idx) {
+-                sess.messages.clear();
+-                let _ = save_session_db(user_id, sess);
++            if let Some(session) = list.iter_mut().find(|session| session.id == active_id) {
++                session.messages.clear();
++                let _ = replace_session_messages_db(user_id, session);
+             }
+         }
+     }
+ 
++    pub async fn generation_lock(&self, user_id: i64) -> Arc<Mutex<()>> {
++        if let Some(lock) = self.generation_locks.read().await.get(&user_id).cloned() {
++            return lock;
++        }
++        let mut locks = self.generation_locks.write().await;
++        locks.entry(user_id).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
++    }
++
++    pub async fn begin_generation(&self, chat_id: i64, draft_id: i64) -> watch::Receiver<bool> {
++        let (sender, receiver) = watch::channel(false);
++        self.active_generations.write().await.insert((chat_id, draft_id), sender);
++        receiver
++    }
++
++    pub async fn cancel_generation(&self, chat_id: i64, draft_id: i64) -> bool {
++        let sender = self.active_generations.read().await.get(&(chat_id, draft_id)).cloned();
++        sender.map(|sender| sender.send(true).is_ok()).unwrap_or(false)
++    }
++
++    pub async fn end_generation(&self, chat_id: i64, draft_id: i64) {
++        self.active_generations.write().await.remove(&(chat_id, draft_id));
++    }
++
+     pub async fn get_context_stats(&self, user_id: i64) -> ContextStats {
+         let active_sess = self.get_active_session(user_id).await;
+         let active_model = self.get_user_model(user_id).await;
+@@ -1057,15 +1283,7 @@ impl AIChatService {
+             let toks = (chars / 3).max(1);
+             total_chars += chars;
+ 
+-            let preview = if c_str.len() > 90 {
+-                let mut end = 90;
+-                while end < c_str.len() && !c_str.is_char_boundary(end) {
+-                    end += 1;
+-                }
+-                format!("{}...", &c_str[..end])
+-            } else {
+-                c_str.clone()
+-            };
++            let preview = truncate_chars_with_ellipsis(&c_str, 90);
+ 
+             msg_stats.push(ContextMessageItem {
+                 index: i + 1,
+@@ -1151,7 +1369,7 @@ impl AIChatService {
+                     (false, Err("ENDPOINT_NOT_SUPPORTED".to_string()))
+                 } else {
+                     let err_txt = resp.text().await.unwrap_or_default();
+-                    (false, Err(format!("HTTP {}: {}", status.as_u16(), &err_txt[..err_txt.len().min(100)])))
++                    (false, Err(format!("HTTP {}: {}", status.as_u16(), truncate_chars(&err_txt, 100).as_str())))
+                 }
+             }
+             Err(e) => (false, Err(format!("Audio transcription error: {e}"))),
+@@ -1176,13 +1394,15 @@ impl AIChatService {
+         video_bytes: Option<Vec<u8>>,
+         video_mime: Option<&str>,
+         video_duration: Option<i32>,
+-    ) -> (Option<String>, String) {
++        cancel_rx: &mut watch::Receiver<bool>,
++    ) -> (Option<String>, String, bool) {
+         let provider = match self.get_active_provider(user_id).await {
+             Some(p) if !p.endpoint.is_empty() => p,
+             _ => {
+                 return (
+                     None,
+                     "👋 <b>Hi, selamat datang di XiaoAI!</b>\n\n⚠️ <i>AI Provider belum dikonfigurasi.</i>\nSilakan jalankan perintah <code>xiao provider add</code> di terminal.".to_string(),
++                    false,
+                 );
+             }
+         };
+@@ -1203,14 +1423,15 @@ impl AIChatService {
+             .find(|record| record.provider_id == provider.endpoint.trim_end_matches('/') && record.model == model);
+         if let Some(record) = capability {
+             if video_bytes.is_some() && record.supports_video == Some(false) {
+-                return (None, format!("Endpoint '{}' tidak mendukung input video untuk model '{}'.", provider.name, model));
++                return (None, format!("Endpoint '{}' tidak mendukung input video untuk model '{}'.", provider.name, model), false);
+             }
+             if audio_bytes.is_some() && record.supports_audio == Some(false) {
+-                return (None, format!("Endpoint '{}' tidak mendukung input audio untuk model '{}'.", provider.name, model));
++                return (None, format!("Endpoint '{}' tidak mendukung input audio untuk model '{}'.", provider.name, model), false);
+             }
+         }
+ 
+         let active_sess = self.get_active_session(user_id).await;
++        let request_session_id = active_sess.id;
+         let mut history: Vec<Value> = active_sess
+             .messages
+             .iter()
+@@ -1222,35 +1443,6 @@ impl AIChatService {
+             history = history[start..].to_vec();
+         }
+ 
+-        // Contextual stage classification
+-        let _contextual_stages = if video_bytes.is_some() {
+-            vec![
+-                ("Watching", ProgressActivity::Watching),
+-                ("Thinking", ProgressActivity::Thinking),
+-                ("Writing", ProgressActivity::Writing),
+-            ]
+-        } else if image_bytes.is_some() {
+-            vec![
+-                ("Looking", ProgressActivity::Looking),
+-                ("Thinking", ProgressActivity::Thinking),
+-                ("Writing", ProgressActivity::Writing),
+-            ]
+-        } else if doc_text.is_some() {
+-            vec![
+-                ("Reading", ProgressActivity::Reading),
+-                ("Thinking", ProgressActivity::Thinking),
+-                ("Writing", ProgressActivity::Writing),
+-            ]
+-        } else if audio_bytes.is_some() {
+-            vec![
+-                ("Listening", ProgressActivity::Listening),
+-                ("Thinking", ProgressActivity::Thinking),
+-                ("Writing", ProgressActivity::Writing),
+-            ]
+-        } else {
+-            generate_contextual_stages(prompt, &model)
+-        };
+-
+         let mut clean_prompt = prompt.trim().to_string();
+         if let Some(doc) = doc_text {
+             let d_name = doc_name.unwrap_or("Dokumen");
+@@ -1269,27 +1461,16 @@ impl AIChatService {
+             clean_prompt = "Dengarkan rekaman suara ini dan jawab pertanyaan atau instruksi di dalamnya secara lengkap.".to_string();
+         }
+ 
+-        let p_low = clean_prompt.to_lowercase();
+-        let needs_think = ["logika", "teka-teki", "puzzle", "riddle", "analisis mendalam", "hitung", "rumus", "derivat", "audit", "debug"]
+-            .iter()
+-            .any(|k| p_low.contains(k))
+-            || model.to_lowercase().contains("thinking");
+-
+-        let enhanced_prompt = if needs_think {
+-            format!(
+-                "Tuliskan analisis penalaranmu di dalam tag <think>...</think> terlebih dahulu jika diperlukan, lalu berikan jawabanmu dengan format yang rapi dan elegan.\n\n\
+-                Pesan/Pertanyaan: {clean_prompt}"
+-            )
+-        } else {
+-            clean_prompt.clone()
+-        };
++        let enhanced_prompt = clean_prompt.clone();
+ 
+         let mut messages = vec![json!({
+             "role": "system",
+             "content": "Kamu adalah asisten AI yang cerdas, komunikatif, dan ramah. \
+-                        Kamu memiliki kemampuan penglihatan visual multimodal yang andal untuk menganalisis rekaman video, mengenali gambar/foto, membaca dokumen teks/PDF, serta mendengarkan pesan suara audio. \
++                        Gunakan input multimodal hanya ketika input tersebut benar-benar disediakan dan endpoint/model mendukungnya. \
++                        Dokumen yang disisipkan Xiao sudah diekstrak sebagai teks; jangan mengklaim membaca PDF/DOCX asli jika kontennya tidak diberikan. \
++                        Lakukan penalaran secara internal dan berikan hanya jawaban yang berguna bagi pengguna; jangan menampilkan chain-of-thought tersembunyi. \
+                         Gunakan gaya bahasa yang alami dan format teks yang elegan. \
+-                        Jika membuat tabel atau data berkolom, SELALU gunakan format standar Markdown Table (| Kolom 1 | Kolom 2 |\n| :--- | :--- |) dan hindari menggambar border ASCII manual, karena sistem akan secara otomatis merendernya sebagai tabel native Telegram interaktif (InputRichBlockTable)."
++                        Jika membuat tabel atau data berkolom, gunakan Markdown Table standar agar Xiao dapat merendernya sebagai tabel Telegram."
+         })];
+ 
+         messages.extend(history);
+@@ -1364,120 +1545,125 @@ impl AIChatService {
+             req = req.header("Authorization", format!("Bearer {}", provider.api_key));
+         }
+ 
+-        let resp = match req.send().await {
++        let mut send_future = Box::pin(req.send());
++        let send_result = tokio::select! {
++            changed = cancel_rx.changed() => {
++                if changed.is_ok() && *cancel_rx.borrow() {
++                    if let Some(tl) = timeline {
++                        tl.fail_current("Stopped by user").await;
++                        tl.sync_draft(true).await;
++                    }
++                    return (None, "⏹️ Generasi dihentikan oleh pengguna.".to_string(), true);
++                }
++                send_future.as_mut().await
++            }
++            result = send_future.as_mut() => result,
++        };
++
++        let resp = match send_result {
+             Ok(r) => r,
+             Err(e) => {
+-                error!("Error sending AI completion request: {e}");
++                error!("Error sending AI completion request: {}", if e.is_timeout() { "timeout" } else { "transport failure" });
+                 if let Some(tl) = timeline {
+-                    tl.fail_current(e.to_string()).await;
++                    tl.fail_current("Provider connection failed").await;
+                     tl.sync_draft(true).await;
+                 }
+-                return (None, format!("⚠️ Terjadi kendala saat memproses jawaban AI: {e}"));
++                return (None, "⚠️ Terjadi kendala saat memproses jawaban AI.".to_string(), false);
+             }
+         };
+ 
+         if !resp.status().is_success() {
+             let status_code = resp.status().as_u16();
+-            let err_txt = resp.text().await.unwrap_or_default();
+-            error!("AI endpoint returned status {status_code}: {err_txt}");
++            let _ = resp.text().await;
++            error!("AI endpoint returned status {status_code}");
+             if let Some(tl) = timeline {
+                 tl.fail_current(format!("API status {status_code}")).await;
+                 tl.sync_draft(true).await;
+             }
+-            return (None, format!("⚠️ Gagal menghubungi AI proxy: {status_code}"));
++            return (None, format!("⚠️ Gagal menghubungi AI proxy: {status_code}"), false);
+         }
+ 
+         let mut stream = resp.bytes_stream();
+         let mut buffer = String::new();
+         let mut accumulated_raw = String::new();
+         let mut accumulated_reasoning = String::new();
+-        let mut last_activity: Option<ProgressActivity> = None;
+         let mut has_started_answer = false;
+ 
+-        while let Some(item) = stream.next().await {
++        let mut cancelled = false;
++        let mut stream_interrupted = false;
++        let mut stream_done = false;
++        while !stream_done {
++            let mut next_future = Box::pin(stream.next());
++            let next_item = tokio::select! {
++                changed = cancel_rx.changed() => {
++                    if changed.is_ok() && *cancel_rx.borrow() {
++                        cancelled = true;
++                        None
++                    } else {
++                        next_future.as_mut().await
++                    }
++                }
++                item = next_future.as_mut() => item,
++            };
++
++            let Some(item) = next_item else { break; };
+             let bytes = match item {
+-                Ok(b) => b,
+-                Err(e) => {
+-                    warn!("Stream chunk error: {e}");
++                Ok(bytes) => bytes,
++                Err(_) => {
++                    stream_interrupted = true;
++                    warn!("AI response stream interrupted");
+                     break;
+                 }
+             };
+ 
+-            let chunk_str = String::from_utf8_lossy(&bytes);
+-            buffer.push_str(&chunk_str);
+-
++            buffer.push_str(&String::from_utf8_lossy(&bytes));
+             while let Some(newline_pos) = buffer.find('\n') {
+                 let line = buffer[..newline_pos].trim().to_string();
+                 buffer.drain(..=newline_pos);
+-
+-                if !line.starts_with("data: ") {
++                let Some(line_data) = line.strip_prefix("data:").map(str::trim) else {
+                     continue;
+-                }
+-                let line_data = &line[6..].trim();
+-                if *line_data == "[DONE]" {
++                };
++                if line_data == "[DONE]" {
++                    stream_done = true;
+                     break;
+                 }
+ 
+-                if let Ok(data) = serde_json::from_str::<Value>(line_data) {
+-                    if let Some(choice) = data.get("choices").and_then(|c| c.get(0)) {
+-                        if let Some(delta) = choice.get("delta") {
+-                            let content_chunk = delta.get("content").and_then(|s| s.as_str()).unwrap_or("");
+-                            let reasoning_chunk = delta.get("reasoning_content").and_then(|s| s.as_str()).unwrap_or("");
+-
+-                            if !reasoning_chunk.is_empty() {
+-                                accumulated_reasoning.push_str(reasoning_chunk);
+-                                if let Some(tl) = timeline {
+-                                    let mut window_start = accumulated_reasoning.len().saturating_sub(150);
+-                                    while window_start > 0 && !accumulated_reasoning.is_char_boundary(window_start) {
+-                                        window_start += 1;
+-                                    }
+-                                    let act = classify_text_activity(&accumulated_reasoning[window_start..]);
+-                                    if Some(act) != last_activity {
+-                                        last_activity = Some(act);
+-                                        tl.add_action(act.display_name(), Some(act)).await;
+-                                        tl.sync_draft(false).await;
+-                                    }
+-                                }
+-                            }
++                let Ok(data) = serde_json::from_str::<Value>(line_data) else { continue; };
++                let Some(delta) = data
++                    .get("choices")
++                    .and_then(|choices| choices.get(0))
++                    .and_then(|choice| choice.get("delta"))
++                else { continue; };
+ 
+-                            if !content_chunk.is_empty() {
+-                                accumulated_raw.push_str(content_chunk);
+-
+-                                if accumulated_raw.contains("<think>") {
+-                                    if !accumulated_raw.contains("</think>") {
+-                                        if let Some(tl) = timeline {
+-                                            if let Some(after) = accumulated_raw.split("<think>").nth(1) {
+-                                                let mut window_start = after.len().saturating_sub(150);
+-                                                while window_start > 0 && !after.is_char_boundary(window_start) {
+-                                                    window_start += 1;
+-                                                }
+-                                                let act = classify_text_activity(&after[window_start..]);
+-                                                if Some(act) != last_activity {
+-                                                    last_activity = Some(act);
+-                                                    tl.add_action(act.display_name(), Some(act)).await;
+-                                                    tl.sync_draft(false).await;
+-                                                }
+-                                            }
+-                                        }
+-                                    } else if !has_started_answer {
+-                                        has_started_answer = true;
+-                                        last_activity = Some(ProgressActivity::Writing);
+-                                        if let Some(tl) = timeline {
+-                                            tl.add_action("Writing", Some(ProgressActivity::Writing)).await;
+-                                            tl.sync_draft(false).await;
+-                                        }
+-                                    }
+-                                } else if !has_started_answer {
+-                                    has_started_answer = true;
+-                                    last_activity = Some(ProgressActivity::Writing);
+-                                    if let Some(tl) = timeline {
+-                                        tl.add_action("Writing", Some(ProgressActivity::Writing)).await;
+-                                        tl.sync_draft(false).await;
+-                                    }
+-                                }
+-                            }
++                if let Some(reasoning_chunk) = delta.get("reasoning_content").and_then(Value::as_str) {
++                    accumulated_reasoning.push_str(reasoning_chunk);
++                }
++
++                let content_chunk = delta.get("content").and_then(Value::as_str).unwrap_or("");
++                if content_chunk.is_empty() {
++                    continue;
++                }
++                accumulated_raw.push_str(content_chunk);
++
++                let visible_partial = if let Some(close_pos) = accumulated_raw.rfind("</think>") {
++                    accumulated_raw[close_pos + "</think>".len()..].trim()
++                } else if accumulated_raw.contains("<think>") {
++                    ""
++                } else {
++                    accumulated_raw.trim()
++                };
++
++                if !visible_partial.is_empty() {
++                    if !has_started_answer {
++                        has_started_answer = true;
++                        if let Some(tl) = timeline {
++                            tl.add_action("Writing", Some(ProgressActivity::Writing)).await;
+                         }
+                     }
++                    if let Some(tl) = timeline {
++                        tl.set_partial_answer(visible_partial).await;
++                        tl.sync_draft(false).await;
++                    }
+                 }
+             }
+         }
+@@ -1517,51 +1703,68 @@ impl AIChatService {
+             }
+         }
+ 
+-        if answer_text.is_empty() {
++        if cancelled {
++            if answer_text.trim().is_empty() {
++                answer_text = "⏹️ Generasi dihentikan oleh pengguna.".to_string();
++            } else {
++                answer_text.push_str("\n\n_⏹️ Generasi dihentikan oleh pengguna._");
++            }
++        } else if stream_interrupted {
++            if answer_text.trim().is_empty() {
++                answer_text = "⚠️ Stream provider terputus sebelum jawaban diterima.".to_string();
++            } else {
++                answer_text.push_str("\n\n_⚠️ Stream provider terputus; jawaban mungkin tidak lengkap._");
++            }
++        } else if answer_text.is_empty() {
+             answer_text = "Maaf, respon AI kosong untuk permintaan ini.".to_string();
+         }
+ 
+         if let Some(tl) = timeline {
+-            if !has_started_answer {
+-                tl.add_action("Writing", Some(ProgressActivity::Writing)).await;
++            tl.set_partial_answer(&answer_text).await;
++            if cancelled {
++                tl.fail_current("Stopped by user").await;
++                tl.sync_draft(true).await;
++            } else if stream_interrupted {
++                tl.fail_current("Provider stream interrupted").await;
+                 tl.sync_draft(true).await;
++            } else {
++                if !has_started_answer {
++                    tl.add_action("Writing", Some(ProgressActivity::Writing)).await;
++                    tl.sync_draft(true).await;
++                }
++                tl.finish_all(ProgressState::Done).await;
+             }
+-            tl.finish_all(ProgressState::Done).await;
+         }
+ 
+-        // Auto-update session name on first turn
+-        let idx = self.get_active_session_index(user_id).await;
++        // Persist only to the stable session that originated this request. If the user
++        // deleted that session while generation was running, discard the late write.
++        let user_message = ChatMessage {
++            role: "user".to_string(),
++            content: Value::String(prompt.to_string()),
++        };
++        let assistant_message = ChatMessage {
++            role: "assistant".to_string(),
++            content: Value::String(answer_text.clone()),
++        };
++        let appended = [user_message.clone(), assistant_message.clone()];
+         let mut sessions_map = self.user_sessions.write().await;
+         if let Some(list) = sessions_map.get_mut(&user_id) {
+-            if let Some(sess) = list.get_mut(idx) {
+-                if sess.messages.is_empty() && sess.name.starts_with("Session ") {
++            if let Some(session) = list.iter_mut().find(|session| session.id == request_session_id) {
++                if session.messages.is_empty() && session.name.starts_with("Session ") {
+                     let clean_title = prompt.trim().replace('\n', " ");
+-                    let short_title = if clean_title.len() > 35 {
+-                        let mut end = 32;
+-                        while end < clean_title.len() && !clean_title.is_char_boundary(end) {
+-                            end += 1;
+-                        }
+-                        format!("{}...", &clean_title[..end])
+-                    } else {
+-                        clean_title
+-                    };
++                    let short_title = truncate_chars_with_ellipsis(&clean_title, 32);
+                     if !short_title.is_empty() {
+-                        sess.name = short_title;
++                        session.name = short_title;
+                     }
+                 }
+-                sess.messages.push(ChatMessage {
+-                    role: "user".to_string(),
+-                    content: Value::String(prompt.to_string()),
+-                });
+-                sess.messages.push(ChatMessage {
+-                    role: "assistant".to_string(),
+-                    content: Value::String(answer_text.clone()),
+-                });
+-                let _ = save_session_db(user_id, sess);
++                session.messages.extend(appended.iter().cloned());
++                let _ = append_session_messages_db(user_id, session, &appended);
++            } else {
++                warn!("Discarding late AI result for deleted session {request_session_id}");
+             }
+         }
+ 
+-        (thinking_text, answer_text)
++        (thinking_text, answer_text, cancelled)
+     }
+ 
+     // ==========================================
+@@ -1623,7 +1826,20 @@ impl AIChatService {
+             }
+         }
+ 
+-        // 2. Universal High-Performance Fallback Engine (FLUX.1 via Pollinations)
++        // 2. Optional external fallback. Disabled by default to avoid silently
++        // sending user prompts to a provider they did not select.
++        let fallback = std::env::var("IMAGE_FALLBACK_PROVIDER")
++            .ok()
++            .or_else(|| load_app_setting("IMAGE_FALLBACK_PROVIDER"))
++            .unwrap_or_else(|| "none".to_string());
++        if !fallback.eq_ignore_ascii_case("pollinations") {
++            return (
++                false,
++                None,
++                "Provider aktif tidak menghasilkan gambar dan fallback eksternal dinonaktifkan. Set IMAGE_FALLBACK_PROVIDER=pollinations untuk opt-in.".to_string(),
++            );
++        }
++
+         let encoded_prompt = urlencoding::encode(clean_prompt);
+         let poll_url = format!(
+             "https://image.pollinations.ai/prompt/{}?width={}&height={}&model=flux&nologo=true&enhance=true",
+@@ -1652,3 +1868,31 @@ impl AIChatService {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn session(id: usize) -> ChatSession {
++        ChatSession {
++            id,
++            name: format!("Session {id}"),
++            messages: Vec::new(),
++            created_at: "now".to_string(),
++        }
++    }
++
++    #[test]
++    fn legacy_active_index_maps_to_stable_session_id() {
++        let sessions = vec![session(3), session(8), session(20)];
++        assert_eq!(legacy_active_session_id(Some(1), &sessions), Some(8));
++        assert_eq!(legacy_active_session_id(Some(99), &sessions), Some(3));
++    }
++
++    #[test]
++    fn session_id_counter_never_reuses_deleted_high_water_mark() {
++        assert_eq!(compute_next_session_id(Some(21), 8), 21);
++        assert_eq!(compute_next_session_id(Some(4), 8), 9);
++        assert_eq!(compute_next_session_id(None, 8), 9);
++    }
++}
+diff --git a/src/bot/client.rs b/src/bot/client.rs
+index 48d558b..964fa56 100644
+--- a/src/bot/client.rs
++++ b/src/bot/client.rs
+@@ -7,10 +7,28 @@ use serde_json::{json, Value};
+ use tracing::{error, info, warn};
+ 
+ use super::models::{
+-    ApiResponse, BotCommand, FileInfo, InputRichMessage,
++    ApiResponse, BotCommand, EphemeralMessageParameters, FileInfo, InputRichMessage,
+     RichBlock, RichBlockTableCell, Update, User,
+ };
+ 
++const MAX_TELEGRAM_DOWNLOAD_BYTES: usize = 20 * 1024 * 1024;
++
++fn reqwest_error_kind(error: &reqwest::Error) -> &'static str {
++    if error.is_timeout() {
++        "timeout"
++    } else if error.is_connect() {
++        "connection failure"
++    } else if error.is_request() {
++        "request failure"
++    } else if error.is_body() {
++        "body failure"
++    } else if error.is_decode() {
++        "decode failure"
++    } else {
++        "transport failure"
++    }
++}
++
+ #[derive(Clone)]
+ pub struct TelegramBotClient {
+     token: String,
+@@ -51,14 +69,19 @@ impl TelegramBotClient {
+                         Ok(json_res)
+                     }
+                     Err(e) => {
+-                        let err_msg = format!("Failed to parse response JSON for {method}: {e}");
++                        let err_msg = format!(
++                            "Failed to parse response JSON for {method}: {}",
++                            reqwest_error_kind(&e)
++                        );
+                         error!("{err_msg}");
+                         Err(err_msg)
+                     }
+                 }
+             }
+             Err(e) => {
+-                let err_msg = format!("HTTP error for {method}: {e}");
++                // Do not format reqwest::Error directly here: it can contain the full
++                // Telegram URL, and Telegram URLs contain the bot token.
++                let err_msg = format!("HTTP error for {method}: {}", reqwest_error_kind(&e));
+                 error!("{err_msg}");
+                 Err(err_msg)
+             }
+@@ -85,6 +108,17 @@ impl TelegramBotClient {
+             return None;
+         }
+         let info = file_res.result?;
++        if info
++            .file_size
++            .and_then(|size| usize::try_from(size).ok())
++            .map_or(false, |size| size > MAX_TELEGRAM_DOWNLOAD_BYTES)
++        {
++            warn!(
++                "Telegram file rejected before download: size exceeds Xiao limit of {} bytes",
++                MAX_TELEGRAM_DOWNLOAD_BYTES
++            );
++            return None;
++        }
+         let file_path = info.file_path?;
+         let file_url = format!("https://api.telegram.org/file/bot{}/{}", self.token, file_path);
+ 
+@@ -100,9 +134,21 @@ impl TelegramBotClient {
+                 let mut bytes_buf = Vec::new();
+                 while let Some(chunk_res) = stream.next().await {
+                     match chunk_res {
+-                        Ok(chunk) => bytes_buf.extend_from_slice(&chunk),
++                        Ok(chunk) => {
++                            if bytes_buf.len().saturating_add(chunk.len()) > MAX_TELEGRAM_DOWNLOAD_BYTES {
++                                warn!(
++                                    "Telegram file download aborted: streamed body exceeded Xiao limit of {} bytes",
++                                    MAX_TELEGRAM_DOWNLOAD_BYTES
++                                );
++                                return None;
++                            }
++                            bytes_buf.extend_from_slice(&chunk)
++                        }
+                         Err(e) => {
+-                            error!("Streaming error while downloading from {file_url}: {e}");
++                            error!(
++                                "Telegram file streaming error: {}",
++                                reqwest_error_kind(&e)
++                            );
+                             return None;
+                         }
+                     }
+@@ -110,11 +156,11 @@ impl TelegramBotClient {
+                 Some((bytes_buf, file_path))
+             }
+             Ok(resp) => {
+-                error!("Download failed with status {}: {}", resp.status(), file_url);
++                error!("Telegram file download failed with status {}", resp.status());
+                 None
+             }
+             Err(e) => {
+-                error!("HTTP download error for {file_url}: {e}");
++                error!("Telegram file download error: {}", reqwest_error_kind(&e));
+                 None
+             }
+         }
+@@ -172,7 +218,14 @@ impl TelegramBotClient {
+                     }
+                 }
+                 if let Some(recv) = receiver_user_id {
+-                    payload["receiver_user_id"] = json!(recv);
++                    payload["ephemeral_message_parameters"] = serde_json::to_value(
++                        EphemeralMessageParameters {
++                            receiver_user_id: recv,
++                            callback_query_id: None,
++                            replace_callback_query_message: None,
++                        },
++                    )
++                    .unwrap_or(json!({}));
+                 }
+                 if is_first {
+                     if let Some(rep) = reply_to_message_id {
+@@ -195,7 +248,14 @@ impl TelegramBotClient {
+             payload["reply_markup"] = rm;
+         }
+         if let Some(recv) = receiver_user_id {
+-            payload["receiver_user_id"] = json!(recv);
++            payload["ephemeral_message_parameters"] = serde_json::to_value(
++                EphemeralMessageParameters {
++                    receiver_user_id: recv,
++                    callback_query_id: None,
++                    replace_callback_query_message: None,
++                },
++            )
++            .unwrap_or(json!({}));
+         }
+         if let Some(rep) = reply_to_message_id {
+             payload["reply_to_message_id"] = json!(rep);
+@@ -237,8 +297,14 @@ impl TelegramBotClient {
+         }
+ 
+         match self.client.post(&url).multipart(form).send().await {
+-            Ok(resp) => resp.json::<Value>().await.map_err(|e| e.to_string()),
+-            Err(e) => Err(format!("sendPhoto multipart error: {e}")),
++            Ok(resp) => resp
++                .json::<Value>()
++                .await
++                .map_err(|e| format!("sendPhoto response decode error: {}", reqwest_error_kind(&e))),
++            Err(e) => Err(format!(
++                "sendPhoto multipart error: {}",
++                reqwest_error_kind(&e)
++            )),
+         }
+     }
+ 
+@@ -342,7 +408,7 @@ impl TelegramBotClient {
+     }
+ 
+     // ==========================================
+-    // Telegram Bot API 10.2: Rich Message & Draft Methods
++    // Telegram Bot API 10.3: Rich Message & Draft Methods
+     // ==========================================
+ 
+     pub async fn send_rich_message_draft(
+@@ -372,8 +438,8 @@ impl TelegramBotClient {
+             // Fallback to sendMessageDraft
+             let mut fallback_text = "Thinking...".to_string();
+             if let Some(first_b) = rich_message.blocks.first() {
+-                if let RichBlock::Thinking { ref text, .. } = first_b {
+-                    fallback_text = text.clone();
++                if let RichBlock::Thinking { text } = first_b {
++                    fallback_text = text.as_str().unwrap_or("Thinking...").to_string();
+                 }
+             }
+             return self
+@@ -422,7 +488,14 @@ impl TelegramBotClient {
+             payload["reply_markup"] = rm.clone();
+         }
+         if let Some(recv) = receiver_user_id {
+-            payload["receiver_user_id"] = json!(recv);
++            payload["ephemeral_message_parameters"] = serde_json::to_value(
++                EphemeralMessageParameters {
++                    receiver_user_id: recv,
++                    callback_query_id: None,
++                    replace_callback_query_message: None,
++                },
++            )
++            .unwrap_or(json!({}));
+         }
+ 
+         let res = self.post_json("sendRichMessage", payload).await?;
+@@ -579,7 +652,8 @@ impl TelegramBotClient {
+             RichBlock::Preformatted { text, language } => {
+                 let lang_attr = language
+                     .as_ref()
+-                    .map(|l| format!(" class=\"language-{l}\""))
++                    .map(|language| html_escape::encode_double_quoted_attribute(language))
++                    .map(|language| format!(" class=\"language-{language}\""))
+                     .unwrap_or_default();
+                 let esc = html_escape::encode_text(text);
+                 format!("<pre{lang_attr}>{esc}</pre>\n")
+@@ -609,6 +683,16 @@ impl TelegramBotClient {
+                 }
+                 format!("<blockquote>{q_text}</blockquote>\n")
+             }
++            RichBlock::ExpandableBlockQuotation { text, credit } => {
++                let q_text = self.rich_value_to_html(text);
++                let credit_html = credit
++                    .as_ref()
++                    .map(|value| self.rich_value_to_html(value))
++                    .filter(|value| !value.is_empty())
++                    .map(|value| format!("<cite>{value}</cite>"))
++                    .unwrap_or_default();
++                format!("<blockquote expandable>{q_text}{credit_html}</blockquote>\n")
++            }
+             RichBlock::Divider {} => "────────────────────────\n".to_string(),
+             RichBlock::MathematicalExpression { expression } => {
+                 let esc = html_escape::encode_text(expression);
+@@ -622,13 +706,29 @@ impl TelegramBotClient {
+                     String::new()
+                 }
+             }
+-            RichBlock::Details { title, content, .. } => {
+-                let t_esc = html_escape::encode_text(title);
+-                let c_esc = html_escape::encode_text(content);
+-                format!("<blockquote expandable><b>{t_esc}</b>\n{c_esc}</blockquote>\n")
++            RichBlock::Buttons { buttons, .. } => buttons
++                .iter()
++                .map(|button| format!("[{}]", self.rich_value_to_html(&button.text)))
++                .collect::<Vec<_>>()
++                .join(" "),
++            RichBlock::Document { document, .. } => {
++                let label = document
++                    .get("media")
++                    .and_then(Value::as_str)
++                    .unwrap_or("document");
++                format!("📄 <code>{}</code>\n", html_escape::encode_text(label))
++            }
++            RichBlock::Details { summary, blocks, .. } => {
++                let summary_html = self.rich_value_to_html(summary);
++                let body_html = blocks
++                    .iter()
++                    .map(|block| self.rich_value_to_html(block))
++                    .collect::<Vec<_>>()
++                    .join("\n");
++                format!("<blockquote expandable><b>{summary_html}</b>\n{body_html}</blockquote>\n")
+             }
+-            RichBlock::Thinking { text, .. } => {
+-                let t_esc = html_escape::encode_text(text);
++            RichBlock::Thinking { text } => {
++                let t_esc = self.rich_value_to_html(text);
+                 format!("<blockquote expandable>💭 <b>Thinking:</b>\n{t_esc}</blockquote>\n")
+             }
+             RichBlock::Anchor { .. } => String::new(),
+@@ -637,7 +737,7 @@ impl TelegramBotClient {
+ 
+     fn rich_value_to_html(&self, v: &Value) -> String {
+         match v {
+-            Value::String(s) => s.clone(),
++            Value::String(s) => html_escape::encode_text(s).into_owned(),
+             Value::Array(arr) => arr.iter().map(|item| self.rich_value_to_html(item)).collect(),
+             Value::Object(obj) => {
+                 let t = obj.get("type").and_then(|s| s.as_str()).unwrap_or("");
+@@ -651,7 +751,8 @@ impl TelegramBotClient {
+                     "code" => format!("<code>{inner}</code>"),
+                     "url" => {
+                         let url = obj.get("url").and_then(|s| s.as_str()).unwrap_or("#");
+-                        format!("<a href=\"{url}\">{inner}</a>")
++                        let safe_url = html_escape::encode_double_quoted_attribute(url);
++                        format!("<a href=\"{safe_url}\">{inner}</a>")
+                     }
+                     "strike" => format!("<s>{inner}</s>"),
+                     "underline" => format!("<u>{inner}</u>"),
+diff --git a/src/bot/models.rs b/src/bot/models.rs
+index 89bbfd6..9de6636 100644
+--- a/src/bot/models.rs
++++ b/src/bot/models.rs
+@@ -11,29 +11,58 @@ use serde_json::Value;
+ pub struct InlineKeyboardButton {
+     pub text: String,
+     #[serde(skip_serializing_if = "Option::is_none")]
++    pub style: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
+     pub callback_data: Option<String>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub url: Option<String>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub web_app: Option<Value>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub disabled: Option<Value>,
+ }
+ 
+ impl InlineKeyboardButton {
+     pub fn callback(text: impl Into<String>, callback_data: impl Into<String>) -> Self {
+         Self {
+             text: text.into(),
++            style: None,
+             callback_data: Some(callback_data.into()),
+             url: None,
+             web_app: None,
++            disabled: None,
+         }
+     }
+ 
++    pub fn callback_styled(
++        text: impl Into<String>,
++        callback_data: impl Into<String>,
++        style: impl Into<String>,
++    ) -> Self {
++        let mut button = Self::callback(text, callback_data);
++        button.style = Some(style.into());
++        button
++    }
++
+     pub fn url_btn(text: impl Into<String>, url: impl Into<String>) -> Self {
+         Self {
+             text: text.into(),
++            style: None,
+             callback_data: None,
+             url: Some(url.into()),
+             web_app: None,
++            disabled: None,
++        }
++    }
++
++    pub fn disabled(text: impl Into<String>) -> Self {
++        Self {
++            text: text.into(),
++            style: None,
++            callback_data: None,
++            url: None,
++            web_app: None,
++            disabled: Some(serde_json::json!({})),
+         }
+     }
+ }
+@@ -41,14 +70,22 @@ impl InlineKeyboardButton {
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub struct InlineKeyboardMarkup {
+     pub inline_keyboard: Vec<Vec<InlineKeyboardButton>>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub force_reply: Option<bool>,
+ }
+ 
+ impl InlineKeyboardMarkup {
+     pub fn new(rows: Vec<Vec<InlineKeyboardButton>>) -> Self {
+         Self {
+             inline_keyboard: rows,
++            force_reply: None,
+         }
+     }
++
++    pub fn with_force_reply(mut self, force_reply: bool) -> Self {
++        self.force_reply = Some(force_reply);
++        self
++    }
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+@@ -86,6 +123,8 @@ pub struct ReplyKeyboardMarkup {
+     pub input_field_placeholder: Option<String>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub selective: Option<bool>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub force_reply: Option<bool>,
+ }
+ 
+ impl ReplyKeyboardMarkup {
+@@ -111,6 +150,7 @@ impl ReplyKeyboardMarkup {
+             one_time_keyboard: Some(false),
+             input_field_placeholder: placeholder.map(|s| s.to_string()),
+             selective: None,
++            force_reply: None,
+         }
+     }
+ }
+@@ -149,9 +189,69 @@ impl BotCommand {
+ }
+ 
+ // ==========================================
+-// Telegram Bot API 10.2: Rich Message Blocks
++// Telegram Bot API 10.3: Rich Message Blocks
+ // ==========================================
+ 
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct RichMessageButton {
++    pub text: Value,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub style: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub url: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub callback_data: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub web_app: Option<Value>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub disabled: Option<Value>,
++}
++
++impl RichMessageButton {
++    pub fn callback(text: impl Into<String>, callback_data: impl Into<String>) -> Self {
++        Self {
++            text: Value::String(text.into()),
++            style: None,
++            url: None,
++            callback_data: Some(callback_data.into()),
++            web_app: None,
++            disabled: None,
++        }
++    }
++
++    pub fn callback_styled(
++        text: impl Into<String>,
++        callback_data: impl Into<String>,
++        style: impl Into<String>,
++    ) -> Self {
++        let mut button = Self::callback(text, callback_data);
++        button.style = Some(style.into());
++        button
++    }
++
++    pub fn url(text: impl Into<String>, url: impl Into<String>) -> Self {
++        Self {
++            text: Value::String(text.into()),
++            style: None,
++            url: Some(url.into()),
++            callback_data: None,
++            web_app: None,
++            disabled: None,
++        }
++    }
++
++    pub fn disabled(text: impl Into<String>) -> Self {
++        Self {
++            text: Value::String(text.into()),
++            style: None,
++            url: None,
++            callback_data: None,
++            web_app: None,
++            disabled: Some(serde_json::json!({})),
++        }
++    }
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub struct RichBlockTableCell {
+     pub text: Value,
+@@ -213,6 +313,13 @@ pub enum RichBlock {
+         blocks: Vec<Value>, // [{"type": "paragraph", "text": ...}]
+     },
+ 
++    #[serde(rename = "expandable_blockquote")]
++    ExpandableBlockQuotation {
++        text: Value,
++        #[serde(skip_serializing_if = "Option::is_none")]
++        credit: Option<Value>,
++    },
++
+     #[serde(rename = "divider")]
+     Divider {},
+ 
+@@ -231,22 +338,33 @@ pub enum RichBlock {
+         caption: Option<String>,
+     },
+ 
++    #[serde(rename = "buttons")]
++    Buttons {
++        buttons: Vec<RichMessageButton>,
++        #[serde(skip_serializing_if = "Option::is_none")]
++        align: Option<String>,
++    },
++
++    #[serde(rename = "document")]
++    Document {
++        document: Value,
++        #[serde(skip_serializing_if = "Option::is_none")]
++        caption: Option<Value>,
++    },
++
+     #[serde(rename = "details")]
+     Details {
+-        title: String,
+-        content: String,
+-        is_open: bool,
++        summary: Value,
++        blocks: Vec<Value>,
++        #[serde(skip_serializing_if = "Option::is_none")]
++        is_open: Option<bool>,
+     },
+ 
+     #[serde(rename = "anchor")]
+     Anchor { name: String },
+ 
+     #[serde(rename = "thinking")]
+-    Thinking {
+-        text: String,
+-        collapsed: bool,
+-        expandable: bool,
+-    },
++    Thinking { text: Value },
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+@@ -282,6 +400,14 @@ pub struct Update {
+     pub update_id: i64,
+     pub message: Option<Message>,
+     pub callback_query: Option<CallbackQuery>,
++    pub stopped_message_generation: Option<MessageGenerationStopped>,
++}
++
++#[derive(Debug, Clone, Deserialize)]
++pub struct MessageGenerationStopped {
++    pub chat: Chat,
++    pub message_thread_id: Option<i64>,
++    pub draft_id: i64,
+ }
+ 
+ #[derive(Debug, Clone, Deserialize)]
+@@ -299,6 +425,16 @@ pub struct Message {
+     pub video: Option<Video>,
+     pub video_note: Option<VideoNote>,
+     pub reply_to_message: Option<Box<Message>>,
++    pub community_chat_joined: Option<Value>,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct EphemeralMessageParameters {
++    pub receiver_user_id: i64,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub callback_query_id: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub replace_callback_query_message: Option<bool>,
+ }
+ 
+ #[derive(Debug, Clone, Deserialize)]
+@@ -391,3 +527,69 @@ pub struct FileInfo {
+     pub file_size: Option<i64>,
+     pub file_path: Option<String>,
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn disabled_inline_button_serializes_as_empty_object() {
++        let value = serde_json::to_value(InlineKeyboardButton::disabled("Unavailable")).unwrap();
++        assert_eq!(value["disabled"], serde_json::json!({}));
++        assert!(value.get("callback_data").is_none());
++    }
++
++    #[test]
++    fn bot_api_10_3_stop_update_deserializes() {
++        let update: Update = serde_json::from_value(serde_json::json!({
++            "update_id": 42,
++            "stopped_message_generation": {
++                "chat": {"id": 7, "type": "private"},
++                "draft_id": 99
++            }
++        }))
++        .unwrap();
++        let stopped = update.stopped_message_generation.unwrap();
++        assert_eq!(stopped.chat.id, 7);
++        assert_eq!(stopped.draft_id, 99);
++    }
++
++    #[test]
++    fn rich_message_buttons_follow_10_3_shape() {
++        let block = RichBlock::Buttons {
++            buttons: vec![RichMessageButton::callback_styled("Retry", "retry", "primary")],
++            align: Some("center".to_string()),
++        };
++        let value = serde_json::to_value(block).unwrap();
++        assert_eq!(value["type"], "buttons");
++        assert_eq!(value["buttons"][0]["callback_data"], "retry");
++        assert_eq!(value["buttons"][0]["style"], "primary");
++    }
++
++    #[test]
++    fn expandable_quote_follows_10_3_shape() {
++        let block = RichBlock::ExpandableBlockQuotation {
++            text: Value::String("detail".to_string()),
++            credit: Some(Value::String("source".to_string())),
++        };
++        let value = serde_json::to_value(block).unwrap();
++        assert_eq!(value["type"], "expandable_blockquote");
++        assert_eq!(value["text"], "detail");
++        assert_eq!(value["credit"], "source");
++        assert!(value.get("blocks").is_none());
++        assert!(value.get("is_open").is_none());
++    }
++
++    #[test]
++    fn details_block_uses_summary_and_blocks() {
++        let block = RichBlock::Details {
++            summary: Value::String("More".to_string()),
++            blocks: vec![serde_json::json!({"type": "paragraph", "text": "Body"})],
++            is_open: Some(true),
++        };
++        let value = serde_json::to_value(block).unwrap();
++        assert_eq!(value["summary"], "More");
++        assert!(value["blocks"].is_array());
++        assert_eq!(value["is_open"], true);
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index a77b3ea..c63a616 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -2,8 +2,9 @@ mod ai;
+ mod bot;
+ mod parser;
+ mod timeline;
++mod util;
+ 
+-use std::collections::HashMap;
++use std::collections::{HashMap, HashSet};
+ use std::env;
+ use std::io::{self, BufRead, Write};
+ use std::path::Path;
+@@ -19,13 +20,54 @@ use ai::AIChatService;
+ use bot::client::TelegramBotClient;
+ use bot::models::{
+     BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputRichMessage,
+-    ReplyKeyboardMarkup, RichBlock, RichBlockTableCell, Update,
++    ReplyKeyboardMarkup, RichBlock, RichBlockTableCell, RichMessageButton, Update,
+ };
+ use parser::build_full_rich_message;
+ use timeline::{ExecutionTimeline, ProgressActivity};
++use util::{escape_html, is_supported_text_document, truncate_chars, truncate_chars_with_ellipsis};
+ 
+ type UserLastImagePrompt = Arc<RwLock<HashMap<i64, String>>>;
+ 
++#[derive(Clone, Debug)]
++struct AccessPolicy {
++    owner_user_id: i64,
++    allowed_chat_ids: HashSet<i64>,
++}
++
++impl AccessPolicy {
++    fn allows(&self, user_id: i64, chat_id: i64) -> bool {
++        user_id == self.owner_user_id
++            && (chat_id == self.owner_user_id || self.allowed_chat_ids.contains(&chat_id))
++    }
++
++    fn allows_stop_chat(&self, chat_id: i64) -> bool {
++        // MessageGenerationStopped does not identify who pressed Stop. To prevent
++        // another group participant from cancelling the owner's request, native
++        // Stop is accepted only in the owner's private chat.
++        chat_id == self.owner_user_id
++    }
++}
++
++fn get_configured_owner_id() -> Option<i64> {
++    load_environment();
++    env::var("OWNER_USER_ID")
++        .ok()
++        .or_else(|| ai::service::load_app_setting("OWNER_USER_ID"))
++        .and_then(|value| value.trim().parse::<i64>().ok())
++        .filter(|value| *value > 0)
++}
++
++fn get_allowed_chat_ids() -> HashSet<i64> {
++    load_environment();
++    env::var("ALLOWED_CHAT_IDS")
++        .ok()
++        .or_else(|| ai::service::load_app_setting("ALLOWED_CHAT_IDS"))
++        .unwrap_or_default()
++        .split(',')
++        .filter_map(|value| value.trim().parse::<i64>().ok())
++        .collect()
++}
++
+ fn get_config_path() -> std::path::PathBuf {
+     // 1. Current working directory .env
+     if Path::new(".env").exists() {
+@@ -481,11 +523,29 @@ async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Option<String>
+         }
+     };
+ 
+-    println!("\n\x1b[1;36m== [3/3] Quickstart Setup Complete! ==\x1b[0m");
++    println!("\n\x1b[1;37m[3/3] Configure Telegram Owner\x1b[0m");
++    println!("\x1b[38;5;244mMasukkan numeric Telegram user ID Anda. Hanya owner ini yang boleh menggunakan Xiao.\x1b[0m");
++    let owner_user_id = loop {
++        print!("\x1b[1;37mOwner User ID:\x1b[0m ");
++        let _ = io::stdout().flush();
++        let mut input = String::new();
++        if reader.read_line(&mut input).is_err() {
++            println!("\n\x1b[38;5;244mSetup cancelled.\x1b[0m");
++            return None;
++        }
++        match input.trim().parse::<i64>() {
++            Ok(value) if value > 0 => break value,
++            _ => println!("\x1b[1;31m[ERROR] Owner User ID harus berupa angka positif.\x1b[0m"),
++        }
++    };
++    let _ = save_env_kv("OWNER_USER_ID", &owner_user_id.to_string());
++
++    println!("\n\x1b[1;36m== Quickstart Setup Complete! ==\x1b[0m");
+     println!("  \x1b[1;37mBot:\x1b[0m          \x1b[1;32m@{}\x1b[0m", bot_username);
+     println!("  \x1b[1;37mProvider:\x1b[0m     {}", clean_alias);
+     println!("  \x1b[1;37mActive Model:\x1b[0m \x1b[1;36m{}\x1b[0m", active_model);
+     println!("  \x1b[1;37mEndpoint:\x1b[0m     {}", endpoint);
++    println!("  \x1b[1;37mOwner ID:\x1b[0m     {}", owner_user_id);
+     println!("\n\x1b[1;32m🎉 Everything is set up! Run 'xiao start' to launch the bot.\x1b[0m\n");
+ 
+     Some(final_token)
+@@ -605,7 +665,7 @@ async fn run_cli_provider_add(ai_service: &AIChatService) {
+ 
+     println!("\n\x1b[1;32m[SUCCESS] Provider '{}' added and activated!\x1b[0m", clean_alias);
+     println!("  \x1b[1;36mActive Model:\x1b[0m \x1b[1;37m{active_model}\x1b[0m");
+-    println!("  \x1b[38;5;244mConfiguration saved to ~/.xiao_providers.json and .env\x1b[0m\n");
++    println!("  \x1b[38;5;244mConfiguration saved to SQLite (runtime source of truth)\x1b[0m\n");
+ }
+ 
+ async fn run_cli_provider_remove(_ai_service: &AIChatService) {
+@@ -1057,7 +1117,7 @@ async fn run_cli_telegram_check() {
+     load_environment();
+     println!("\n\x1b[1;36m== Telegram Bot Status Check ==\x1b[0m");
+ 
+-    let token = env::var("BOT_TOKEN").unwrap_or_default();
++    let token = get_configured_token().unwrap_or_default();
+     if token.is_empty() || token == "YOUR_TELEGRAM_BOT_TOKEN_HERE" {
+         println!("  \x1b[1;31m[FAIL]\x1b[0m BOT_TOKEN is not configured.");
+         println!("  \x1b[38;5;244mRun 'xiao telegram bind' or 'xiao setup' to bind a token.\x1b[0m\n");
+@@ -1075,6 +1135,11 @@ async fn run_cli_telegram_check() {
+             println!("  \x1b[1;37mUsername:\x1b[0m \x1b[1;36m@{}\x1b[0m", uname);
+             println!("  \x1b[1;37mBot ID:\x1b[0m   {}", info.id);
+             println!("  \x1b[1;37mBot Link:\x1b[0m https://t.me/{}", uname);
++            if let Some(owner) = get_configured_owner_id() {
++                println!("  \x1b[1;37mOwner ID:\x1b[0m  {}", owner);
++            } else {
++                println!("  \x1b[1;31m[FAIL] OWNER_USER_ID belum dikonfigurasi.\x1b[0m");
++            }
+         }
+         Ok(resp) => {
+             println!("  \x1b[1;31m[FAIL]\x1b[0m Token is invalid ({:?})", resp.description);
+@@ -1232,6 +1297,29 @@ async fn run_cli_telegram_pick(ai_service: &AIChatService) {
+     }
+ }
+ 
++async fn run_cli_telegram_owner(owner_arg: Option<&str>) {
++    let owner = if let Some(value) = owner_arg {
++        value.trim().parse::<i64>().ok()
++    } else {
++        print!("\x1b[1;37mTelegram Owner User ID:\x1b[0m ");
++        let _ = io::stdout().flush();
++        let mut input = String::new();
++        if io::stdin().read_line(&mut input).is_err() {
++            None
++        } else {
++            input.trim().parse::<i64>().ok()
++        }
++    };
++
++    match owner.filter(|value| *value > 0) {
++        Some(owner_id) => match save_env_kv("OWNER_USER_ID", &owner_id.to_string()) {
++            Ok(()) => println!("\n\x1b[1;32m[OK] Telegram owner diset ke user ID {owner_id}.\x1b[0m\n"),
++            Err(error) => println!("\n\x1b[1;31m[ERROR] Gagal menyimpan owner: {error}\x1b[0m\n"),
++        },
++        None => println!("\n\x1b[1;31m[ERROR] Owner User ID harus berupa angka positif.\x1b[0m\n"),
++    }
++}
++
+ async fn run_cli_telegram_menu(action: Option<&str>, arg: Option<&str>) {
+     load_environment();
+     match action {
+@@ -1244,6 +1332,9 @@ async fn run_cli_telegram_menu(action: Option<&str>, arg: Option<&str>) {
+         Some("change") | Some("update") => {
+             run_cli_telegram_change().await;
+         }
++        Some("owner") => {
++            run_cli_telegram_owner(arg).await;
++        }
+         _ => {
+             run_cli_telegram_check().await;
+         }
+@@ -1256,7 +1347,7 @@ fn print_cli_help() {
+     println!("  \x1b[36mstart\x1b[0m                               Run Telegram bot");
+     println!("  \x1b[36msetup\x1b[0m                               Quickstart setup wizard");
+     println!("  \x1b[36mprovider [add] [del] [status]\x1b[0m       Manage AI providers");
+-    println!("  \x1b[36mtelegram [check] [bind] [change]\x1b[0m    Manage Telegram bot token");
++    println!("  \x1b[36mtelegram [check|bind|change|owner]\x1b[0m  Manage Telegram bot and owner");
+     println!("  \x1b[36mmodel [name] [pick]\x1b[0m                 Select, search, or whitelist models");
+     println!("  \x1b[36mstatus\x1b[0m                              System health check");
+     println!("  \x1b[36mhelp\x1b[0m                                Show this help\n");
+@@ -1283,11 +1374,12 @@ fn get_collapsed_menu_keyboard() -> Value {
+ }
+ 
+ fn build_session_manager_inline_keyboard(
+-    sessions_len: usize,
++    sessions: &[ai::service::ChatSession],
+     active_idx: usize,
+     page: usize,
+     page_size: usize,
+ ) -> InlineKeyboardMarkup {
++    let sessions_len = sessions.len();
+     let total_pages = 1.max((sessions_len + page_size - 1) / page_size);
+     let curr_page = 1.max(page.min(total_pages));
+ 
+@@ -1301,7 +1393,12 @@ fn build_session_manager_inline_keyboard(
+         } else {
+             format!("{}", i + 1)
+         };
+-        row_numbers.push(InlineKeyboardButton::callback(label, format!("session_select:{}", i)));
++        if let Some(session) = sessions.get(i) {
++            row_numbers.push(InlineKeyboardButton::callback(
++                label,
++                format!("session_select_id:{}", session.id),
++            ));
++        }
+     }
+ 
+     let mut rows = Vec::new();
+@@ -1315,23 +1412,33 @@ fn build_session_manager_inline_keyboard(
+         let previous_button = if curr_page > 1 {
+             InlineKeyboardButton::callback("‹", format!("session_page:{previous_page}"))
+         } else {
+-            InlineKeyboardButton::callback("‹", "noop")
++            InlineKeyboardButton::disabled("‹")
+         };
+         let next_button = if curr_page < total_pages {
+             InlineKeyboardButton::callback("›", format!("session_page:{next_page}"))
+         } else {
+-            InlineKeyboardButton::callback("›", "noop")
++            InlineKeyboardButton::disabled("›")
+         };
+         rows.push(vec![
+             previous_button,
+-            InlineKeyboardButton::callback(format!("{curr_page}/{total_pages}"), "noop"),
++            InlineKeyboardButton::disabled(format!("{curr_page}/{total_pages}")),
+             next_button,
+         ]);
+     }
+ 
++    let active_session_id = sessions
++        .get(active_idx)
++        .map(|session| session.id)
++        .unwrap_or_default();
+     rows.push(vec![
+-        InlineKeyboardButton::callback("ᴅᴇʟᴇᴛᴇ", format!("session_remove:{}", active_idx)),
+-        InlineKeyboardButton::callback("ʀᴇɴᴀᴍᴇ", format!("session_rename:{}", active_idx)),
++        InlineKeyboardButton::callback(
++            "ᴅᴇʟᴇᴛᴇ",
++            format!("session_remove_id:{active_session_id}"),
++        ),
++        InlineKeyboardButton::callback(
++            "ʀᴇɴᴀᴍᴇ",
++            format!("session_rename_id:{active_session_id}"),
++        ),
+         InlineKeyboardButton::callback("ɴᴇᴡ", "session_new"),
+     ]);
+     rows.push(vec![InlineKeyboardButton::callback("ᴄʟᴏꜱᴇ", "session_close")]);
+@@ -1380,6 +1487,8 @@ async fn build_provider_model_picker(
+     let is_search = search_query.map(|s| !s.trim().is_empty()).unwrap_or(false);
+     let clean_query = search_query.unwrap_or("").trim();
+     let q_low = clean_query.to_lowercase();
++    let safe_query = escape_html(clean_query);
++    let safe_active_model = escape_html(&current_active_model);
+ 
+     // If setup mode and a specific provider is specified, only show that provider's models
+     let target_providers: Vec<&ProviderConfig> = if is_setup && provider_id != "all" && !provider_id.is_empty() {
+@@ -1422,26 +1531,27 @@ async fn build_provider_model_picker(
+ 
+     let text = if is_setup {
+         let prov_name = providers.iter().find(|p| p.id == provider_id).map(|p| p.name.as_str()).unwrap_or("Provider");
++        let safe_prov_name = escape_html(prov_name);
+         format!(
+             "✨ <b>Endpoint Terhubung! ({})</b>\n\n\
+              📋 Ditemukan <b>{} model AI</b> pada endpoint ini.\n\
+              Silakan <b>klik 1x pada model pilihan Anda</b> di bawah untuk langsung mengaktifkannya dan menyelesaikan setup:",
+-            prov_name, total_models
++            safe_prov_name, total_models
+         )
+     } else if is_search {
+         if total_models == 0 {
+             format!(
+-                "🔍 <b>Pencarian Model AI:</b> \"<code>{clean_query}</code>\"\n\n\
++                "🔍 <b>Pencarian Model AI:</b> \"<code>{safe_query}</code>\"\n\n\
+                  ⚠️ <i>Tidak ada model yang cocok dengan kata kunci tersebut di semua provider.</i>\n\
+                  Silakan cari kata kunci lain atau sentuh tombol di bawah:"
+             )
+         } else {
+             format!(
+-                "🔍 <b>Hasil Pencarian Model untuk:</b> \"<code>{clean_query}</code>\"\n\
++                "🔍 <b>Hasil Pencarian Model untuk:</b> \"<code>{safe_query}</code>\"\n\
+                  Model aktif saat ini: <code>{}</code>\n\
+                  Ditemukan: <b>{} model</b> (Halaman {}/{})\n\n\
+                  Sentuh salah satu model di bawah untuk mengaktifkannya:",
+-                current_active_model, total_models, curr_page, total_pages
++                safe_active_model, total_models, curr_page, total_pages
+             )
+         }
+     } else {
+@@ -1450,16 +1560,17 @@ async fn build_provider_model_picker(
+                 "<b>Model</b> (Total <b>{} model</b> dari <b>{} provider</b>)\n\
+                  Model aktif saat ini: <code>{}</code> (Halaman {}/{})\n\n\
+                  Sentuh salah satu model di bawah untuk langsung mengaktifkannya dalam 1x klik:",
+-                total_models, providers.len(), current_active_model, curr_page, total_pages
++                total_models, providers.len(), safe_active_model, curr_page, total_pages
+             )
+         } else {
+             let prov_name = providers.first().map(|p| p.name.as_str()).unwrap_or("Provider");
++            let safe_prov_name = escape_html(prov_name);
+             format!(
+                 "<b>Model untuk '{}'</b>\n\
+                  Model aktif saat ini: <code>{}</code>\n\
+                  Total Model Tersedia: <b>{}</b> (Halaman {}/{})\n\n\
+                  Sentuh salah satu model di bawah untuk langsung mengaktifkannya dalam 1x klik:",
+-                prov_name, current_active_model, total_models, curr_page, total_pages
++                safe_prov_name, safe_active_model, total_models, curr_page, total_pages
+             )
+         }
+     };
+@@ -1483,7 +1594,7 @@ async fn build_provider_model_picker(
+         };
+ 
+         if btn_txt.len() > 30 {
+-            btn_txt = format!("{}...", &btn_txt[..27]);
++            btn_txt = truncate_chars_with_ellipsis(&btn_txt, 27);
+         }
+         current_row.push(InlineKeyboardButton::callback(btn_txt, format!("set_m:{p_id}:{orig_global_idx}")));
+         if current_row.len() == 2 {
+@@ -1502,7 +1613,7 @@ async fn build_provider_model_picker(
+         if curr_page > 1 {
+             nav_row.push(InlineKeyboardButton::callback("Prev", format!("provider_models:{target_nav_id}:{}", curr_page - 1)));
+         }
+-        nav_row.push(InlineKeyboardButton::callback(format!("Hal {curr_page}/{total_pages}"), "noop"));
++        nav_row.push(InlineKeyboardButton::disabled(format!("Hal {curr_page}/{total_pages}")));
+         if curr_page < total_pages {
+             nav_row.push(InlineKeyboardButton::callback("Next", format!("provider_models:{target_nav_id}:{}", curr_page + 1)));
+         }
+@@ -1634,7 +1745,7 @@ async fn send_or_update_session_manager(
+     let active_idx = ai_service.get_active_session_index(user_id).await;
+ 
+     let rich_msg = build_session_manager_ui(ai_service, user_id, page, 5).await;
+-    let inline_kb = build_session_manager_inline_keyboard(sessions.len(), active_idx, page, 5);
++    let inline_kb = build_session_manager_inline_keyboard(&sessions, active_idx, page, 5);
+     let kb_val = serde_json::to_value(inline_kb).ok();
+ 
+     if let Some(mid) = message_id {
+@@ -1734,7 +1845,7 @@ async fn build_context_monitor_ui(
+ 
+     let progress_text = if stats.total_messages > 0 {
+         format!(
+-            "[{}] {:.2}% | {}/{} Tokens | {} Pesan",
++            "[{}] ~{:.2}% | ~{}/~{} Tokens | {} Pesan",
+             stats.progress_bar,
+             stats.usage_pct,
+             used_str,
+@@ -1743,7 +1854,7 @@ async fn build_context_monitor_ui(
+         )
+     } else {
+         format!(
+-            "[{}] {:.2}% | {}/{} Tokens",
++            "[{}] ~{:.2}% | ~{}/~{} Tokens",
+             stats.progress_bar,
+             stats.usage_pct,
+             used_str,
+@@ -1768,6 +1879,13 @@ async fn build_context_monitor_ui(
+             text: progress_text,
+             language: None,
+         },
++        RichBlock::Buttons {
++            buttons: vec![
++                RichMessageButton::callback_styled("Refresh", "context_refresh", "primary"),
++                RichMessageButton::callback("Close", "context_close"),
++            ],
++            align: Some("center".to_string()),
++        },
+     ])
+ }
+ 
+@@ -1890,7 +2008,7 @@ async fn handle_image_generation(
+         }
+ 
+         if !last_context.is_empty() {
+-            clean_prompt = format!("illustration of {}", &last_context[..last_context.len().min(250)]);
++            clean_prompt = format!("illustration of {}", truncate_chars(&last_context, 250));
+         } else {
+             let last_guard = user_last_image_prompt.read().await;
+             clean_prompt = last_guard
+@@ -1928,7 +2046,14 @@ async fn handle_image_generation(
+     user_last_image_prompt.write().await.insert(user_id, clean_prompt.clone());
+ 
+     let draft_id: i64 = rand::thread_rng().gen_range(100000..999999);
+-    let timeline = Arc::new(ExecutionTimeline::new(bot.clone(), chat_id, draft_id, 10));
++    let timeline = Arc::new(ExecutionTimeline::new(
++        bot.clone(),
++        chat_id,
++        draft_id,
++        10,
++        chat_id == user_id,
++        false,
++    ));
+     timeline.add_action("Generating Image", Some(ProgressActivity::Drawing)).await;
+     timeline.sync_draft(true).await;
+     timeline.start_ticker();
+@@ -1941,9 +2066,10 @@ async fn handle_image_generation(
+         timeline.fail_current(engine_info.clone()).await;
+         timeline.sync_draft(true).await;
+ 
++        let safe_engine_info = escape_html(&engine_info);
+         let err_text = format!(
+             "❌ <b>Gagal Membuat Gambar</b>\n\n\
+-             <b>Penyebab:</b> {engine_info}\n\n\
++             <b>Penyebab:</b> {safe_engine_info}\n\n\
+              Silakan coba lagi atau gunakan kata kunci/prompt yang berbeda."
+         );
+         let retry_kb = InlineKeyboardMarkup::new(vec![
+@@ -1954,10 +2080,12 @@ async fn handle_image_generation(
+         return;
+     }
+ 
++    let safe_prompt = escape_html(&clean_prompt);
++    let safe_engine_info = escape_html(&engine_info);
+     let caption_text = format!(
+         "🫟 <b>Gambar Berhasil Dibuat!</b>\n\n\
+-         📝 <b>Prompt:</b> <i>\"{clean_prompt}\"</i>\n\
+-         ⚡ <b>Engine:</b> <code>{engine_info}</code>"
++         📝 <b>Prompt:</b> <i>\"{safe_prompt}\"</i>\n\
++         ⚡ <b>Engine:</b> <code>{safe_engine_info}</code>"
+     );
+ 
+     let img_kb = InlineKeyboardMarkup::new(vec![
+@@ -2000,8 +2128,19 @@ async fn handle_ai_chat(
+     video_mime: Option<&str>,
+     video_duration: Option<i32>,
+ ) {
++    let generation_lock = ai_service.generation_lock(user_id).await;
++    let _generation_guard = generation_lock.lock().await;
++
+     let draft_id: i64 = rand::thread_rng().gen_range(100000..999999);
+-    let timeline = Arc::new(ExecutionTimeline::new(bot.clone(), chat_id, draft_id, 30));
++    let mut cancel_rx = ai_service.begin_generation(chat_id, draft_id).await;
++    let timeline = Arc::new(ExecutionTimeline::new(
++        bot.clone(),
++        chat_id,
++        draft_id,
++        30,
++        chat_id == user_id,
++        chat_id == user_id,
++    ));
+ 
+     let (initial_lbl, initial_act) = if video_bytes.is_some() {
+         ("Watching", ProgressActivity::Watching)
+@@ -2022,7 +2161,7 @@ async fn handle_ai_chat(
+ 
+     let current_model = ai_service.get_user_model(user_id).await;
+ 
+-    let (_thinking, mut answer_text) = ai_service
++    let (_thinking, mut answer_text, _cancelled) = ai_service
+         .generate_response(
+             user_id,
+             user_prompt,
+@@ -2036,9 +2175,11 @@ async fn handle_ai_chat(
+             video_bytes,
+             video_mime,
+             video_duration,
++            &mut cancel_rx,
+         )
+         .await;
+ 
++    ai_service.end_generation(chat_id, draft_id).await;
+     timeline.stop_ticker();
+ 
+     if answer_text.trim().is_empty() {
+@@ -2052,7 +2193,7 @@ async fn handle_ai_chat(
+ 
+     if res.is_err() || !res.unwrap().get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+         let _ = bot
+-            .send_message(chat_id, &answer_text, Some("HTML"), Some(get_collapsed_menu_keyboard()), None, None)
++            .send_message(chat_id, &answer_text, None, Some(get_collapsed_menu_keyboard()), None, None)
+             .await;
+     }
+ }
+@@ -2065,11 +2206,21 @@ async fn handle_update(
+     bot: &TelegramBotClient,
+     ai_service: &AIChatService,
+     user_last_image_prompt: &UserLastImagePrompt,
++    access: &AccessPolicy,
+     update: Update,
+ ) {
++    if let Some(stopped) = update.stopped_message_generation.as_ref() {
++        if access.allows_stop_chat(stopped.chat.id) {
++            let _ = ai_service.cancel_generation(stopped.chat.id, stopped.draft_id).await;
++        }
++        return;
++    }
+     if let Some(msg) = update.message {
+         let chat_id = msg.chat.id;
+         let user_id = msg.from.as_ref().map(|u| u.id).unwrap_or(chat_id);
++        if !access.allows(user_id, chat_id) {
++            return;
++        }
+         let _user_name = msg.from.as_ref().map(|u| u.first_name.as_str()).unwrap_or("Pengguna");
+         let text = msg.text.as_deref().or(msg.caption.as_deref()).unwrap_or("").trim().to_string();
+ 
+@@ -2133,9 +2284,40 @@ async fn handle_update(
+                 } else if d_mime.starts_with("audio/") || [".ogg", ".mp3", ".wav", ".m4a"].iter().any(|ext| path.to_lowercase().ends_with(ext)) {
+                     audio_bytes = Some(data);
+                     audio_mime = Some(if d_mime.is_empty() { "audio/ogg".to_string() } else { d_mime });
++                } else if is_supported_text_document(&d_mime, &d_name) {
++                    const MAX_TEXT_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
++                    if data.len() > MAX_TEXT_DOCUMENT_BYTES {
++                        let _ = bot.send_message(
++                            chat_id,
++                            "⚠️ <b>Dokumen teks terlalu besar.</b> Batas input teks Xiao adalah 2 MiB per file.",
++                            Some("HTML"), None, None, None
++                        ).await;
++                        return;
++                    }
++                    match String::from_utf8(data) {
++                        Ok(text) => {
++                            doc_text = Some(text);
++                            doc_name = Some(d_name);
++                        }
++                        Err(_) => {
++                            let _ = bot.send_message(
++                                chat_id,
++                                "⚠️ <b>Encoding dokumen tidak didukung.</b> Kirim file teks UTF-8.",
++                                Some("HTML"), None, None, None
++                            ).await;
++                            return;
++                        }
++                    }
+                 } else {
+-                    doc_text = Some(String::from_utf8_lossy(&data).to_string());
+-                    doc_name = Some(d_name);
++                    let safe_name = escape_html(&d_name);
++                    let _ = bot.send_message(
++                        chat_id,
++                        &format!(
++                            "⚠️ <b>Format dokumen belum memiliki extractor.</b>\n\n<code>{safe_name}</code> tidak akan dipaksa dibaca sebagai teks biner. PDF/DOCX/XLSX memerlukan pipeline extractor/OCR terpisah; untuk sekarang kirim TXT/MD/JSON/kode atau halaman sebagai gambar."
++                        ),
++                        Some("HTML"), None, None, None
++                    ).await;
++                    return;
+                 }
+             }
+         }
+@@ -2167,16 +2349,18 @@ async fn handle_update(
+             let guard = ai_service.user_waiting_rename.read().await;
+             guard.get(&user_id).copied()
+         };
+-        if let Some(target_idx) = rename_opt {
++        if let Some(target_session_id) = rename_opt {
+             if !text.is_empty() && !text.starts_with('/') {
+                 ai_service.user_waiting_rename.write().await.remove(&user_id);
+                 let orig_msg_id = ai_service.user_rename_msg_id.write().await.remove(&user_id);
+-                ai_service.rename_session(user_id, target_idx, &text).await;
++                ai_service
++                    .rename_session_by_id(user_id, target_session_id, &text)
++                    .await;
+ 
+                 let _ = bot
+                     .send_message(
+                         chat_id,
+-                        &format!("✅ Session #{} berhasil diubah namanya menjadi: <b>{}</b>", target_idx + 1, text),
++                        &format!("✅ Session berhasil diubah namanya menjadi: <b>{}</b>", escape_html(&text)),
+                         Some("HTML"),
+                         Some(get_collapsed_menu_keyboard()),
+                         None,
+@@ -2338,7 +2522,12 @@ async fn handle_update(
+             send_or_update_session_manager(bot, ai_service, chat_id, user_id, None, target_page).await;
+         } else if ["✏️ Rename Session", "✏️ Ubah Nama Session", "Rename", "rename", "Rename Session"].contains(&text.as_str()) {
+             let active_idx = ai_service.get_active_session_index(user_id).await;
+-            ai_service.user_waiting_rename.write().await.insert(user_id, active_idx);
++            let active_session_id = ai_service.get_active_session_id(user_id).await;
++            ai_service
++                .user_waiting_rename
++                .write()
++                .await
++                .insert(user_id, active_session_id);
+             let _ = bot
+                 .send_message(
+                     chat_id,
+@@ -2391,7 +2580,7 @@ async fn handle_update(
+                 let _ = bot.send_message(chat_id, &msg_txt, Some("HTML"), serde_json::to_value(kb_m).ok(), None, None).await;
+             }
+         } else if text.starts_with("⚡ ") {
+-            let selected_model = text[2..].trim();
++            let selected_model = text.strip_prefix("⚡ ").unwrap_or(&text).trim();
+             let all_providers = ai_service.get_user_providers(user_id).await;
+             let mut found_prov = None;
+             for p in &all_providers {
+@@ -2408,7 +2597,11 @@ async fn handle_update(
+                 let _ = bot
+                     .send_message(
+                         chat_id,
+-                        &format!("✅ <b>Model AI diubah ke:</b> <code>{selected_model}</code> (<i>{}</i>)", prov.name),
++                        &format!(
++                            "✅ <b>Model AI diubah ke:</b> <code>{}</code> (<i>{}</i>)",
++                            escape_html(selected_model),
++                            escape_html(&prov.name)
++                        ),
+                         Some("HTML"),
+                         Some(get_main_menu_keyboard()),
+                         None,
+@@ -2500,6 +2693,9 @@ async fn handle_update(
+         let cq_data = cq.data.unwrap_or_default();
+         let user_id = cq.from.id;
+         let chat_id = cq.message.as_ref().map(|m| m.chat.id).unwrap_or(user_id);
++        if !access.allows(user_id, chat_id) {
++            return;
++        }
+         let msg_id = cq.message.as_ref().map(|m| m.message_id);
+ 
+         if cq_data == "noop" {
+@@ -2529,7 +2725,62 @@ async fn handle_update(
+             }
+         }
+ 
+-        if let Some(idx_str) = cq_data.strip_prefix("session_select:") {
++        if let Some(id_str) = cq_data.strip_prefix("session_select_id:") {
++            if let Ok(session_id) = id_str.parse::<usize>() {
++                if ai_service.switch_session_by_id(user_id, session_id).await {
++                    let active_idx = ai_service.get_active_session_index(user_id).await;
++                    let target_page = (active_idx / 5) + 1;
++                    let _ = bot
++                        .answer_callback_query(&cq_id, Some("Session aktif diperbarui ✅"), false)
++                        .await;
++                    send_or_update_session_manager(
++                        bot, ai_service, chat_id, user_id, msg_id, target_page,
++                    )
++                    .await;
++                }
++            }
++        } else if let Some(id_str) = cq_data.strip_prefix("session_remove_id:") {
++            if let Ok(session_id) = id_str.parse::<usize>() {
++                if ai_service.remove_session_by_id(user_id, session_id).await {
++                    let new_active = ai_service.get_active_session_index(user_id).await;
++                    let target_page = (new_active / 5) + 1;
++                    let _ = bot
++                        .answer_callback_query(&cq_id, Some("Session berhasil dihapus 🗑️"), false)
++                        .await;
++                    send_or_update_session_manager(
++                        bot, ai_service, chat_id, user_id, msg_id, target_page,
++                    )
++                    .await;
++                }
++            }
++        } else if let Some(id_str) = cq_data.strip_prefix("session_rename_id:") {
++            if let Ok(session_id) = id_str.parse::<usize>() {
++                let sessions = ai_service.get_sessions(user_id).await;
++                if sessions.iter().any(|session| session.id == session_id) {
++                    ai_service
++                        .user_waiting_rename
++                        .write()
++                        .await
++                        .insert(user_id, session_id);
++                    if let Some(mid) = msg_id {
++                        ai_service.user_rename_msg_id.write().await.insert(user_id, mid);
++                    }
++                    let _ = bot
++                        .answer_callback_query(&cq_id, Some("Silakan ketik nama baru"), false)
++                        .await;
++                    let _ = bot
++                        .send_message(
++                            chat_id,
++                            "✏️ <b>Ketikkan nama baru untuk session aktif:</b>",
++                            Some("HTML"),
++                            None,
++                            None,
++                            None,
++                        )
++                        .await;
++                }
++            }
++        } else if let Some(idx_str) = cq_data.strip_prefix("session_select:") {
+             if let Ok(idx) = idx_str.parse::<usize>() {
+                 ai_service.switch_session(user_id, idx).await;
+                 let target_page = (idx / 5) + 1;
+@@ -2560,10 +2811,11 @@ async fn handle_update(
+                         session.name.trim().to_string()
+                     };
+                     let detail = format!(
+-                        "<b>{name}</b>\n\nMessages: <b>{}</b>\nCreated: <code>{}</code>\nLast: <code>{}</code>",
++                        "<b>{}</b>\n\nMessages: <b>{}</b>\nCreated: <code>{}</code>\nLast: <code>{}</code>",
++                        escape_html(&name),
+                         session.messages.len() / 2,
+-                        session.created_at,
+-                        session_last_activity(session)
++                        escape_html(&session.created_at),
++                        escape_html(&session_last_activity(session))
+                     );
+                     let _ = bot.answer_callback_query(&cq_id, None, false).await;
+                     let _ = bot.send_message(chat_id, &detail, Some("HTML"), None, None, None).await;
+@@ -2571,7 +2823,15 @@ async fn handle_update(
+             }
+         } else if let Some(idx_str) = cq_data.strip_prefix("session_rename:") {
+             if let Ok(idx) = idx_str.parse::<usize>() {
+-                ai_service.user_waiting_rename.write().await.insert(user_id, idx);
++                let sessions = ai_service.get_sessions(user_id).await;
++                let Some(session_id) = sessions.get(idx).map(|session| session.id) else {
++                    return;
++                };
++                ai_service
++                    .user_waiting_rename
++                    .write()
++                    .await
++                    .insert(user_id, session_id);
+                 if let Some(mid) = msg_id {
+                     ai_service.user_rename_msg_id.write().await.insert(user_id, mid);
+                 }
+@@ -2630,12 +2890,15 @@ async fn handle_update(
+                     let target_prov = providers.iter().find(|p| p.id == prov_id);
+                     let prov_name = target_prov.map(|p| p.name.as_str()).unwrap_or("Custom Provider");
+                     let endpoint_url = target_prov.map(|p| p.endpoint.as_str()).unwrap_or("");
++                    let safe_prov_name = escape_html(prov_name);
++                    let safe_endpoint_url = escape_html(endpoint_url);
++                    let safe_model_name = escape_html(&model_name);
+ 
+                     let done_text = format!(
+                         "🎉 <b>Model AI Berhasil Diubah!</b>\n\n\
+-                         🌐 <b>Provider:</b> <b>{prov_name}</b>\n\
+-                         🔗 <b>Endpoint:</b> <code>{endpoint_url}</code>\n\
+-                         ⚡ <b>Model Aktif:</b> <code>{model_name}</code>\n\n\
++                         🌐 <b>Provider:</b> <b>{safe_prov_name}</b>\n\
++                         🔗 <b>Endpoint:</b> <code>{safe_endpoint_url}</code>\n\
++                         ⚡ <b>Model Aktif:</b> <code>{safe_model_name}</code>\n\n\
+                          💬 <i>Silakan langsung ketik pesan Anda untuk mulai mengobrol.</i>"
+                     );
+ 
+@@ -2674,13 +2937,21 @@ async fn handle_update(
+         } else if cq_data == "context_refresh" || cq_data == "open_context" || cq_data == "show_context" {
+             let _ = bot.answer_callback_query(&cq_id, Some("Konteks diperbarui! 🧠"), false).await;
+             send_or_update_context_monitor(bot, ai_service, chat_id, user_id, msg_id).await;
++        } else if cq_data == "context_close" {
++            let _ = bot.answer_callback_query(&cq_id, None, false).await;
++            if let Some(mid) = msg_id {
++                let _ = bot.delete_message(chat_id, mid).await;
++            }
+         } else if cq_data == "open_new_session" {
+             let new_sess = ai_service.create_new_session(user_id, None).await;
+             let _ = bot.answer_callback_query(&cq_id, Some(&format!("Sesi #{} dibuat! ✨", new_sess.id)), false).await;
+             let _ = bot
+                 .send_message(
+                     chat_id,
+-                    &format!("✨ <b>Sesi Baru Berhasil Dibuat!</b>\nSesi aktif saat ini: <b>{}</b>", new_sess.name),
++                    &format!(
++                        "✨ <b>Sesi Baru Berhasil Dibuat!</b>\nSesi aktif saat ini: <b>{}</b>",
++                        escape_html(&new_sess.name)
++                    ),
+                     Some("HTML"),
+                     Some(get_collapsed_menu_keyboard()),
+                     None,
+@@ -2773,6 +3044,12 @@ async fn main() {
+         return;
+     };
+ 
++    let Some(owner_user_id) = get_configured_owner_id() else {
++        error!("OWNER_USER_ID belum dikonfigurasi. Jalankan `xiao telegram owner <telegram_user_id>` atau `xiao setup`.");
++        return;
++    };
++    let access = Arc::new(AccessPolicy { owner_user_id, allowed_chat_ids: get_allowed_chat_ids() });
++
+     let bot = TelegramBotClient::new(token);
+     let user_last_image_prompt: UserLastImagePrompt = Arc::new(RwLock::new(HashMap::new()));
+ 
+@@ -2780,8 +3057,8 @@ async fn main() {
+     match bot.get_me().await {
+         Ok(resp) if resp.ok && resp.result.is_some() => {
+             let bot_info = resp.result.unwrap();
+-            println!("\n🚀 XiaoAI @{} online menggunakan Telegram Bot API 10.2!", bot_info.username.unwrap_or_default());
+-            println!("⚡ Full Live Execution Timeline Active!");
++            println!("\n🚀 XiaoAI @{} online menggunakan Telegram Bot API 10.3!", bot_info.username.unwrap_or_default());
++            println!("⚡ Streaming Timeline + Native Stop Active!");
+             println!("🌐 Custom OpenAI-Compatible Provider Setup Active (via CLI)\n");
+         }
+         Ok(resp) => {
+@@ -2822,7 +3099,7 @@ async fn main() {
+                 println!("\n🛑 Menerima sinyal berhenti. Bot dimatikan secara aman.");
+                 break;
+             }
+-            updates_res = bot.get_updates(offset, 100, 20, None) => {
++            updates_res = bot.get_updates(offset, 100, 20, Some(vec!["message".to_string(), "callback_query".to_string(), "stopped_message_generation".to_string()])) => {
+                 match updates_res {
+                     Ok(resp) if resp.ok => {
+                         if let Some(updates) = resp.result {
+@@ -2831,9 +3108,10 @@ async fn main() {
+                                 let bot_clone = bot.clone();
+                                 let ai_clone = Arc::clone(&ai_service);
+                                 let last_img_clone = Arc::clone(&user_last_image_prompt);
++                                let access_clone = Arc::clone(&access);
+ 
+                                 tokio::spawn(async move {
+-                                    handle_update(&bot_clone, &ai_clone, &last_img_clone, update).await;
++                                    handle_update(&bot_clone, &ai_clone, &last_img_clone, &access_clone, update).await;
+                                 });
+                             }
+                         }
+diff --git a/src/parser.rs b/src/parser.rs
+index 9cdda24..1610ca3 100644
+--- a/src/parser.rs
++++ b/src/parser.rs
+@@ -277,8 +277,11 @@ fn try_parse_table(
+ 
+     // 2. Unicode Box or ASCII Grid Table (┌─┬─┐ or +---+---+)
+     let is_unicode_box = line.chars().any(|c| "┌╔┏┬┰├┝┼╂".contains(c))
+-        || (line.starts_with('│') && line[1..].contains('│'));
+-    let is_ascii_grid = line.starts_with('+') && line[1..].contains('+') && (line.contains('-') || line.contains('='));
++        || line.strip_prefix('│').is_some_and(|rest| rest.contains('│'));
++    let is_ascii_grid = line
++        .strip_prefix('+')
++        .is_some_and(|rest| rest.contains('+'))
++        && (line.contains('-') || line.contains('='));
+ 
+     if is_unicode_box || is_ascii_grid {
+         let mut table_lines = Vec::new();
+@@ -290,7 +293,9 @@ fn try_parse_table(
+                 break;
+             }
+             if curr.chars().any(|c| "┌╔┏┬┰├┝┼╂└╚┗┴┸┤┥│║┃|┐┘┒┙╗╝┚┖┓┛".contains(c))
+-                || (curr.starts_with('+') && curr[1..].contains('+'))
++                || curr
++                    .strip_prefix('+')
++                    .is_some_and(|rest| rest.contains('+'))
+             {
+                 table_lines.push(curr);
+                 curr_i += 1;
+@@ -642,3 +647,24 @@ pub fn build_full_rich_message(answer_text: &str, _model_name: Option<&str>) ->
+     }
+     InputRichMessage::new(blocks)
+ }
++
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn unicode_box_table_parses_without_byte_boundary_slicing() {
++        let input = "┌──────┬──────┐\n│ Nama │ Ikon │\n├──────┼──────┤\n│ 世界 │ 😊   │\n└──────┴──────┘";
++        let blocks = parse_markdown_to_rich_blocks(input);
++        assert!(blocks.iter().any(|block| matches!(block, RichBlock::Table { .. })));
++    }
++
++    #[test]
++    fn emoji_and_multibyte_inline_text_survive_parser() {
++        let value = parse_inline("Halo █ 😊 世界 **tebal**");
++        let serialized = serde_json::to_string(&value).unwrap();
++        assert!(serialized.contains("世界"));
++        assert!(serialized.contains("😊"));
++    }
++}
+diff --git a/src/timeline.rs b/src/timeline.rs
+index d71ed44..20cb864 100644
+--- a/src/timeline.rs
++++ b/src/timeline.rs
+@@ -8,6 +8,7 @@ use tracing::debug;
+ 
+ use crate::bot::client::TelegramBotClient;
+ use crate::bot::models::{InputRichMessage, RichBlock};
++use serde_json::Value;
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum ProgressState {
+@@ -93,181 +94,49 @@ impl ProgressItem {
+     }
+ }
+ 
+-pub fn classify_text_activity(text: &str) -> ProgressActivity {
+-    let t = text.to_lowercase();
+-    if ["look", "lihat", "gambar", "image", "photo", "foto", "vision", "visual", "logo"]
+-        .iter()
+-        .any(|k| t.contains(k))
+-    {
+-        return ProgressActivity::Looking;
+-    }
+-    if ["read", "baca", "dokumen", "document", "pdf", "file", "teks", "text"]
+-        .iter()
+-        .any(|k| t.contains(k))
+-    {
+-        return ProgressActivity::Reading;
+-    }
+-    if ["tabel", "table", "grid", "kolom", "baris", "matrix", "rekap", "jadwal", "klasemen"]
+-        .iter()
+-        .any(|k| t.contains(k))
+-    {
+-        return ProgressActivity::Table;
+-    }
+-    if ["test", "uji", "validat", "evaluat", "verif", "benchmark", "check"]
+-        .iter()
+-        .any(|k| t.contains(k))
+-    {
+-        return ProgressActivity::Testing;
+-    }
+-    if ["search", "cari", "find", "scan", "telusuri", "inspect", "query", "explore", "lookup"]
+-        .iter()
+-        .any(|k| t.contains(k))
+-    {
+-        return ProgressActivity::Searching;
+-    }
+-    if ["fetch", "request", "api", "endpoint", "download", "ambil", "connect", "hubungi", "retrieve", "http", "network", "sync"]
+-        .iter()
+-        .any(|k| t.contains(k))
+-    {
+-        return ProgressActivity::Fetching;
+-    }
+-    if [
+-        "code", "coding", "syntax", "hitung", "calculat", "math", "rumus", "run", "eksekusi", "compile",
+-        "algoritma", "derivat", "logic", "logika", "program", "fungsi", "function",
+-    ]
+-    .iter()
+-    .any(|k| t.contains(k))
+-    {
+-        return ProgressActivity::Coding;
+-    }
+-    if [
+-        "tool", "patch", "modifikasi", "update", "simpan", "apply", "terapkan", "perbaiki", "simulate",
+-        "branch", "exec", "database", "db",
+-    ]
+-    .iter()
+-    .any(|k| t.contains(k))
+-    {
+-        return ProgressActivity::Tool;
+-    }
+-    if [
+-        "write", "tulis", "format", "susun", "rangkum", "synthesize", "jelaskan", "draft", "compose",
+-        "render", "jawab",
+-    ]
+-    .iter()
+-    .any(|k| t.contains(k))
+-    {
+-        return ProgressActivity::Writing;
+-    }
+-    ProgressActivity::Thinking
+-}
+-
+-pub fn generate_contextual_stages(prompt: &str, _model: &str) -> Vec<(&'static str, ProgressActivity)> {
+-    let p = prompt.to_lowercase();
+-    let mut stages = Vec::new();
+-
+-    if ["tabel", "table", "jadwal", "rekap", "klasemen", "grid", "kolom", "baris"]
+-        .iter()
+-        .any(|k| p.contains(k))
+-    {
+-        stages.push(("Searching", ProgressActivity::Searching));
+-        stages.push(("Table", ProgressActivity::Table));
+-        stages.push(("Writing", ProgressActivity::Writing));
+-    } else if [
+-        "code", "coding", "python", "rust", "javascript", "html", "css", "sql", "query", "script",
+-        "function", "fungsi", "class", "api", "jwt", "auth", "endpoint", "bug", "error", "fix", "patch",
+-    ]
+-    .iter()
+-    .any(|k| p.contains(k))
+-    {
+-        stages.push(("Searching", ProgressActivity::Searching));
+-        stages.push(("Fetching", ProgressActivity::Fetching));
+-        stages.push(("Coding", ProgressActivity::Coding));
+-        if ["error", "bug", "fix", "debug", "masalah", "fail"].iter().any(|k| p.contains(k)) {
+-            stages.push(("Tool", ProgressActivity::Tool));
+-        } else {
+-            stages.push(("Testing", ProgressActivity::Testing));
+-        }
+-        stages.push(("Writing", ProgressActivity::Writing));
+-    } else if [
+-        "hitung", "berapa", "matematika", "fisika", "rumus", "integral", "turunan", "aljabar",
+-        "persamaan", "deret", "probabilitas", "kecepatan", "jarak", "energi", "kalkulus",
+-    ]
+-    .iter()
+-    .any(|k| p.contains(k))
+-    {
+-        stages.push(("Thinking", ProgressActivity::Thinking));
+-        stages.push(("Coding", ProgressActivity::Coding));
+-        stages.push(("Tool", ProgressActivity::Tool));
+-        stages.push(("Writing", ProgressActivity::Writing));
+-    } else if [
+-        "teka-teki", "logika", "puzzle", "riddle", "petani", "serigala", "kambing", "kotak", "apel",
+-        "jeruk", "strategi", "analisa lebih dalam", "analisis", "bandingkan",
+-    ]
+-    .iter()
+-    .any(|k| p.contains(k))
+-    {
+-        stages.push(("Thinking", ProgressActivity::Thinking));
+-        stages.push(("Tool", ProgressActivity::Tool));
+-        stages.push(("Testing", ProgressActivity::Testing));
+-        stages.push(("Writing", ProgressActivity::Writing));
+-    } else if [
+-        "sejarah", "kenapa", "mengapa", "apa itu", "jelaskan", "bagaimana", "definisi", "teori",
+-        "faktor", "penyebab", "prinsip",
+-    ]
+-    .iter()
+-    .any(|k| p.contains(k))
+-    {
+-        stages.push(("Searching", ProgressActivity::Searching));
+-        stages.push(("Fetching", ProgressActivity::Fetching));
+-        stages.push(("Thinking", ProgressActivity::Thinking));
+-        stages.push(("Writing", ProgressActivity::Writing));
+-    } else if [
+-        "terjemah", "translate", "inggris", "indonesia", "puisi", "cerita", "esai", "surat", "kalimat",
+-    ]
+-    .iter()
+-    .any(|k| p.contains(k))
+-    {
+-        stages.push(("Searching", ProgressActivity::Searching));
+-        stages.push(("Writing", ProgressActivity::Writing));
+-    } else {
+-        stages.push(("Thinking", ProgressActivity::Thinking));
+-        stages.push(("Searching", ProgressActivity::Searching));
+-        stages.push(("Writing", ProgressActivity::Writing));
+-    }
+-
+-    stages
+-}
+-
+ pub struct ExecutionTimeline {
+     bot: TelegramBotClient,
+     chat_id: i64,
+     draft_id: i64,
+     max_items: usize,
++    draft_enabled: bool,
++    can_stop: bool,
+     items: Arc<RwLock<Vec<ProgressItem>>>,
+     start_time: Instant,
+     last_sync_time: Arc<RwLock<Instant>>,
+     sync_lock: Arc<Mutex<()>>,
+     stopped: Arc<AtomicBool>,
++    partial_answer: Arc<RwLock<String>>,
+ }
+ 
+ impl ExecutionTimeline {
+-    pub fn new(bot: TelegramBotClient, chat_id: i64, draft_id: i64, max_items: usize) -> Self {
++    pub fn new(
++        bot: TelegramBotClient,
++        chat_id: i64,
++        draft_id: i64,
++        max_items: usize,
++        draft_enabled: bool,
++        can_stop: bool,
++    ) -> Self {
+         Self {
+             bot,
+             chat_id,
+             draft_id,
+             max_items,
++            draft_enabled,
++            can_stop,
+             items: Arc::new(RwLock::new(Vec::new())),
+             start_time: Instant::now(),
+             last_sync_time: Arc::new(RwLock::new(Instant::now())),
+             sync_lock: Arc::new(Mutex::new(())),
+             stopped: Arc::new(AtomicBool::new(false)),
++            partial_answer: Arc::new(RwLock::new(String::new())),
+         }
+     }
+ 
+     pub async fn add_action(&self, label: impl Into<String>, activity: Option<ProgressActivity>) {
+         let lbl = label.into();
+-        let act = activity.unwrap_or_else(|| classify_text_activity(&lbl));
++        let act = activity.unwrap_or(ProgressActivity::Thinking);
+ 
+         let mut items = self.items.write().await;
+         for it in items.iter_mut() {
+@@ -303,7 +172,6 @@ impl ExecutionTimeline {
+     }
+ 
+     pub async fn fail_current(&self, error: String) {
+-        self.stop_ticker();
+         let mut items = self.items.write().await;
+         for it in items.iter_mut().rev() {
+             if it.state == ProgressState::Active {
+@@ -328,6 +196,10 @@ impl ExecutionTimeline {
+         self.stopped.store(true, Ordering::SeqCst);
+     }
+ 
++    pub async fn set_partial_answer(&self, text: &str) {
++        *self.partial_answer.write().await = text.to_string();
++    }
++
+     pub fn start_ticker(self: &Arc<Self>) {
+         self.stopped.store(false, Ordering::SeqCst);
+         let timeline = Arc::clone(self);
+@@ -378,7 +250,13 @@ impl ExecutionTimeline {
+     }
+ 
+     pub async fn sync_draft(&self, force: bool) {
+-        if self.stopped.load(Ordering::SeqCst) {
++        // Telegram streaming drafts are a private-chat feature. In allowed group
++        // chats Xiao still completes the request and sends the final response,
++        // but it doesn't repeatedly call a draft method that Telegram will reject.
++        if !self.draft_enabled {
++            return;
++        }
++        if self.stopped.load(Ordering::SeqCst) && !force {
+             return;
+         }
+ 
+@@ -397,15 +275,26 @@ impl ExecutionTimeline {
+         *self.last_sync_time.write().await = Instant::now();
+         let status = self.render_current_status().await;
+ 
+-        let rich_message = InputRichMessage::new(vec![RichBlock::Thinking {
+-            text: status,
+-            collapsed: true,
+-            expandable: true,
+-        }]);
++        let partial = self.partial_answer.read().await.clone();
++        let mut blocks = vec![RichBlock::Thinking {
++            text: Value::String(status),
++        }];
++        if !partial.trim().is_empty() {
++            blocks.push(RichBlock::Paragraph {
++                text: Value::String(partial),
++            });
++        }
++        let rich_message = InputRichMessage::new(blocks);
+ 
+         if let Err(e) = self
+             .bot
+-            .send_rich_message_draft(self.chat_id, self.draft_id, &rich_message, true, false)
++            .send_rich_message_draft(
++                self.chat_id,
++                self.draft_id,
++                &rich_message,
++                self.can_stop,
++                self.can_stop,
++            )
+             .await
+         {
+             debug!("Failed to sync draft update: {e}");
+diff --git a/src/util.rs b/src/util.rs
+new file mode 100644
+index 0000000..0b3d4e3
+--- /dev/null
++++ b/src/util.rs
+@@ -0,0 +1,73 @@
++pub fn truncate_chars(input: &str, max_chars: usize) -> String {
++    input.chars().take(max_chars).collect()
++}
++
++pub fn truncate_chars_with_ellipsis(input: &str, max_chars: usize) -> String {
++    if input.chars().count() <= max_chars {
++        return input.to_string();
++    }
++    let mut out = truncate_chars(input, max_chars);
++    out.push_str("...");
++    out
++}
++
++pub fn escape_html(input: &str) -> String {
++    html_escape::encode_text(input).into_owned()
++}
++
++pub fn is_supported_text_document(mime_type: &str, file_name: &str) -> bool {
++    let mime = mime_type.trim().to_ascii_lowercase();
++    if mime.starts_with("text/")
++        || matches!(
++            mime.as_str(),
++            "application/json"
++                | "application/ld+json"
++                | "application/xml"
++                | "application/x-yaml"
++                | "application/yaml"
++                | "application/toml"
++                | "application/javascript"
++                | "application/x-javascript"
++        )
++    {
++        return true;
++    }
++
++    let lower = file_name.to_ascii_lowercase();
++    [
++        ".txt", ".md", ".markdown", ".json", ".jsonl", ".xml", ".yaml", ".yml",
++        ".toml", ".csv", ".tsv", ".log", ".rs", ".go", ".py", ".js", ".ts",
++        ".jsx", ".tsx", ".java", ".kt", ".kts", ".c", ".h", ".cpp", ".hpp",
++        ".cs", ".php", ".rb", ".sh", ".bash", ".zsh", ".fish", ".sql", ".html",
++        ".htm", ".css", ".scss", ".ini", ".cfg", ".conf", ".env",
++    ]
++    .iter()
++    .any(|ext| lower.ends_with(ext))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn truncation_is_unicode_safe() {
++        assert_eq!(truncate_chars("ab█😊世界", 4), "ab█😊");
++        assert_eq!(truncate_chars_with_ellipsis("ab█😊世界", 4), "ab█😊...");
++    }
++
++    #[test]
++    fn html_is_escaped() {
++        assert_eq!(escape_html("<b>&\"x\"</b>"), "&lt;b&gt;&amp;\"x\"&lt;/b&gt;");
++    }
++
++    #[test]
++    fn text_document_detection_rejects_binary_containers() {
++        assert!(is_supported_text_document("text/plain", "notes.txt"));
++        assert!(is_supported_text_document("application/octet-stream", "main.rs"));
++        assert!(!is_supported_text_document("application/pdf", "report.pdf"));
++        assert!(!is_supported_text_document(
++            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
++            "report.docx"
++        ));
++    }
++}
