@@ -967,6 +967,10 @@ impl AIChatService {
                 for session in list.iter() {
                     let _ = save_session_db(user_id, session);
                 }
+                let active_idx = *self.active_session_idx.read().await.get(&user_id).unwrap_or(&0);
+                if let Ok(conn) = open_session_db() {
+                    let _ = conn.execute("INSERT INTO active_sessions(user_id,session_id) VALUES(?1,?2) ON CONFLICT(user_id) DO UPDATE SET session_id=excluded.session_id", params![user_id, active_idx]);
+                }
                 return true;
             }
         }
