@@ -5,7 +5,6 @@ mod timeline;
 
 use std::collections::HashMap;
 use std::env;
-use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -56,37 +55,22 @@ fn load_environment() {
 }
 
 fn save_env_kv(key: &str, value: &str) -> io::Result<()> {
-    let env_path = get_config_path();
-    let mut lines = Vec::new();
-    let mut key_written = false;
-    let target_prefix = format!("{key}=");
-
-    if env_path.exists() {
-        let content = fs::read_to_string(&env_path)?;
-        for line in content.lines() {
-            if line.trim().starts_with(&target_prefix) {
-                lines.push(format!("{key}={value}"));
-                key_written = true;
-            } else {
-                lines.push(line.to_string());
-            }
-        }
-    }
-
-    if !key_written {
-        lines.push(format!("{key}={value}"));
-    }
-
-    fs::write(&env_path, lines.join("\n") + "\n")
+    ai::service::save_app_setting(key, value)
 }
 
 fn save_token_to_env(token: &str) -> io::Result<()> {
-    save_env_kv("BOT_TOKEN", token)
+    ai::service::save_app_setting("BOT_TOKEN", token)
 }
 
 fn get_configured_token() -> Option<String> {
     load_environment();
     if let Ok(token) = env::var("BOT_TOKEN") {
+        let trimmed = token.trim().to_string();
+        if !trimmed.is_empty() && trimmed != "YOUR_TELEGRAM_BOT_TOKEN_HERE" {
+            return Some(trimmed);
+        }
+    }
+    if let Some(token) = ai::service::load_app_setting("BOT_TOKEN") {
         let trimmed = token.trim().to_string();
         if !trimmed.is_empty() && trimmed != "YOUR_TELEGRAM_BOT_TOKEN_HERE" {
             return Some(trimmed);
@@ -1008,10 +992,10 @@ async fn run_cli_status(ai_service: &AIChatService) {
     load_environment();
     println!("\n\x1b[1;36m== XiaoAI System Status ==\x1b[0m");
 
-    let token = env::var("BOT_TOKEN").unwrap_or_default();
-    let endpoint = env::var("AI_ENDPOINT").unwrap_or_else(|_| "".to_string());
-    let api_key = env::var("AI_API_KEY").unwrap_or_else(|_| "none".to_string());
-    let model = env::var("AI_MODEL").unwrap_or_else(|_| "".to_string());
+    let token = env::var("BOT_TOKEN").ok().or_else(|| ai::service::load_app_setting("BOT_TOKEN")).unwrap_or_default();
+    let endpoint = env::var("AI_ENDPOINT").ok().or_else(|| ai::service::load_app_setting("AI_ENDPOINT")).unwrap_or_default();
+    let api_key = env::var("AI_API_KEY").ok().or_else(|| ai::service::load_app_setting("AI_API_KEY")).unwrap_or_else(|| "none".to_string());
+    let model = env::var("AI_MODEL").ok().or_else(|| ai::service::load_app_setting("AI_MODEL")).unwrap_or_default();
 
     println!("\x1b[1;37m1. TELEGRAM BOT API\x1b[0m");
     if token.is_empty() || token == "YOUR_TELEGRAM_BOT_TOKEN_HERE" {

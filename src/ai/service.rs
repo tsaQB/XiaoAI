@@ -44,10 +44,18 @@ pub fn get_providers_store_path() -> std::path::PathBuf {
 }
 
 pub fn load_provider_store() -> ProviderStore {
+    if let Ok(conn) = open_session_db() {
+        if let Ok(value) = conn.query_row("SELECT value FROM settings WHERE key='provider_store'", [], |row| row.get::<_, String>(0)) {
+            if let Ok(store) = serde_json::from_str(&value) {
+                return store;
+            }
+        }
+    }
     let p = get_providers_store_path();
     if p.exists() {
         if let Ok(content) = std::fs::read_to_string(&p) {
             if let Ok(store) = serde_json::from_str::<ProviderStore>(&content) {
+                let _ = save_provider_store(&store);
                 return store;
             }
         }
@@ -56,10 +64,12 @@ pub fn load_provider_store() -> ProviderStore {
 }
 
 pub fn save_provider_store(store: &ProviderStore) -> std::io::Result<()> {
-    let p = get_providers_store_path();
     let json_str = serde_json::to_string_pretty(store)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    std::fs::write(p, json_str)
+    let conn = open_session_db().map_err(|e| std::io::Error::other(e.to_string()))?;
+    conn.execute("INSERT INTO settings(key,value) VALUES('provider_store',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![json_str])
+        .map(|_| ())
+        .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +98,7 @@ fn open_session_db() -> rusqlite::Result<Connection> {
     }
     let conn = Connection::open(path)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
+        CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS sessions (
             user_id INTEGER NOT NULL, session_id INTEGER NOT NULL, name TEXT NOT NULL,
             created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(user_id, session_id)
@@ -360,17 +371,40 @@ pub fn get_capability_registry_path() -> std::path::PathBuf {
 }
 
 pub fn load_capability_registry() -> CapabilityRegistry {
+    if let Ok(conn) = open_session_db() {
+        if let Ok(value) = conn.query_row("SELECT value FROM settings WHERE key='capability_registry'", [], |row| row.get::<_, String>(0)) {
+            if let Ok(registry) = serde_json::from_str(&value) {
+                return registry;
+            }
+        }
+    }
     let path = get_capability_registry_path();
-    std::fs::read_to_string(path)
+    let registry = std::fs::read_to_string(path)
         .ok()
         .and_then(|value| serde_json::from_str(&value).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let _ = save_capability_registry(&registry);
+    registry
 }
 
 pub fn save_capability_registry(registry: &CapabilityRegistry) -> std::io::Result<()> {
     let value = serde_json::to_string_pretty(registry)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    std::fs::write(get_capability_registry_path(), value)
+    let conn = open_session_db().map_err(|e| std::io::Error::other(e.to_string()))?;
+    conn.execute("INSERT INTO settings(key,value) VALUES('capability_registry',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![value])
+        .map(|_| ())
+        .map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+pub fn load_app_setting(key: &str) -> Option<String> {
+    open_session_db().ok()?.query_row("SELECT value FROM settings WHERE key=?1", params![format!("app:{key}")], |row| row.get(0)).ok()
+}
+
+pub fn save_app_setting(key: &str, value: &str) -> std::io::Result<()> {
+    let conn = open_session_db().map_err(|e| std::io::Error::other(e.to_string()))?;
+    conn.execute("INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![format!("app:{key}"), value])
+        .map(|_| ())
+        .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 fn format_number_with_commas(n: usize) -> String {
@@ -461,6 +495,15 @@ pub struct AIChatService {
 
 impl AIChatService {
     pub fn new() -> Self {
+        for key in ["BOT_TOKEN", "AI_ENDPOINT", "AI_API_KEY", "AI_MODEL"] {
+            if load_app_setting(key).is_none() {
+                if let Ok(value) = std::env::var(key) {
+                    if !value.trim().is_empty() {
+                        let _ = save_app_setting(key, &value);
+                    }
+                }
+            }
+        }
         let client = Client::builder()
             .timeout(Duration::from_secs(90))
             .build()
@@ -545,13 +588,9 @@ impl AIChatService {
         if let Some(p) = store.providers.iter().find(|p| p.id == provider_id) {
             store.active_id = Some(provider_id.to_string());
             let _ = save_provider_store(&store);
-            let _ = std::fs::write(".env", format!(
-                "BOT_TOKEN={}\nAI_ENDPOINT={}\nAI_API_KEY={}\nAI_MODEL={}\n",
-                std::env::var("BOT_TOKEN").unwrap_or_default(),
-                p.endpoint,
-                p.api_key,
-                p.active_model
-            ));
+            let _ = save_app_setting("AI_ENDPOINT", &p.endpoint);
+            let _ = save_app_setting("AI_API_KEY", &p.api_key);
+            let _ = save_app_setting("AI_MODEL", &p.active_model);
         }
 
         let providers = self.user_providers.read().await;
@@ -685,13 +724,9 @@ impl AIChatService {
         if !matched_endpoint.is_empty() {
             store.active_id = Some(provider_id.to_string());
             let _ = save_provider_store(&store);
-            let _ = std::fs::write(".env", format!(
-                "BOT_TOKEN={}\nAI_ENDPOINT={}\nAI_API_KEY={}\nAI_MODEL={}\n",
-                std::env::var("BOT_TOKEN").unwrap_or_default(),
-                matched_endpoint,
-                matched_key,
-                model_name
-            ));
+            let _ = save_app_setting("AI_ENDPOINT", &matched_endpoint);
+            let _ = save_app_setting("AI_API_KEY", &matched_key);
+            let _ = save_app_setting("AI_MODEL", model_name);
         }
 
         let mut providers = self.user_providers.write().await;
