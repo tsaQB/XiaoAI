@@ -1,0 +1,10 @@
+.env
+target/
+__pycache__/
+*.py[cod]
+Screenshot_*.png
+Screenshot_*.jpg
+Screenshot_*.jpeg
+IMG_*.jpg
+IMG_*.jpeg
+.crush/

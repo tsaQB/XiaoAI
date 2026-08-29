@@ -1,0 +1,36 @@
+[package]
+name = "XiaoAI"
+version = "0.1.0"
+edition = "2021"
+authors = ["Crush"]
+description = "XiaoAI - Telegram Bot API 10.2 Full Live Execution Timeline AI Bot in Rust"
+
+[[bin]]
+name = "xiao"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.38", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dotenvy = "0.15"
+futures-util = "0.3"
+tokio-stream = "0.1"
+regex = "1.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+base64 = "0.22"
+chrono = "0.4"
+rand = "0.8"
+urlencoding = "2.1"
+html-escape = "0.2"
+crossterm = "0.27"
+url = "2.5"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

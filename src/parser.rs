@@ -1,0 +1,644 @@
+use regex::Regex;
+use serde_json::{json, Value};
+
+use crate::bot::models::{
+    InputRichMessage, RichBlock, RichBlockTableCell,
+};
+
+pub fn parse_inline(input_str: &str) -> Value {
+    if input_str.is_empty() {
+        return Value::String(String::new());
+    }
+
+    // Clean leaked HTML tags
+    let html_re = Regex::new(r"(?i)</?(?:b|i|s|u|code|pre|blockquote|a|tg-spoiler|span|p|div)(?:\s+[^>]*)?>").unwrap();
+    let cleaned = html_re.replace_all(input_str, "");
+    let unescaped = html_escape::decode_html_entities(&cleaned).to_string();
+
+    let mut out: Vec<Value> = Vec::new();
+    let mut rest = unescaped.as_str();
+
+    while !rest.is_empty() {
+        // 1. Bold **text**
+        if rest.starts_with("**") {
+            if let Some(end) = rest[2..].find("**") {
+                let inner = &rest[2..2 + end];
+                out.push(json!({
+                    "type": "bold",
+                    "text": parse_inline(inner)
+                }));
+                rest = &rest[2 + end + 2..];
+                continue;
+            }
+        }
+
+        // 2. Bold __text__
+        if rest.starts_with("__") {
+            if let Some(end) = rest[2..].find("__") {
+                let inner = &rest[2..2 + end];
+                out.push(json!({
+                    "type": "bold",
+                    "text": parse_inline(inner)
+                }));
+                rest = &rest[2 + end + 2..];
+                continue;
+            }
+        }
+
+        // 3. Inline code `code`
+        if rest.starts_with('`') {
+            if let Some(end) = rest[1..].find('`') {
+                let inner = &rest[1..1 + end];
+                out.push(json!({
+                    "type": "code",
+                    "text": inner
+                }));
+                rest = &rest[1 + end + 1..];
+                continue;
+            }
+        }
+
+        // 4. Italic *text*
+        if rest.starts_with('*') && !rest.starts_with("**") {
+            if let Some(end) = rest[1..].find('*') {
+                if end > 0 && !rest[1..].starts_with('*') {
+                    let inner = &rest[1..1 + end];
+                    out.push(json!({
+                        "type": "italic",
+                        "text": parse_inline(inner)
+                    }));
+                    rest = &rest[1 + end + 1..];
+                    continue;
+                }
+            }
+        }
+
+        // 5. Italic _text_
+        if rest.starts_with('_') && !rest.starts_with("__") {
+            if let Some(end) = rest[1..].find('_') {
+                if end > 0 {
+                    let inner = &rest[1..1 + end];
+                    out.push(json!({
+                        "type": "italic",
+                        "text": parse_inline(inner)
+                    }));
+                    rest = &rest[1 + end + 1..];
+                    continue;
+                }
+            }
+        }
+
+        // 6. Links [text](url)
+        if rest.starts_with('[') {
+            if let Some(close) = rest.find("](") {
+                if let Some(end) = rest[close + 2..].find(')') {
+                    let url = &rest[close + 2..close + 2 + end];
+                    if url.starts_with("https://") || url.starts_with("http://") {
+                        let inner = &rest[1..close];
+                        out.push(json!({
+                            "type": "url",
+                            "text": parse_inline(inner),
+                            "url": url
+                        }));
+                        rest = &rest[close + 3 + end..];
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // 7. Inline math $...$
+        if rest.starts_with('$') && !rest.starts_with("$$") {
+            if let Some(end) = rest[1..].find('$') {
+                if end > 0 && !rest[1..].starts_with('$') {
+                    let inner = rest[1..1 + end].trim();
+                    if !inner.is_empty() {
+                        out.push(json!({
+                            "type": "mathematical_expression",
+                            "expression": inner
+                        }));
+                        rest = &rest[1 + end + 1..];
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // 8. Inline math \( ... \)
+        if rest.starts_with(r"\(") {
+            if let Some(end) = rest[2..].find(r"\)") {
+                let inner = rest[2..2 + end].trim();
+                if !inner.is_empty() {
+                    out.push(json!({
+                        "type": "mathematical_expression",
+                        "expression": inner
+                    }));
+                    rest = &rest[2 + end + 2..];
+                    continue;
+                }
+            }
+        }
+
+        // 9. Plain text chunk until next token
+        let mut next_pos = rest.len();
+        for delim in &["**", "__", "`", "*", "_", "[", "$", r"\("] {
+            if let Some(idx) = rest.find(delim) {
+                if idx > 0 && idx < next_pos {
+                    next_pos = idx;
+                }
+            }
+        }
+
+        if next_pos == rest.len() {
+            out.push(Value::String(rest.to_string()));
+            break;
+        } else {
+            out.push(Value::String(rest[..next_pos].to_string()));
+            rest = &rest[next_pos..];
+        }
+    }
+
+    // Merge adjacent strings
+    let mut merged: Vec<Value> = Vec::new();
+    for item in out {
+        if let Value::String(s) = item {
+            if let Some(Value::String(prev)) = merged.last_mut() {
+                prev.push_str(&s);
+            } else if !s.is_empty() {
+                merged.push(Value::String(s));
+            }
+        } else {
+            merged.push(item);
+        }
+    }
+
+    if merged.is_empty() {
+        Value::String(String::new())
+    } else if merged.len() == 1 {
+        merged.into_iter().next().unwrap()
+    } else {
+        Value::Array(merged)
+    }
+}
+
+fn is_border_line(line: &str) -> bool {
+    let s = line.trim();
+    if s.is_empty() {
+        return true;
+    }
+    s.chars().all(|c| {
+        "┌╔┏┬┰├┝┼╂└╚┗┴┸┤┥─━═+-=_ \t┐┘┒┙╗╝┚┖┓┛│|║┃"
+            .contains(c)
+    })
+}
+
+fn try_parse_table(
+    lines: &[String],
+    i: usize,
+) -> (Option<Vec<Vec<RichBlockTableCell>>>, bool, usize) {
+    let n = lines.len();
+    let line = lines[i].trim();
+
+    // 1. Standard Markdown Table (| Col 1 | Col 2 |\n| --- | --- |)
+    if line.contains('|') && i + 1 < n {
+        let next_line = lines[i + 1].trim();
+        let sep_cells: Vec<&str> = next_line
+            .trim_matches('|')
+            .split('|')
+            .map(|c| c.trim())
+            .collect();
+
+        let is_sep = !sep_cells.is_empty()
+            && sep_cells.iter().all(|c| {
+                if c.is_empty() {
+                    return true;
+                }
+                let trimmed = c.trim_matches(':');
+                !trimmed.is_empty() && trimmed.chars().all(|ch| ch == '-')
+            });
+
+        if is_sep {
+            let mut aligns: Vec<&str> = Vec::new();
+            for c in &sep_cells {
+                if c.starts_with(':') && c.ends_with(':') {
+                    aligns.push("center");
+                } else if c.ends_with(':') {
+                    aligns.push("right");
+                } else {
+                    aligns.push("left");
+                }
+            }
+
+            let header_raw: Vec<&str> = line
+                .trim_matches('|')
+                .split('|')
+                .map(|c| c.trim())
+                .collect();
+
+            let header_row: Vec<RichBlockTableCell> = header_raw
+                .into_iter()
+                .enumerate()
+                .map(|(idx, h)| {
+                    let align = aligns.get(idx).copied().unwrap_or("left");
+                    RichBlockTableCell::new(parse_inline(h), true, Some(align))
+                })
+                .collect();
+
+            let mut table_cells = vec![header_row];
+            let mut idx_line = i + 2;
+
+            while idx_line < n {
+                let row_str = lines[idx_line].trim();
+                if row_str.is_empty() || !row_str.contains('|') {
+                    break;
+                }
+                let row_raw: Vec<&str> = row_str
+                    .trim_matches('|')
+                    .split('|')
+                    .map(|c| c.trim())
+                    .collect();
+
+                let data_row: Vec<RichBlockTableCell> = row_raw
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, c)| {
+                        let align = aligns.get(idx).copied().unwrap_or("left");
+                        RichBlockTableCell::new(parse_inline(c), false, Some(align))
+                    })
+                    .collect();
+
+                table_cells.push(data_row);
+                idx_line += 1;
+            }
+
+            return (Some(table_cells), true, idx_line);
+        }
+    }
+
+    // 2. Unicode Box or ASCII Grid Table (┌─┬─┐ or +---+---+)
+    let is_unicode_box = line.chars().any(|c| "┌╔┏┬┰├┝┼╂".contains(c))
+        || (line.starts_with('│') && line[1..].contains('│'));
+    let is_ascii_grid = line.starts_with('+') && line[1..].contains('+') && (line.contains('-') || line.contains('='));
+
+    if is_unicode_box || is_ascii_grid {
+        let mut table_lines = Vec::new();
+        let mut curr_i = i;
+
+        while curr_i < n {
+            let curr = lines[curr_i].trim();
+            if curr.is_empty() {
+                break;
+            }
+            if curr.chars().any(|c| "┌╔┏┬┰├┝┼╂└╚┗┴┸┤┥│║┃|┐┘┒┙╗╝┚┖┓┛".contains(c))
+                || (curr.starts_with('+') && curr[1..].contains('+'))
+            {
+                table_lines.push(curr);
+                curr_i += 1;
+            } else {
+                break;
+            }
+        }
+
+        if table_lines.len() >= 2 {
+            let mut table_cells = Vec::new();
+            let mut has_header = false;
+            let mut first_row_done = false;
+
+            for l in &table_lines {
+                if is_border_line(l) {
+                    if first_row_done {
+                        has_header = true;
+                    }
+                    continue;
+                }
+                let mut row_content = *l;
+                row_content = row_content.trim_start_matches(|c| "│|║┃".contains(c));
+                row_content = row_content.trim_end_matches(|c| "│|║┃".contains(c));
+
+                let cols: Vec<&str> = row_content
+                    .split(|c| "│|║┃".contains(c))
+                    .map(|col| col.trim())
+                    .collect();
+
+                if !cols.is_empty() && cols.iter().any(|c| !c.is_empty()) {
+                    let row: Vec<RichBlockTableCell> = cols
+                        .into_iter()
+                        .map(|c| RichBlockTableCell::new(parse_inline(c), false, Some("left")))
+                        .collect();
+                    table_cells.push(row);
+                    first_row_done = true;
+                }
+            }
+
+            if let Some(first_row) = table_cells.first_mut() {
+                if has_header {
+                    for cell in first_row.iter_mut() {
+                        cell.is_header = Some(true);
+                    }
+                }
+            }
+
+            if table_cells.len() >= 2 || (!table_cells.is_empty() && has_header) {
+                return (Some(table_cells), has_header, curr_i);
+            }
+        }
+    }
+
+    // 3. Plain Underline Table: Header \n ---------------- \n Data
+    let underline_re = Regex::new(r"^-{3,}$").unwrap();
+    if i + 1 < n && underline_re.is_match(lines[i + 1].trim()) {
+        let space_split_re = Regex::new(r"\s{2,}|\t+").unwrap();
+        let cols_hdr: Vec<&str> = space_split_re
+            .split(line)
+            .map(|c| c.trim())
+            .filter(|c| !c.is_empty())
+            .collect();
+
+        if cols_hdr.len() >= 2 {
+            let header_row: Vec<RichBlockTableCell> = cols_hdr
+                .into_iter()
+                .map(|c| RichBlockTableCell::new(parse_inline(c), true, Some("left")))
+                .collect();
+            let mut table_cells = vec![header_row];
+            let mut curr_i = i + 2;
+
+            while curr_i < n {
+                let curr = lines[curr_i].trim();
+                if curr.is_empty() {
+                    break;
+                }
+                if underline_re.is_match(curr) {
+                    curr_i += 1;
+                    continue;
+                }
+                let data_cols: Vec<&str> = space_split_re
+                    .split(curr)
+                    .map(|c| c.trim())
+                    .filter(|c| !c.is_empty())
+                    .collect();
+                if !data_cols.is_empty() {
+                    let row: Vec<RichBlockTableCell> = data_cols
+                        .into_iter()
+                        .map(|c| RichBlockTableCell::new(parse_inline(c), false, Some("left")))
+                        .collect();
+                    table_cells.push(row);
+                }
+                curr_i += 1;
+            }
+
+            if table_cells.len() >= 2 {
+                return (Some(table_cells), true, curr_i);
+            }
+        }
+    }
+
+    (None, false, i)
+}
+
+pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+
+    // Strip <think>...</think>
+    let think_re = Regex::new(r"(?s)<think>.*?</think>").unwrap();
+    let cleaned_step1 = think_re.replace_all(text, "");
+    let tag_re = Regex::new(r"(?i)</?think>").unwrap();
+    let cleaned = tag_re.replace_all(&cleaned_step1, "").trim().to_string();
+
+    if cleaned.is_empty() {
+        return Vec::new();
+    }
+
+    let lines: Vec<String> = cleaned.replace("\r\n", "\n").split('\n').map(|s| s.to_string()).collect();
+    let mut blocks: Vec<RichBlock> = Vec::new();
+
+    let mut i = 0;
+    let n = lines.len();
+
+    let heading_re = Regex::new(r"^(#{1,6})\s+(.+)$").unwrap();
+    let divider_re = Regex::new(r"^(\-{3,}|\*{3,}|_{3,}|─{3,}|—{2,})$").unwrap();
+    let bullet_re = Regex::new(r"^[-*•]\s+").unwrap();
+    let numbered_re = Regex::new(r"^\d+[\.)]\s+").unwrap();
+
+    while i < n {
+        let line = &lines[i];
+        let stripped = line.trim();
+
+        // 1. Skip blank lines
+        if stripped.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // 2. Fenced Code Block (```lang ... ```)
+        if stripped.starts_with("```") {
+            let lang = stripped[3..].trim();
+            let language = if lang.is_empty() { None } else { Some(lang.to_string()) };
+            let mut code_lines = Vec::new();
+            i += 1;
+            while i < n && !lines[i].trim().starts_with("```") {
+                code_lines.push(lines[i].clone());
+                i += 1;
+            }
+            if i < n && lines[i].trim().starts_with("```") {
+                i += 1;
+            }
+            blocks.push(RichBlock::Preformatted {
+                text: code_lines.join("\n"),
+                language,
+            });
+            continue;
+        }
+
+        // 3. Math Block ($$...$$ or \[...\])
+        if stripped.starts_with("$$") || stripped.starts_with(r"\[") {
+            let is_bracket = stripped.starts_with(r"\[");
+            let closing_token = if is_bracket { r"\]" } else { "$$" };
+            let start_len = 2;
+            let mut math_lines = Vec::new();
+
+            if stripped.ends_with(closing_token) && stripped.len() > (start_len * 2) {
+                math_lines.push(stripped[start_len..stripped.len() - closing_token.len()].trim().to_string());
+                i += 1;
+            } else {
+                if stripped.len() > start_len {
+                    math_lines.push(stripped[start_len..].trim().to_string());
+                }
+                i += 1;
+                while i < n && !lines[i].trim().ends_with(closing_token) {
+                    math_lines.push(lines[i].clone());
+                    i += 1;
+                }
+                if i < n && lines[i].trim().ends_with(closing_token) {
+                    let end_line = lines[i].trim();
+                    if end_line.len() > closing_token.len() {
+                        math_lines.push(end_line[..end_line.len() - closing_token.len()].trim().to_string());
+                    }
+                    i += 1;
+                }
+            }
+
+            let expr = math_lines.join("\n").trim().to_string();
+            if !expr.is_empty() {
+                blocks.push(RichBlock::MathematicalExpression { expression: expr });
+            }
+            continue;
+        }
+
+        // Standalone LaTeX math formula line (\text{...} or \frac{...})
+        if (stripped.starts_with(r"\text{") || stripped.starts_with(r"\frac") || stripped.starts_with(r"\sqrt"))
+            && (stripped.contains(r"\frac") || stripped.contains('=') || stripped.contains(r"\times"))
+        {
+            let mut math_lines = vec![stripped.to_string()];
+            i += 1;
+            while i < n {
+                let curr_s = lines[i].trim();
+                if curr_s.is_empty()
+                    || ![r"\frac", r"\text", "=", r"\times", r"\sqrt", "^", "_", "+", "-", "{", "}"]
+                        .iter()
+                        .any(|k| curr_s.contains(k))
+                {
+                    break;
+                }
+                math_lines.push(curr_s.to_string());
+                i += 1;
+            }
+            let expr = math_lines.join("\n").trim().to_string();
+            if !expr.is_empty() {
+                blocks.push(RichBlock::MathematicalExpression { expression: expr });
+            }
+            continue;
+        }
+
+        // 4. Horizontal Divider (---, ***, ___, ───)
+        if divider_re.is_match(stripped) {
+            blocks.push(RichBlock::Divider {});
+            i += 1;
+            continue;
+        }
+
+        // 5. Section Heading (# Heading, ## Subheading, etc.)
+        if let Some(caps) = heading_re.captures(stripped) {
+            let level = caps.get(1).map(|m| m.as_str().len()).unwrap_or(1);
+            let heading_text = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+            blocks.push(RichBlock::SectionHeading {
+                text: parse_inline(heading_text),
+                level: level.min(6),
+            });
+            i += 1;
+            continue;
+        }
+
+        // 6. Blockquote (> quote)
+        if stripped.starts_with('>') {
+            let mut quote_lines = Vec::new();
+            while i < n && lines[i].trim().starts_with('>') {
+                let q = lines[i].trim();
+                let stripped_q = q.strip_prefix('>').unwrap_or(q).trim_start();
+                quote_lines.push(stripped_q.to_string());
+                i += 1;
+            }
+            blocks.push(RichBlock::BlockQuotation {
+                blocks: vec![json!({
+                    "type": "paragraph",
+                    "text": parse_inline(&quote_lines.join("\n"))
+                })],
+            });
+            continue;
+        }
+
+        // 7. Table (Markdown, Unicode, ASCII, Underline)
+        let (t_cells, has_hdr, next_i) = try_parse_table(&lines, i);
+        if let Some(cells) = t_cells {
+            blocks.push(RichBlock::Table {
+                cells,
+                has_header: has_hdr,
+                is_bordered: true,
+                is_striped: true,
+                is_compact: true,
+                caption: None,
+            });
+            i = next_i;
+            continue;
+        }
+
+        // 8. List Items (- item, * item, 1. item)
+        let is_bullet = bullet_re.is_match(stripped);
+        let is_numbered = numbered_re.is_match(stripped);
+
+        if is_bullet || is_numbered {
+            let mut list_items = Vec::new();
+            let is_ordered = is_numbered;
+
+            while i < n {
+                let curr = lines[i].trim();
+                if curr.is_empty() {
+                    break;
+                }
+                if is_ordered && numbered_re.is_match(curr) {
+                    let item_text = numbered_re.replace(curr, "").trim().to_string();
+                    list_items.push(json!({
+                        "blocks": [{
+                            "type": "paragraph",
+                            "text": parse_inline(&item_text)
+                        }]
+                    }));
+                    i += 1;
+                } else if !is_ordered && bullet_re.is_match(curr) {
+                    let item_text = bullet_re.replace(curr, "").trim().to_string();
+                    list_items.push(json!({
+                        "blocks": [{
+                            "type": "paragraph",
+                            "text": parse_inline(&item_text)
+                        }]
+                    }));
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            blocks.push(RichBlock::List { items: list_items });
+            continue;
+        }
+
+        // 9. Regular Paragraph
+        let mut para_lines = Vec::new();
+        while i < n {
+            let curr = &lines[i];
+            let s_curr = curr.trim();
+            if s_curr.is_empty()
+                || s_curr.starts_with("```")
+                || s_curr.starts_with("$$")
+                || heading_re.is_match(s_curr)
+                || s_curr.starts_with('>')
+                || bullet_re.is_match(s_curr)
+                || numbered_re.is_match(s_curr)
+                || divider_re.is_match(s_curr)
+                || try_parse_table(&lines, i).0.is_some()
+            {
+                break;
+            }
+            para_lines.push(curr.clone());
+            i += 1;
+        }
+
+        if !para_lines.is_empty() {
+            blocks.push(RichBlock::Paragraph {
+                text: parse_inline(&para_lines.join("\n")),
+            });
+        }
+    }
+
+    blocks
+}
+
+pub fn build_full_rich_message(answer_text: &str, _model_name: Option<&str>) -> InputRichMessage {
+    let mut blocks = parse_markdown_to_rich_blocks(answer_text);
+    if blocks.is_empty() {
+        blocks.push(RichBlock::Paragraph {
+            text: parse_inline(answer_text.trim()),
+        });
+    }
+    InputRichMessage::new(blocks)
+}
