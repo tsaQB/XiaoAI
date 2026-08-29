@@ -54,7 +54,17 @@ jobs:
           path: Cargo.lock
           retention-days: 3
 
-      - name: Format
+      - name: Canonical format
+        run: cargo fmt --all
+
+      - name: Upload formatted Rust source
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: xiao-p1-rustfmt-source
+          path: src
+          retention-days: 3
+
+      - name: Format check
         run: cargo fmt --all -- --check
 
       - name: Check
