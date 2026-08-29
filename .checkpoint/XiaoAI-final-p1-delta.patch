@@ -3585,7 +3585,7 @@ index ac00856..d9ca655 100644
                  false,
 diff --git a/src/ai/storage.rs b/src/ai/storage.rs
 new file mode 100644
-index 0000000..241b41a
+index 0000000..3a1a06d
 --- /dev/null
 +++ b/src/ai/storage.rs
 @@ -0,0 +1,559 @@
@@ -3684,7 +3684,7 @@ index 0000000..241b41a
 +        .map_err(|e| std::io::Error::other(e.to_string()))
 +}
 +
-+pub(super) async pub(super) fn persist_provider_state(store: ProviderStore) -> bool {
++pub(super) async fn persist_provider_state(store: ProviderStore) -> bool {
 +    match tokio::task::spawn_blocking(move || save_provider_state_db(&store)).await {
 +        Ok(Ok(())) => true,
 +        Ok(Err(err)) => {
@@ -3970,17 +3970,17 @@ index 0000000..241b41a
 +    }
 +}
 +
-+pub(super) async pub(super) fn load_sessions_db_async(user_id: i64) -> Vec<ChatSession> {
++pub(super) async fn load_sessions_db_async(user_id: i64) -> Vec<ChatSession> {
 +    run_db("load_sessions", move || load_sessions_db(user_id))
 +        .await
 +        .unwrap_or_default()
 +}
 +
-+pub(super) async pub(super) fn allocate_session_id_db_async(user_id: i64) -> Option<usize> {
++pub(super) async fn allocate_session_id_db_async(user_id: i64) -> Option<usize> {
 +    run_db("allocate_session_id", move || allocate_session_id_db(user_id)).await
 +}
 +
-+pub(super) async pub(super) fn save_session_metadata_db_async(user_id: i64, session: ChatSession) -> bool {
++pub(super) async fn save_session_metadata_db_async(user_id: i64, session: ChatSession) -> bool {
 +    run_db("save_session_metadata", move || {
 +        save_session_metadata_db(user_id, &session)
 +    })
@@ -3988,7 +3988,7 @@ index 0000000..241b41a
 +    .is_some()
 +}
 +
-+pub(super) async pub(super) fn replace_session_messages_db_async(user_id: i64, session: ChatSession) -> bool {
++pub(super) async fn replace_session_messages_db_async(user_id: i64, session: ChatSession) -> bool {
 +    run_db("replace_session_messages", move || {
 +        replace_session_messages_db(user_id, &session)
 +    })
@@ -3996,7 +3996,7 @@ index 0000000..241b41a
 +    .is_some()
 +}
 +
-+pub(super) async pub(super) fn append_session_messages_db_async(
++pub(super) async fn append_session_messages_db_async(
 +    user_id: i64,
 +    session: ChatSession,
 +    messages: Vec<ChatMessage>,
@@ -4008,13 +4008,13 @@ index 0000000..241b41a
 +    .is_some()
 +}
 +
-+pub(super) async pub(super) fn delete_session_db_async(user_id: i64, session_id: usize) -> bool {
++pub(super) async fn delete_session_db_async(user_id: i64, session_id: usize) -> bool {
 +    run_db("delete_session", move || delete_session_db(user_id, session_id))
 +        .await
 +        .is_some()
 +}
 +
-+pub(super) async pub(super) fn save_active_session_db_async(user_id: i64, session_id: usize) -> bool {
++pub(super) async fn save_active_session_db_async(user_id: i64, session_id: usize) -> bool {
 +    run_db("save_active_session", move || {
 +        save_active_session_db(user_id, session_id)
 +    })
@@ -4022,7 +4022,7 @@ index 0000000..241b41a
 +    .is_some()
 +}
 +
-+pub(super) async pub(super) fn ensure_session_identity_v2_db_async(user_id: i64, sessions: Vec<ChatSession>) -> bool {
++pub(super) async fn ensure_session_identity_v2_db_async(user_id: i64, sessions: Vec<ChatSession>) -> bool {
 +    run_db("ensure_session_identity_v2", move || {
 +        ensure_session_identity_v2_db(user_id, &sessions)
 +    })
@@ -4030,7 +4030,7 @@ index 0000000..241b41a
 +    .is_some()
 +}
 +
-+pub(super) async pub(super) fn load_active_session_id_db_async(user_id: i64) -> Option<usize> {
++pub(super) async fn load_active_session_id_db_async(user_id: i64) -> Option<usize> {
 +    run_db("load_active_session", move || {
 +        let conn = open_session_db()?;
 +        conn.query_row(
@@ -4108,7 +4108,7 @@ index 0000000..241b41a
 +        .map_err(|e| std::io::Error::other(e.to_string()))
 +}
 +
-+pub(super) async pub(super) fn persist_capability_registry(registry: CapabilityRegistry) -> bool {
++pub(super) async fn persist_capability_registry(registry: CapabilityRegistry) -> bool {
 +    match tokio::task::spawn_blocking(move || save_capability_registry(&registry)).await {
 +        Ok(Ok(())) => true,
 +        Ok(Err(err)) => {
@@ -4122,7 +4122,7 @@ index 0000000..241b41a
 +    }
 +}
 +
-+pub(super) async pub(super) fn load_app_setting_async(key: &'static str) -> Option<String> {
++pub(super) async fn load_app_setting_async(key: &'static str) -> Option<String> {
 +    tokio::task::spawn_blocking(move || load_app_setting(key))
 +        .await
 +        .ok()
