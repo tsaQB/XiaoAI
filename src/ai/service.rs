@@ -1068,6 +1068,20 @@ impl AIChatService {
             provider.models.first().cloned().unwrap_or_else(|| "gpt-4o".to_string())
         };
 
+        let capability_registry = load_capability_registry();
+        let capability = capability_registry
+            .models
+            .iter()
+            .find(|record| record.provider_id == provider.endpoint.trim_end_matches('/') && record.model == model);
+        if let Some(record) = capability {
+            if video_bytes.is_some() && record.supports_video == Some(false) {
+                return (None, format!("Endpoint '{}' tidak mendukung input video untuk model '{}'.", provider.name, model));
+            }
+            if audio_bytes.is_some() && record.supports_audio == Some(false) {
+                return (None, format!("Endpoint '{}' tidak mendukung input audio untuk model '{}'.", provider.name, model));
+            }
+        }
+
         let active_sess = self.get_active_session(user_id).await;
         let mut history: Vec<Value> = active_sess
             .messages
