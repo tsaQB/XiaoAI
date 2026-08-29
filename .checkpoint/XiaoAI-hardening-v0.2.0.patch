@@ -597,7 +597,7 @@ index 2026d17..b136526 100644
 +- Memecah `main.rs` dan `ai/service.rs` menjadi application/domain/repository/provider modules yang lebih kecil.
 +- Mengganti parser SSE custom dengan parser event-stream yang lebih battle-tested dan menambah retry/backoff 429/5xx.
 diff --git a/src/ai/service.rs b/src/ai/service.rs
-index 3b94755..58e27fd 100644
+index 3b94755..1faea6e 100644
 --- a/src/ai/service.rs
 +++ b/src/ai/service.rs
 @@ -1,22 +1,21 @@
@@ -644,6 +644,15 @@ index 3b94755..58e27fd 100644
              if let Ok(store) = serde_json::from_str(&value) {
                  return store;
              }
+@@ -65,7 +68,7 @@ pub fn load_provider_store() -> ProviderStore {
+ 
+ pub fn save_provider_store(store: &ProviderStore) -> std::io::Result<()> {
+     let json_str = serde_json::to_string_pretty(store)
+-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
++        .map_err(std::io::Error::other)?;
+     let conn = open_session_db().map_err(|e| std::io::Error::other(e.to_string()))?;
+     conn.execute("INSERT INTO settings(key,value) VALUES('provider_store',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![json_str])
+         .map(|_| ())
 @@ -87,7 +90,9 @@ pub struct ChatSession {
  }
  
@@ -793,7 +802,7 @@ index 3b94755..58e27fd 100644
 +            "INSERT INTO messages(user_id,session_id,role,content,created_at) VALUES(?1,?2,?3,?4,?5)",
 +            params![user_id, session.id, message.role, content, now],
 +        )?;
-     }
++    }
 +    tx.commit()?;
 +    Ok(())
 +}
@@ -875,7 +884,7 @@ index 3b94755..58e27fd 100644
 +            "INSERT INTO settings(key,value) VALUES(?1,'1') ON CONFLICT(key) DO UPDATE SET value='1'",
 +            params![&marker],
 +        )?;
-+    }
+     }
 +
 +    let next_id = sessions
 +        .iter()
@@ -1219,18 +1228,41 @@ index 3b94755..58e27fd 100644
          }
      }
  
-@@ -483,7 +751,9 @@ pub struct AIChatService {
+@@ -478,12 +746,32 @@ pub struct ContextStats {
+     pub messages_breakdown: Vec<ContextMessageItem>,
+ }
+ 
++type GenerationKey = (i64, i64);
++type GenerationCancelSender = watch::Sender<bool>;
++type ActiveGenerations = Arc<RwLock<HashMap<GenerationKey, GenerationCancelSender>>>;
++
++pub struct GenerationInput<'a> {
++    pub prompt: &'a str,
++    pub timeline: Option<&'a Arc<ExecutionTimeline>>,
++    pub image_bytes: Option<Vec<u8>>,
++    pub mime_type: Option<&'a str>,
++    pub doc_text: Option<&'a str>,
++    pub doc_name: Option<&'a str>,
++    pub audio_bytes: Option<Vec<u8>>,
++    pub audio_mime: Option<&'a str>,
++    pub video_bytes: Option<Vec<u8>>,
++    pub video_mime: Option<&'a str>,
++    pub video_duration: Option<i32>,
++}
++
+ #[derive(Clone)]
+ pub struct AIChatService {
      client: Client,
      user_models: Arc<RwLock<HashMap<i64, String>>>,
      user_sessions: Arc<RwLock<HashMap<i64, Vec<ChatSession>>>>,
 -    active_session_idx: Arc<RwLock<HashMap<i64, usize>>>,
 +    active_session_id: Arc<RwLock<HashMap<i64, usize>>>,
 +    generation_locks: Arc<RwLock<HashMap<i64, Arc<Mutex<()>>>>>,
-+    active_generations: Arc<RwLock<HashMap<(i64, i64), watch::Sender<bool>>>>,
++    active_generations: ActiveGenerations,
      pub user_waiting_rename: Arc<RwLock<HashMap<i64, usize>>>,
      pub user_rename_msg_id: Arc<RwLock<HashMap<i64, i64>>>,
      pub user_session_msg_id: Arc<RwLock<HashMap<i64, i64>>>,
-@@ -495,7 +765,15 @@ pub struct AIChatService {
+@@ -495,7 +783,15 @@ pub struct AIChatService {
  
  impl AIChatService {
      pub fn new() -> Self {
@@ -1247,7 +1279,7 @@ index 3b94755..58e27fd 100644
              if load_app_setting(key).is_none() {
                  if let Ok(value) = std::env::var(key) {
                      if !value.trim().is_empty() {
-@@ -513,7 +791,9 @@ impl AIChatService {
+@@ -513,7 +809,9 @@ impl AIChatService {
              client,
              user_models: Arc::new(RwLock::new(HashMap::new())),
              user_sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -1258,7 +1290,7 @@ index 3b94755..58e27fd 100644
              user_waiting_rename: Arc::new(RwLock::new(HashMap::new())),
              user_rename_msg_id: Arc::new(RwLock::new(HashMap::new())),
              user_session_msg_id: Arc::new(RwLock::new(HashMap::new())),
-@@ -628,10 +908,17 @@ impl AIChatService {
+@@ -628,10 +926,17 @@ impl AIChatService {
              .collect();
          let provider_id = format!("prov_{}", random_suffix.to_lowercase());
  
@@ -1278,7 +1310,7 @@ index 3b94755..58e27fd 100644
              endpoint: endpoint.trim().trim_end_matches('/').to_string(),
              api_key: api_key.trim().to_string(),
              models,
-@@ -687,7 +974,12 @@ impl AIChatService {
+@@ -687,7 +992,12 @@ impl AIChatService {
          false
      }
  
@@ -1292,7 +1324,7 @@ index 3b94755..58e27fd 100644
          let mut store = load_provider_store();
          if let Some(p) = store.providers.iter_mut().find(|p| p.id == provider_id) {
              p.models = models.clone();
-@@ -704,13 +996,23 @@ impl AIChatService {
+@@ -704,13 +1014,23 @@ impl AIChatService {
          }
      }
  
@@ -1318,7 +1350,7 @@ index 3b94755..58e27fd 100644
          let mut store = load_provider_store();
          let mut matched_endpoint = String::new();
          let mut matched_key = String::new();
-@@ -758,7 +1060,11 @@ impl AIChatService {
+@@ -758,7 +1078,11 @@ impl AIChatService {
  
          let mut req = self.client.get(&url).timeout(Duration::from_secs(15));
          let trimmed_key = api_key.trim();
@@ -1331,7 +1363,7 @@ index 3b94755..58e27fd 100644
              req = req.header("Authorization", format!("Bearer {trimmed_key}"));
          }
  
-@@ -776,33 +1082,50 @@ impl AIChatService {
+@@ -776,33 +1100,50 @@ impl AIChatService {
                                      if let Some(id_str) = item.get("id").and_then(|s| s.as_str()) {
                                          model_ids.push(id_str.to_string());
  
@@ -1394,7 +1426,7 @@ index 3b94755..58e27fd 100644
                                  for k in data_obj.keys() {
                                      model_ids.push(k.to_string());
                                  }
-@@ -811,23 +1134,50 @@ impl AIChatService {
+@@ -811,23 +1152,50 @@ impl AIChatService {
                              let mut registry = load_capability_registry();
                              let provider_id = clean_endpoint.to_string();
                              for model_id in &model_ids {
@@ -1452,7 +1484,7 @@ index 3b94755..58e27fd 100644
                                      *existing = record;
                                  } else {
                                      registry.models.push(record);
-@@ -841,7 +1191,10 @@ impl AIChatService {
+@@ -841,7 +1209,10 @@ impl AIChatService {
                                  (false, Err("Endpoint berhasil dihubungi, namun tidak ada daftar model yang dikembalikan (data kosong).".to_string()))
                              }
                          }
@@ -1464,7 +1496,7 @@ index 3b94755..58e27fd 100644
                      }
                  } else if status.as_u16() == 401 || status.as_u16() == 403 {
                      (false, Err(format!("HTTP {} Unauthorized: Autentikasi gagal. Mohon periksa kembali API Key Anda.", status.as_u16())))
-@@ -849,12 +1202,24 @@ impl AIChatService {
+@@ -849,12 +1220,24 @@ impl AIChatService {
                      (false, Err(format!("HTTP 404 Not Found: Path /models tidak ditemukan di {clean_endpoint}. Pastikan format endpoint URL benar (misal: https://api.openai.com/v1).")))
                  } else {
                      let err_text = resp.text().await.unwrap_or_default();
@@ -1491,7 +1523,7 @@ index 3b94755..58e27fd 100644
                  } else if e.is_connect() {
                      (false, Err(format!("Gagal terhubung ke {clean_endpoint}. Pastikan host/domain benar dan server aktif.")))
                  } else {
-@@ -871,14 +1236,20 @@ impl AIChatService {
+@@ -871,14 +1254,20 @@ impl AIChatService {
              }
          }
          let models = self.user_models.read().await;
@@ -1514,7 +1546,7 @@ index 3b94755..58e27fd 100644
      }
  
      // ==========================================
-@@ -886,126 +1257,217 @@ impl AIChatService {
+@@ -886,126 +1275,217 @@ impl AIChatService {
      // ==========================================
  
      pub async fn get_sessions(&self, user_id: i64) -> Vec<ChatSession> {
@@ -1809,7 +1841,7 @@ index 3b94755..58e27fd 100644
                  return true;
              }
          }
-@@ -1013,34 +1475,78 @@ impl AIChatService {
+@@ -1013,34 +1493,78 @@ impl AIChatService {
      }
  
      pub async fn rename_session(&self, user_id: i64, index: usize, new_name: &str) -> bool {
@@ -1904,7 +1936,7 @@ index 3b94755..58e27fd 100644
          let cap = get_model_capabilities_with_meta(&active_model, metadata.as_ref());
          let limit_tokens = cap.context_limit;
          let limit_str = cap.context_str.clone();
-@@ -1057,15 +1563,7 @@ impl AIChatService {
+@@ -1057,15 +1581,7 @@ impl AIChatService {
              let toks = (chars / 3).max(1);
              total_chars += chars;
  
@@ -1921,7 +1953,7 @@ index 3b94755..58e27fd 100644
  
              msg_stats.push(ContextMessageItem {
                  index: i + 1,
-@@ -1084,7 +1582,11 @@ impl AIChatService {
+@@ -1084,7 +1600,11 @@ impl AIChatService {
              filled_blocks = 1;
          }
          filled_blocks = filled_blocks.min(10);
@@ -1934,7 +1966,16 @@ index 3b94755..58e27fd 100644
  
          ContextStats {
              session_name: active_sess.name,
-@@ -1114,21 +1616,39 @@ impl AIChatService {
+@@ -1095,7 +1615,7 @@ impl AIChatService {
+             limit_tokens,
+             limit_str,
+             total_messages: active_sess.messages.len(),
+-            total_turns: (active_sess.messages.len() + 1) / 2,
++            total_turns: active_sess.messages.len().div_ceil(2),
+             total_tokens,
+             total_chars,
+             usage_pct,
+@@ -1114,21 +1634,39 @@ impl AIChatService {
          audio_bytes: Vec<u8>,
          file_name: &str,
      ) -> (bool, Result<String, String>) {
@@ -1982,7 +2023,7 @@ index 3b94755..58e27fd 100644
              req = req.header("Authorization", format!("Bearer {}", provider.api_key));
          }
  
-@@ -1151,7 +1671,14 @@ impl AIChatService {
+@@ -1151,7 +1689,14 @@ impl AIChatService {
                      (false, Err("ENDPOINT_NOT_SUPPORTED".to_string()))
                  } else {
                      let err_txt = resp.text().await.unwrap_or_default();
@@ -1998,13 +2039,38 @@ index 3b94755..58e27fd 100644
                  }
              }
              Err(e) => (false, Err(format!("Audio transcription error: {e}"))),
-@@ -1176,13 +1703,15 @@ impl AIChatService {
-         video_bytes: Option<Vec<u8>>,
-         video_mime: Option<&str>,
-         video_duration: Option<i32>,
+@@ -1165,24 +1710,29 @@ impl AIChatService {
+     pub async fn generate_response(
+         &self,
+         user_id: i64,
+-        prompt: &str,
+-        timeline: Option<&Arc<ExecutionTimeline>>,
+-        image_bytes: Option<Vec<u8>>,
+-        mime_type: Option<&str>,
+-        doc_text: Option<&str>,
+-        doc_name: Option<&str>,
+-        audio_bytes: Option<Vec<u8>>,
+-        audio_mime: Option<&str>,
+-        video_bytes: Option<Vec<u8>>,
+-        video_mime: Option<&str>,
+-        video_duration: Option<i32>,
 -    ) -> (Option<String>, String) {
++        input: GenerationInput<'_>,
 +        cancel_rx: &mut watch::Receiver<bool>,
 +    ) -> (Option<String>, String, bool) {
++        let GenerationInput {
++            prompt,
++            timeline,
++            image_bytes,
++            mime_type,
++            doc_text,
++            doc_name,
++            audio_bytes,
++            audio_mime,
++            video_bytes,
++            video_mime,
++            video_duration,
++        } = input;
          let provider = match self.get_active_provider(user_id).await {
              Some(p) if !p.endpoint.is_empty() => p,
              _ => {
@@ -2015,7 +2081,7 @@ index 3b94755..58e27fd 100644
                  );
              }
          };
-@@ -1193,24 +1722,42 @@ impl AIChatService {
+@@ -1193,24 +1743,42 @@ impl AIChatService {
          } else if !provider.active_model.is_empty() {
              provider.active_model.clone()
          } else {
@@ -2065,7 +2131,7 @@ index 3b94755..58e27fd 100644
          let mut history: Vec<Value> = active_sess
              .messages
              .iter()
-@@ -1222,35 +1769,6 @@ impl AIChatService {
+@@ -1222,35 +1790,6 @@ impl AIChatService {
              history = history[start..].to_vec();
          }
  
@@ -2101,7 +2167,7 @@ index 3b94755..58e27fd 100644
          let mut clean_prompt = prompt.trim().to_string();
          if let Some(doc) = doc_text {
              let d_name = doc_name.unwrap_or("Dokumen");
-@@ -1261,7 +1779,9 @@ impl AIChatService {
+@@ -1261,7 +1800,9 @@ impl AIChatService {
                  format!("{doc_header}{clean_prompt}")
              };
          } else if video_bytes.is_some() && clean_prompt.is_empty() {
@@ -2112,7 +2178,7 @@ index 3b94755..58e27fd 100644
              clean_prompt = format!("Tonton dan analisis rekaman video ini{dur_str} secara mendalam. Jelaskan isi visual, alur peristiwa, teks di layar, dan suara di dalamnya.");
          } else if image_bytes.is_some() && clean_prompt.is_empty() {
              clean_prompt = "Jelaskan dan analisis gambar ini secara detail.".to_string();
-@@ -1269,27 +1789,16 @@ impl AIChatService {
+@@ -1269,27 +1810,16 @@ impl AIChatService {
              clean_prompt = "Dengarkan rekaman suara ini dan jawab pertanyaan atau instruksi di dalamnya secara lengkap.".to_string();
          }
  
@@ -2145,7 +2211,7 @@ index 3b94755..58e27fd 100644
          })];
  
          messages.extend(history);
-@@ -1321,7 +1830,11 @@ impl AIChatService {
+@@ -1321,7 +1851,11 @@ impl AIChatService {
          } else if let Some(a_bytes) = audio_bytes {
              use base64::Engine;
              let b64_audio = base64::engine::general_purpose::STANDARD.encode(&a_bytes);
@@ -2158,7 +2224,7 @@ index 3b94755..58e27fd 100644
              messages.push(json!({
                  "role": "user",
                  "content": [
-@@ -1342,7 +1855,10 @@ impl AIChatService {
+@@ -1342,7 +1876,10 @@ impl AIChatService {
              65536
          } else if m_lower.contains("claude") {
              64000
@@ -2170,7 +2236,7 @@ index 3b94755..58e27fd 100644
              65536
          } else {
              16384
-@@ -1360,124 +1876,157 @@ impl AIChatService {
+@@ -1360,124 +1897,157 @@ impl AIChatService {
              }))
              .timeout(Duration::from_secs(180));
  
@@ -2405,7 +2471,7 @@ index 3b94755..58e27fd 100644
                  }
              }
          }
-@@ -1493,7 +2042,10 @@ impl AIChatService {
+@@ -1493,7 +2063,10 @@ impl AIChatService {
              let think_re = regex::Regex::new(r"(?s)<think>(.*?)</think>").unwrap();
              if let Some(caps) = think_re.captures(&accumulated_raw) {
                  thinking_text = caps.get(1).map(|m| m.as_str().trim().to_string());
@@ -2417,7 +2483,7 @@ index 3b94755..58e27fd 100644
              } else if accumulated_raw.contains("<think>") {
                  let parts: Vec<&str> = accumulated_raw.split("<think>").collect();
                  let before_think = parts[0].trim();
-@@ -1509,7 +2061,10 @@ impl AIChatService {
+@@ -1509,7 +2082,10 @@ impl AIChatService {
          }
  
          let tag_clean_re = regex::Regex::new(r"(?i)</?think>").unwrap();
@@ -2429,7 +2495,7 @@ index 3b94755..58e27fd 100644
  
          if answer_text.is_empty() {
              if let Some(ref th) = thinking_text {
-@@ -1517,51 +2072,73 @@ impl AIChatService {
+@@ -1517,51 +2093,73 @@ impl AIChatService {
              }
          }
  
@@ -2531,7 +2597,7 @@ index 3b94755..58e27fd 100644
      }
  
      // ==========================================
-@@ -1594,7 +2171,11 @@ impl AIChatService {
+@@ -1594,7 +2192,11 @@ impl AIChatService {
                      }))
                      .timeout(Duration::from_secs(45));
  
@@ -2544,7 +2610,7 @@ index 3b94755..58e27fd 100644
                      req = req.header("Authorization", format!("Bearer {}", p.api_key));
                  }
  
-@@ -1602,16 +2183,29 @@ impl AIChatService {
+@@ -1602,16 +2204,29 @@ impl AIChatService {
                      if resp.status().is_success() {
                          if let Ok(res_json) = resp.json::<Value>().await {
                              if let Some(data) = res_json.get("data").and_then(|d| d.get(0)) {
@@ -2579,7 +2645,7 @@ index 3b94755..58e27fd 100644
                                              }
                                          }
                                      }
-@@ -1623,28 +2217,61 @@ impl AIChatService {
+@@ -1623,28 +2238,61 @@ impl AIChatService {
              }
          }
  
@@ -2647,7 +2713,7 @@ index 3b94755..58e27fd 100644
                  } else {
                      (false, None, format!("Gagal membuat gambar: {e}"))
                  }
-@@ -1652,3 +2279,31 @@ impl AIChatService {
+@@ -1652,3 +2300,31 @@ impl AIChatService {
          }
      }
  }
@@ -2680,7 +2746,7 @@ index 3b94755..58e27fd 100644
 +    }
 +}
 diff --git a/src/bot/client.rs b/src/bot/client.rs
-index 48d558b..a6cb9b7 100644
+index 48d558b..a7748b5 100644
 --- a/src/bot/client.rs
 +++ b/src/bot/client.rs
 @@ -1,16 +1,34 @@
@@ -2772,7 +2838,7 @@ index 48d558b..a6cb9b7 100644
 +        if info
 +            .file_size
 +            .and_then(|size| usize::try_from(size).ok())
-+            .map_or(false, |size| size > MAX_TELEGRAM_DOWNLOAD_BYTES)
++            .is_some_and(|size| size > MAX_TELEGRAM_DOWNLOAD_BYTES)
 +        {
 +            warn!(
 +                "Telegram file rejected before download: size exceeds Xiao limit of {} bytes",
@@ -2896,15 +2962,16 @@ index 48d558b..a6cb9b7 100644
      // ==========================================
  
      pub async fn send_rich_message_draft(
-@@ -372,12 +449,19 @@ impl TelegramBotClient {
+@@ -371,13 +448,18 @@ impl TelegramBotClient {
+             }
              // Fallback to sendMessageDraft
              let mut fallback_text = "Thinking...".to_string();
-             if let Some(first_b) = rich_message.blocks.first() {
+-            if let Some(first_b) = rich_message.blocks.first() {
 -                if let RichBlock::Thinking { ref text, .. } = first_b {
 -                    fallback_text = text.clone();
-+                if let RichBlock::Thinking { text } = first_b {
-+                    fallback_text = text.as_str().unwrap_or("Thinking...").to_string();
-                 }
+-                }
++            if let Some(RichBlock::Thinking { text }) = rich_message.blocks.first() {
++                fallback_text = text.as_str().unwrap_or("Thinking...").to_string();
              }
              return self
 -                .send_message_draft(chat_id, draft_id, &fallback_text, Some("HTML"), can_stop, keep_on_stop)
@@ -2919,7 +2986,7 @@ index 48d558b..a6cb9b7 100644
                  .await;
          }
  
-@@ -422,7 +506,13 @@ impl TelegramBotClient {
+@@ -422,7 +504,13 @@ impl TelegramBotClient {
              payload["reply_markup"] = rm.clone();
          }
          if let Some(recv) = receiver_user_id {
@@ -2934,7 +3001,7 @@ index 48d558b..a6cb9b7 100644
          }
  
          let res = self.post_json("sendRichMessage", payload).await?;
-@@ -463,55 +553,57 @@ impl TelegramBotClient {
+@@ -463,57 +551,61 @@ impl TelegramBotClient {
      // HTML Rendering Helpers & Chunking
      // ==========================================
  
@@ -3026,8 +3093,12 @@ index 48d558b..a6cb9b7 100644
 +    ) -> Vec<String> {
          let mut chunks = Vec::new();
          let mut current_text = String::new();
++        let tag_clean_re =
++            regex::Regex::new(r"</?[^>]+>").expect("static HTML tag regex must compile");
  
-@@ -521,19 +613,39 @@ impl TelegramBotClient {
+         for block in blocks {
+             let b_html = self.render_single_block_html(block);
+@@ -521,19 +613,38 @@ impl TelegramBotClient {
                  continue;
              }
  
@@ -3044,7 +3115,6 @@ index 48d558b..a6cb9b7 100644
 +                // Never split raw Telegram HTML in the middle of a tag/entity.
 +                // Oversized single blocks degrade to escaped plain text chunks;
 +                // correctness is preferable to a parse-mode rejection.
-+                let tag_clean_re = regex::Regex::new(r"</?[^>]+>").unwrap();
 +                let stripped = tag_clean_re.replace_all(&b_html, "").into_owned();
 +                let plain = html_escape::decode_html_entities(&stripped).into_owned();
 +                let mut escaped_chunk = String::new();
@@ -3072,7 +3142,7 @@ index 48d558b..a6cb9b7 100644
                  chunks.push(current_text.trim().to_string());
                  current_text.clear();
              }
-@@ -579,7 +691,8 @@ impl TelegramBotClient {
+@@ -579,14 +690,15 @@ impl TelegramBotClient {
              RichBlock::Preformatted { text, language } => {
                  let lang_attr = language
                      .as_ref()
@@ -3082,7 +3152,15 @@ index 48d558b..a6cb9b7 100644
                      .unwrap_or_default();
                  let esc = html_escape::encode_text(text);
                  format!("<pre{lang_attr}>{esc}</pre>\n")
-@@ -609,12 +722,24 @@ impl TelegramBotClient {
+             }
+             RichBlock::List { items } => {
+                 let mut list_lines = Vec::new();
+-                for (_idx, item) in items.iter().enumerate() {
++                for item in items {
+                     let item_str = if let Some(obj) = item.as_object() {
+                         if let Some(b) = obj.get("blocks") {
+                             self.rich_value_to_html(b)
+@@ -609,12 +721,24 @@ impl TelegramBotClient {
                  }
                  format!("<blockquote>{q_text}</blockquote>\n")
              }
@@ -3108,7 +3186,7 @@ index 48d558b..a6cb9b7 100644
                  let ascii_tbl = self.render_table_to_ascii(cells, *has_header);
                  if !ascii_tbl.is_empty() {
                      format!("\n{ascii_tbl}\n")
-@@ -622,13 +747,31 @@ impl TelegramBotClient {
+@@ -622,13 +746,31 @@ impl TelegramBotClient {
                      String::new()
                  }
              }
@@ -3127,7 +3205,9 @@ index 48d558b..a6cb9b7 100644
 +                    .and_then(Value::as_str)
 +                    .unwrap_or("document");
 +                format!("📄 <code>{}</code>\n", html_escape::encode_text(label))
-+            }
+             }
+-            RichBlock::Thinking { text, .. } => {
+-                let t_esc = html_escape::encode_text(text);
 +            RichBlock::Details {
 +                summary, blocks, ..
 +            } => {
@@ -3138,15 +3218,13 @@ index 48d558b..a6cb9b7 100644
 +                    .collect::<Vec<_>>()
 +                    .join("\n");
 +                format!("<blockquote expandable><b>{summary_html}</b>\n{body_html}</blockquote>\n")
-             }
--            RichBlock::Thinking { text, .. } => {
--                let t_esc = html_escape::encode_text(text);
++            }
 +            RichBlock::Thinking { text } => {
 +                let t_esc = self.rich_value_to_html(text);
                  format!("<blockquote expandable>💭 <b>Thinking:</b>\n{t_esc}</blockquote>\n")
              }
              RichBlock::Anchor { .. } => String::new(),
-@@ -637,8 +780,11 @@ impl TelegramBotClient {
+@@ -637,8 +779,11 @@ impl TelegramBotClient {
  
      fn rich_value_to_html(&self, v: &Value) -> String {
          match v {
@@ -3160,7 +3238,7 @@ index 48d558b..a6cb9b7 100644
              Value::Object(obj) => {
                  let t = obj.get("type").and_then(|s| s.as_str()).unwrap_or("");
                  let inner = obj
-@@ -651,7 +797,8 @@ impl TelegramBotClient {
+@@ -651,7 +796,8 @@ impl TelegramBotClient {
                      "code" => format!("<code>{inner}</code>"),
                      "url" => {
                          let url = obj.get("url").and_then(|s| s.as_str()).unwrap_or("#");
@@ -3170,7 +3248,7 @@ index 48d558b..a6cb9b7 100644
                      }
                      "strike" => format!("<s>{inner}</s>"),
                      "underline" => format!("<u>{inner}</u>"),
-@@ -666,7 +813,10 @@ impl TelegramBotClient {
+@@ -666,7 +812,10 @@ impl TelegramBotClient {
      fn rich_value_to_plain(&self, v: &Value) -> String {
          match v {
              Value::String(s) => s.clone(),
@@ -3182,7 +3260,7 @@ index 48d558b..a6cb9b7 100644
              Value::Object(obj) => {
                  if let Some(text) = obj.get("text") {
                      self.rich_value_to_plain(text)
-@@ -833,3 +983,39 @@ impl TelegramBotClient {
+@@ -833,3 +982,39 @@ impl TelegramBotClient {
          format!("<pre><code>{}</code></pre>", table_lines.join("\n"))
      }
  }
@@ -3223,7 +3301,7 @@ index 48d558b..a6cb9b7 100644
 +    }
 +}
 diff --git a/src/bot/models.rs b/src/bot/models.rs
-index 89bbfd6..c82e638 100644
+index 89bbfd6..c5fcf7b 100644
 --- a/src/bot/models.rs
 +++ b/src/bot/models.rs
 @@ -11,29 +11,58 @@ use serde_json::Value;
@@ -3317,6 +3395,15 @@ index 89bbfd6..c82e638 100644
  }
  
  impl ReplyKeyboardMarkup {
+@@ -99,7 +138,7 @@ impl ReplyKeyboardMarkup {
+             .into_iter()
+             .map(|row| {
+                 row.into_iter()
+-                    .map(|btn| KeyboardButton::new(btn))
++                    .map(KeyboardButton::new)
+                     .collect()
+             })
+             .collect();
 @@ -111,6 +150,7 @@ impl ReplyKeyboardMarkup {
              one_time_keyboard: Some(false),
              input_field_placeholder: placeholder.map(|s| s.to_string()),
@@ -3557,10 +3644,10 @@ index 89bbfd6..c82e638 100644
 +    }
 +}
 diff --git a/src/main.rs b/src/main.rs
-index a77b3ea..6b647ec 100644
+index a77b3ea..7d68236 100644
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -2,30 +2,72 @@ mod ai;
+@@ -2,30 +2,85 @@ mod ai;
  mod bot;
  mod parser;
  mod timeline;
@@ -3596,6 +3683,19 @@ index a77b3ea..6b647ec 100644
  
  type UserLastImagePrompt = Arc<RwLock<HashMap<i64, String>>>;
  
++struct ChatInput<'a> {
++    prompt: &'a str,
++    image_bytes: Option<Vec<u8>>,
++    mime_type: Option<&'a str>,
++    doc_text: Option<&'a str>,
++    doc_name: Option<&'a str>,
++    audio_bytes: Option<Vec<u8>>,
++    audio_mime: Option<&'a str>,
++    video_bytes: Option<Vec<u8>>,
++    video_mime: Option<&'a str>,
++    video_duration: Option<i32>,
++}
++
 +#[derive(Clone, Debug)]
 +struct AccessPolicy {
 +    owner_user_id: i64,
@@ -3639,7 +3739,7 @@ index a77b3ea..6b647ec 100644
  fn get_config_path() -> std::path::PathBuf {
      // 1. Current working directory .env
      if Path::new(".env").exists() {
-@@ -157,9 +199,13 @@ pub fn terminal_interactive_select(
+@@ -157,9 +212,13 @@ pub fn terminal_interactive_select(
                  query
              ));
          } else {
@@ -3655,7 +3755,7 @@ index a77b3ea..6b647ec 100644
  
          if filtered.is_empty() {
              buffer.push("  \x1b[38;5;203mNo items matching filter.\x1b[0m".to_string());
-@@ -186,10 +232,16 @@ pub fn terminal_interactive_select(
+@@ -186,10 +245,16 @@ pub fn terminal_interactive_select(
                  }
              }
              if end_idx < filtered.len() {
@@ -3674,7 +3774,7 @@ index a77b3ea..6b647ec 100644
  
          // Clear and print at top of alternate screen
          let _ = execute!(
-@@ -201,7 +253,10 @@ pub fn terminal_interactive_select(
+@@ -201,7 +266,10 @@ pub fn terminal_interactive_select(
          let _ = stdout.flush();
  
          // Read event
@@ -3686,7 +3786,18 @@ index a77b3ea..6b647ec 100644
              if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
                  return None;
              }
-@@ -246,7 +301,12 @@ pub fn terminal_interactive_select(
+@@ -215,9 +283,7 @@ pub fn terminal_interactive_select(
+                     }
+                 }
+                 KeyCode::Up => {
+-                    if selected_pos > 0 {
+-                        selected_pos -= 1;
+-                    }
++                    selected_pos = selected_pos.saturating_sub(1);
+                 }
+                 KeyCode::Down => {
+                     if !filtered.is_empty() && selected_pos + 1 < filtered.len() {
+@@ -246,7 +312,12 @@ pub fn terminal_interactive_select(
      }
  }
  
@@ -3700,7 +3811,7 @@ index a77b3ea..6b647ec 100644
      if items.is_empty() {
          return None;
      }
-@@ -264,50 +324,108 @@ fn terminal_interactive_multi_select(title: &str, items: &[String], selected: &[
+@@ -264,50 +335,108 @@ fn terminal_interactive_multi_select(title: &str, items: &[String], selected: &[
              (0..items.len()).collect()
          } else {
              let q = query.to_lowercase();
@@ -3824,7 +3935,7 @@ index a77b3ea..6b647ec 100644
                  KeyCode::Char(' ') => {
                      if let Some(&idx) = filtered.get(cursor_idx) {
                          if picked[idx] || picked.iter().filter(|v| **v).count() < max_selected {
-@@ -315,9 +433,25 @@ fn terminal_interactive_multi_select(title: &str, items: &[String], selected: &[
+@@ -315,9 +444,25 @@ fn terminal_interactive_multi_select(title: &str, items: &[String], selected: &[
                          }
                      }
                  }
@@ -3853,7 +3964,7 @@ index a77b3ea..6b647ec 100644
                  _ => {}
              }
          }
-@@ -383,7 +517,9 @@ async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Option<String>
+@@ -383,7 +528,9 @@ async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Option<String>
  
      // Step 4: Fetch & Select Model via Arrow Keys
      println!("\n\x1b[38;5;244mConnecting to endpoint {endpoint} & fetching models...\x1b[0m");
@@ -3864,7 +3975,7 @@ index a77b3ea..6b647ec 100644
  
      if !ok {
          let err = res.err().unwrap_or_else(|| "Unknown error".to_string());
-@@ -392,7 +528,10 @@ async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Option<String>
+@@ -392,7 +539,10 @@ async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Option<String>
      }
  
      let models = res.unwrap_or_else(|_| vec!["gpt-4o".to_string()]);
@@ -3876,7 +3987,7 @@ index a77b3ea..6b647ec 100644
  
      let selected_idx = terminal_interactive_select(
          "⚡ Select Active AI Model for This Provider:",
-@@ -405,7 +544,10 @@ async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Option<String>
+@@ -405,7 +555,10 @@ async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Option<String>
      let active_model = if let Some(idx) = selected_idx {
          models[idx].clone()
      } else {
@@ -3888,7 +3999,7 @@ index a77b3ea..6b647ec 100644
      };
  
      use rand::Rng;
-@@ -434,7 +576,10 @@ async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Option<String>
+@@ -434,7 +587,10 @@ async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Option<String>
      let _ = save_env_kv("AI_API_KEY", &api_key);
      let _ = save_env_kv("AI_MODEL", &active_model);
  
@@ -3900,7 +4011,7 @@ index a77b3ea..6b647ec 100644
  
      // Step 5: Telegram Bot Token
      println!("\n\x1b[1;37m[2/3] Configure Telegram Bot Token\x1b[0m");
-@@ -466,13 +611,18 @@ async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Option<String>
+@@ -466,13 +622,18 @@ async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Option<String>
              Ok(resp) if resp.ok && resp.result.is_some() => {
                  let bot_info = resp.result.unwrap();
                  let username = bot_info.username.unwrap_or_else(|| "Unknown".to_string());
@@ -3921,7 +4032,7 @@ index a77b3ea..6b647ec 100644
                  println!("\x1b[1;31m[FAIL] Invalid token: {desc}\x1b[0m");
              }
              Err(e) => {
-@@ -481,11 +631,35 @@ async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Option<String>
+@@ -481,11 +642,35 @@ async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Option<String>
          }
      };
  
@@ -3960,7 +4071,7 @@ index a77b3ea..6b647ec 100644
      println!("\n\x1b[1;32m🎉 Everything is set up! Run 'xiao start' to launch the bot.\x1b[0m\n");
  
      Some(final_token)
-@@ -497,7 +671,9 @@ async fn get_or_prompt_token(ai_service: &AIChatService) -> Option<String> {
+@@ -497,7 +682,9 @@ async fn get_or_prompt_token(ai_service: &AIChatService) -> Option<String> {
              return Some(token);
          }
      }
@@ -3971,7 +4082,7 @@ index a77b3ea..6b647ec 100644
      run_cli_quickstart_wizard(ai_service).await
  }
  
-@@ -520,7 +696,9 @@ async fn run_cli_provider_add(ai_service: &AIChatService) {
+@@ -520,7 +707,9 @@ async fn run_cli_provider_add(ai_service: &AIChatService) {
          return;
      }
      let endpoint = endpoint_input.trim().trim_end_matches('/').to_string();
@@ -3982,7 +4093,7 @@ index a77b3ea..6b647ec 100644
          println!("\x1b[1;31m[ERROR] Invalid endpoint URL format!\x1b[0m");
          return;
      }
-@@ -542,7 +720,9 @@ async fn run_cli_provider_add(ai_service: &AIChatService) {
+@@ -542,7 +731,9 @@ async fn run_cli_provider_add(ai_service: &AIChatService) {
      let alias = alias_input.trim().to_string();
  
      println!("\n\x1b[38;5;244mConnecting to endpoint {endpoint} & fetching models...\x1b[0m");
@@ -3993,7 +4104,7 @@ index a77b3ea..6b647ec 100644
  
      if !ok {
          let err = res.err().unwrap_or_else(|| "Unknown error".to_string());
-@@ -551,7 +731,10 @@ async fn run_cli_provider_add(ai_service: &AIChatService) {
+@@ -551,7 +742,10 @@ async fn run_cli_provider_add(ai_service: &AIChatService) {
      }
  
      let models = res.unwrap_or_else(|_| vec!["gpt-4o".to_string()]);
@@ -4005,7 +4116,7 @@ index a77b3ea..6b647ec 100644
  
      let selected_idx = terminal_interactive_select(
          "Select Active AI Model for This Provider:",
-@@ -564,7 +747,10 @@ async fn run_cli_provider_add(ai_service: &AIChatService) {
+@@ -564,7 +758,10 @@ async fn run_cli_provider_add(ai_service: &AIChatService) {
      let active_model = if let Some(idx) = selected_idx {
          models[idx].clone()
      } else {
@@ -4017,7 +4128,7 @@ index a77b3ea..6b647ec 100644
      };
  
      let clean_alias = if alias.is_empty() {
-@@ -603,9 +789,12 @@ async fn run_cli_provider_add(ai_service: &AIChatService) {
+@@ -603,9 +800,12 @@ async fn run_cli_provider_add(ai_service: &AIChatService) {
      let _ = save_env_kv("AI_API_KEY", &api_key);
      let _ = save_env_kv("AI_MODEL", &active_model);
  
@@ -4032,7 +4143,7 @@ index a77b3ea..6b647ec 100644
  }
  
  async fn run_cli_provider_remove(_ai_service: &AIChatService) {
-@@ -628,13 +817,8 @@ async fn run_cli_provider_remove(_ai_service: &AIChatService) {
+@@ -628,13 +828,8 @@ async fn run_cli_provider_remove(_ai_service: &AIChatService) {
          })
          .collect();
  
@@ -4048,7 +4159,7 @@ index a77b3ea..6b647ec 100644
  
      if let Some(idx) = selected {
          let removed = store.providers.remove(idx);
-@@ -652,7 +836,10 @@ async fn run_cli_provider_remove(_ai_service: &AIChatService) {
+@@ -652,7 +847,10 @@ async fn run_cli_provider_remove(_ai_service: &AIChatService) {
              }
          }
          let _ = save_provider_store(&store);
@@ -4060,7 +4171,7 @@ index a77b3ea..6b647ec 100644
      } else {
          println!("\n\x1b[38;5;244mCancelled.\x1b[0m\n");
      }
-@@ -670,10 +857,19 @@ async fn run_cli_provider_status(_ai_service: &AIChatService) {
+@@ -670,10 +868,19 @@ async fn run_cli_provider_status(_ai_service: &AIChatService) {
      println!("\n\x1b[1;36m== Active Provider Status ==\x1b[0m");
  
      if let Some(p) = active_p {
@@ -4083,7 +4194,7 @@ index a77b3ea..6b647ec 100644
  
          let cap = crate::ai::service::get_model_capabilities(&p.active_model);
          println!("\n\x1b[1;36mCapabilities ({}):\x1b[0m", cap.family);
-@@ -739,13 +935,8 @@ async fn run_cli_provider_menu(ai_service: &AIChatService, action: Option<&str>)
+@@ -739,13 +946,8 @@ async fn run_cli_provider_menu(ai_service: &AIChatService, action: Option<&str>)
          menu_items.push("\x1b[1;31m- Remove Provider\x1b[0m".to_string());
          menu_items.push("\x1b[38;5;244mx Exit\x1b[0m".to_string());
  
@@ -4099,7 +4210,7 @@ index a77b3ea..6b647ec 100644
  
          let Some(idx) = sel else {
              break;
-@@ -756,9 +947,17 @@ async fn run_cli_provider_menu(ai_service: &AIChatService, action: Option<&str>)
+@@ -756,9 +958,17 @@ async fn run_cli_provider_menu(ai_service: &AIChatService, action: Option<&str>)
              let is_act = store.active_id.as_deref() == Some(target_prov.id.as_str());
  
              let meta_guard = ai_service.model_metadata.read().await;
@@ -4119,7 +4230,7 @@ index a77b3ea..6b647ec 100644
  
              let status_tag = if is_act {
                  "\x1b[1;32mACTIVE (Default)\x1b[0m"
-@@ -788,19 +987,19 @@ async fn run_cli_provider_menu(ai_service: &AIChatService, action: Option<&str>)
+@@ -788,19 +998,19 @@ async fn run_cli_provider_menu(ai_service: &AIChatService, action: Option<&str>)
  
              let mut sub_actions = Vec::new();
              if !is_act {
@@ -4148,7 +4259,7 @@ index a77b3ea..6b647ec 100644
  
              let Some(action_idx) = sub_sel else {
                  continue;
-@@ -816,15 +1015,27 @@ async fn run_cli_provider_menu(ai_service: &AIChatService, action: Option<&str>)
+@@ -816,15 +1026,27 @@ async fn run_cli_provider_menu(ai_service: &AIChatService, action: Option<&str>)
                      let _ = save_env_kv("AI_ENDPOINT", &target_prov.endpoint);
                      let _ = save_env_kv("AI_API_KEY", &target_prov.api_key);
                      let _ = save_env_kv("AI_MODEL", &target_prov.active_model);
@@ -4180,7 +4291,7 @@ index a77b3ea..6b647ec 100644
                          if let Some(m_idx) = terminal_interactive_select(
                              &format!("Select Model for '{}':", target_prov.name),
                              &models,
-@@ -834,7 +1045,11 @@ async fn run_cli_provider_menu(ai_service: &AIChatService, action: Option<&str>)
+@@ -834,7 +1056,11 @@ async fn run_cli_provider_menu(ai_service: &AIChatService, action: Option<&str>)
                          ) {
                              let chosen_model = models[m_idx].clone();
                              let mut updated_store = load_provider_store();
@@ -4193,7 +4304,7 @@ index a77b3ea..6b647ec 100644
                                  p.active_model = chosen_model.clone();
                                  p.models = models;
                              }
-@@ -842,13 +1057,20 @@ async fn run_cli_provider_menu(ai_service: &AIChatService, action: Option<&str>)
+@@ -842,13 +1068,20 @@ async fn run_cli_provider_menu(ai_service: &AIChatService, action: Option<&str>)
                              if store.active_id.as_deref() == Some(target_prov.id.as_str()) {
                                  let _ = save_env_kv("AI_MODEL", &chosen_model);
                              }
@@ -4216,7 +4327,7 @@ index a77b3ea..6b647ec 100644
                          let removed = updated_store.providers.remove(pos);
                          if updated_store.active_id.as_deref() == Some(removed.id.as_str()) {
                              if let Some(first_p) = updated_store.providers.first() {
-@@ -864,7 +1086,10 @@ async fn run_cli_provider_menu(ai_service: &AIChatService, action: Option<&str>)
+@@ -864,7 +1097,10 @@ async fn run_cli_provider_menu(ai_service: &AIChatService, action: Option<&str>)
                              }
                          }
                          let _ = save_provider_store(&updated_store);
@@ -4228,7 +4339,7 @@ index a77b3ea..6b647ec 100644
                      }
                  }
                  _ => {}
-@@ -886,16 +1111,31 @@ async fn run_cli_model_probe(ai_service: &AIChatService) {
+@@ -886,16 +1122,31 @@ async fn run_cli_model_probe(ai_service: &AIChatService) {
          return;
      }
      for provider in providers {
@@ -4263,7 +4374,7 @@ index a77b3ea..6b647ec 100644
      }
  }
  
-@@ -913,7 +1153,10 @@ async fn run_cli_model_picker(ai_service: &AIChatService, initial_filter: Option
+@@ -913,7 +1164,10 @@ async fn run_cli_model_picker(ai_service: &AIChatService, initial_filter: Option
  
      for prov in store.providers.iter_mut() {
          if prov.models.len() <= 1 && !prov.endpoint.is_empty() {
@@ -4275,7 +4386,7 @@ index a77b3ea..6b647ec 100644
                  if !fetched.is_empty() {
                      prov.models = fetched;
                  }
-@@ -929,8 +1172,14 @@ async fn run_cli_model_picker(ai_service: &AIChatService, initial_filter: Option
+@@ -929,8 +1183,14 @@ async fn run_cli_model_picker(ai_service: &AIChatService, initial_filter: Option
      for prov in &store.providers {
          let is_prov_active = prov.id == active_prov_id;
          for m in &prov.models {
@@ -4292,7 +4403,7 @@ index a77b3ea..6b647ec 100644
          }
      }
  
-@@ -944,43 +1193,57 @@ async fn run_cli_model_picker(ai_service: &AIChatService, initial_filter: Option
+@@ -944,43 +1204,57 @@ async fn run_cli_model_picker(ai_service: &AIChatService, initial_filter: Option
      let items: Vec<String> = catalog
          .iter()
          .map(|(_, prov_name, model_name, is_act)| {
@@ -4363,7 +4474,7 @@ index a77b3ea..6b647ec 100644
              println!("  \x1b[38;5;244mActivated provider & saved to configuration.\x1b[0m\n");
          }
      } else {
-@@ -992,10 +1255,22 @@ async fn run_cli_status(ai_service: &AIChatService) {
+@@ -992,10 +1266,22 @@ async fn run_cli_status(ai_service: &AIChatService) {
      load_environment();
      println!("\n\x1b[1;36m== XiaoAI System Status ==\x1b[0m");
  
@@ -4390,7 +4501,7 @@ index a77b3ea..6b647ec 100644
  
      println!("\x1b[1;37m1. TELEGRAM BOT API\x1b[0m");
      if token.is_empty() || token == "YOUR_TELEGRAM_BOT_TOKEN_HERE" {
-@@ -1006,10 +1281,16 @@ async fn run_cli_status(ai_service: &AIChatService) {
+@@ -1006,10 +1292,16 @@ async fn run_cli_status(ai_service: &AIChatService) {
              Ok(resp) if resp.ok && resp.result.is_some() => {
                  let info = resp.result.unwrap();
                  let uname = info.username.unwrap_or_else(|| "Unknown".to_string());
@@ -4409,7 +4520,7 @@ index a77b3ea..6b647ec 100644
              }
              Err(e) => {
                  println!("   \x1b[1;31m[FAIL]\x1b[0m BOT_TOKEN: Connection error ({e})");
-@@ -1019,17 +1300,26 @@ async fn run_cli_status(ai_service: &AIChatService) {
+@@ -1019,17 +1311,26 @@ async fn run_cli_status(ai_service: &AIChatService) {
  
      println!("\n\x1b[1;37m2. ACTIVE AI PROVIDER\x1b[0m");
      if endpoint.is_empty() {
@@ -4440,7 +4551,7 @@ index a77b3ea..6b647ec 100644
              } else {
                  println!("   \x1b[38;5;214m[WARN]\x1b[0m Model Verification: Model '{model}' not listed in /models endpoint");
              }
-@@ -1039,7 +1329,9 @@ async fn run_cli_status(ai_service: &AIChatService) {
+@@ -1039,7 +1340,9 @@ async fn run_cli_status(ai_service: &AIChatService) {
          }
  
          let meta_guard = ai_service.model_metadata.read().await;
@@ -4451,7 +4562,7 @@ index a77b3ea..6b647ec 100644
          drop(meta_guard);
          let cap = crate::ai::service::get_model_capabilities_with_meta(&model, metadata.as_ref());
          println!("\n\x1b[1;37m3. MODEL CAPABILITIES ({})\x1b[0m", cap.family);
-@@ -1057,10 +1349,12 @@ async fn run_cli_telegram_check() {
+@@ -1057,10 +1360,12 @@ async fn run_cli_telegram_check() {
      load_environment();
      println!("\n\x1b[1;36m== Telegram Bot Status Check ==\x1b[0m");
  
@@ -4466,7 +4577,7 @@ index a77b3ea..6b647ec 100644
          return;
      }
  
-@@ -1075,9 +1369,17 @@ async fn run_cli_telegram_check() {
+@@ -1075,9 +1380,17 @@ async fn run_cli_telegram_check() {
              println!("  \x1b[1;37mUsername:\x1b[0m \x1b[1;36m@{}\x1b[0m", uname);
              println!("  \x1b[1;37mBot ID:\x1b[0m   {}", info.id);
              println!("  \x1b[1;37mBot Link:\x1b[0m https://t.me/{}", uname);
@@ -4485,7 +4596,7 @@ index a77b3ea..6b647ec 100644
          }
          Err(e) => {
              println!("  \x1b[1;31m[FAIL]\x1b[0m Verification error: {e}");
-@@ -1116,7 +1418,10 @@ async fn run_cli_telegram_bind(manual_token: Option<&str>) {
+@@ -1116,7 +1429,10 @@ async fn run_cli_telegram_bind(manual_token: Option<&str>) {
          Ok(resp) if resp.ok && resp.result.is_some() => {
              let info = resp.result.unwrap();
              let uname = info.username.unwrap_or_else(|| "Unknown".to_string());
@@ -4497,7 +4608,7 @@ index a77b3ea..6b647ec 100644
  
              if let Err(e) = save_token_to_env(&token) {
                  println!("  \x1b[1;31m[ERROR] Failed to save token: {e}\x1b[0m\n");
-@@ -1125,7 +1430,10 @@ async fn run_cli_telegram_bind(manual_token: Option<&str>) {
+@@ -1125,7 +1441,10 @@ async fn run_cli_telegram_bind(manual_token: Option<&str>) {
              }
          }
          Ok(resp) => {
@@ -4509,7 +4620,7 @@ index a77b3ea..6b647ec 100644
          }
          Err(e) => {
              println!("  \x1b[1;31m[FAIL] Verification error: {e}\x1b[0m\n");
-@@ -1143,7 +1451,10 @@ async fn run_cli_telegram_change() {
+@@ -1143,7 +1462,10 @@ async fn run_cli_telegram_change() {
          if let Ok(resp) = temp_bot.get_me().await {
              if let Some(info) = resp.result {
                  let uname = info.username.unwrap_or_else(|| "Unknown".to_string());
@@ -4521,7 +4632,7 @@ index a77b3ea..6b647ec 100644
              }
          }
      }
-@@ -1170,7 +1481,10 @@ async fn run_cli_telegram_change() {
+@@ -1170,7 +1492,10 @@ async fn run_cli_telegram_change() {
          Ok(resp) if resp.ok && resp.result.is_some() => {
              let info = resp.result.unwrap();
              let uname = info.username.unwrap_or_else(|| "Unknown".to_string());
@@ -4533,7 +4644,7 @@ index a77b3ea..6b647ec 100644
  
              if let Err(e) = save_token_to_env(&new_token) {
                  println!("  \x1b[1;31m[ERROR] Failed to save token: {e}\x1b[0m\n");
-@@ -1179,7 +1493,10 @@ async fn run_cli_telegram_change() {
+@@ -1179,7 +1504,10 @@ async fn run_cli_telegram_change() {
              }
          }
          Ok(resp) => {
@@ -4545,7 +4656,7 @@ index a77b3ea..6b647ec 100644
          }
          Err(e) => {
              println!("  \x1b[1;31m[FAIL] Verification error: {e}\x1b[0m\n");
-@@ -1196,7 +1513,10 @@ async fn run_cli_telegram_pick(ai_service: &AIChatService) {
+@@ -1196,7 +1524,10 @@ async fn run_cli_telegram_pick(ai_service: &AIChatService) {
      }
      for provider in &mut store.providers {
          if provider.models.len() <= 1 && !provider.endpoint.is_empty() {
@@ -4557,7 +4668,7 @@ index a77b3ea..6b647ec 100644
                  if !models.is_empty() {
                      provider.models = models;
                  }
-@@ -1206,29 +1526,82 @@ async fn run_cli_telegram_pick(ai_service: &AIChatService) {
+@@ -1206,29 +1537,82 @@ async fn run_cli_telegram_pick(ai_service: &AIChatService) {
      let mut catalog: Vec<(String, String, String)> = Vec::new();
      for provider in &store.providers {
          for model in &provider.models {
@@ -4654,7 +4765,7 @@ index a77b3ea..6b647ec 100644
      }
  }
  
-@@ -1244,6 +1617,9 @@ async fn run_cli_telegram_menu(action: Option<&str>, arg: Option<&str>) {
+@@ -1244,6 +1628,9 @@ async fn run_cli_telegram_menu(action: Option<&str>, arg: Option<&str>) {
          Some("change") | Some("update") => {
              run_cli_telegram_change().await;
          }
@@ -4664,7 +4775,7 @@ index a77b3ea..6b647ec 100644
          _ => {
              run_cli_telegram_check().await;
          }
-@@ -1256,8 +1632,10 @@ fn print_cli_help() {
+@@ -1256,8 +1643,10 @@ fn print_cli_help() {
      println!("  \x1b[36mstart\x1b[0m                               Run Telegram bot");
      println!("  \x1b[36msetup\x1b[0m                               Quickstart setup wizard");
      println!("  \x1b[36mprovider [add] [del] [status]\x1b[0m       Manage AI providers");
@@ -4677,7 +4788,7 @@ index a77b3ea..6b647ec 100644
      println!("  \x1b[36mstatus\x1b[0m                              System health check");
      println!("  \x1b[36mhelp\x1b[0m                                Show this help\n");
  }
-@@ -1268,9 +1646,7 @@ fn print_cli_help() {
+@@ -1268,9 +1657,7 @@ fn print_cli_help() {
  
  fn get_main_menu_keyboard() -> Value {
      serde_json::to_value(ReplyKeyboardMarkup::from_strings(
@@ -4688,7 +4799,7 @@ index a77b3ea..6b647ec 100644
          false,
          true,
          Some("Tanya AI atau pilih menu..."),
-@@ -1283,11 +1659,12 @@ fn get_collapsed_menu_keyboard() -> Value {
+@@ -1283,12 +1670,13 @@ fn get_collapsed_menu_keyboard() -> Value {
  }
  
  fn build_session_manager_inline_keyboard(
@@ -4698,11 +4809,13 @@ index a77b3ea..6b647ec 100644
      page: usize,
      page_size: usize,
  ) -> InlineKeyboardMarkup {
+-    let total_pages = 1.max((sessions_len + page_size - 1) / page_size);
 +    let sessions_len = sessions.len();
-     let total_pages = 1.max((sessions_len + page_size - 1) / page_size);
++    let total_pages = 1.max(sessions_len.div_ceil(page_size));
      let curr_page = 1.max(page.min(total_pages));
  
-@@ -1301,7 +1678,12 @@ fn build_session_manager_inline_keyboard(
+     let start_idx = (curr_page - 1) * page_size;
+@@ -1301,7 +1689,12 @@ fn build_session_manager_inline_keyboard(
          } else {
              format!("{}", i + 1)
          };
@@ -4716,7 +4829,7 @@ index a77b3ea..6b647ec 100644
      }
  
      let mut rows = Vec::new();
-@@ -1315,26 +1697,33 @@ fn build_session_manager_inline_keyboard(
+@@ -1315,26 +1708,33 @@ fn build_session_manager_inline_keyboard(
          let previous_button = if curr_page > 1 {
              InlineKeyboardButton::callback("‹", format!("session_page:{previous_page}"))
          } else {
@@ -4756,7 +4869,7 @@ index a77b3ea..6b647ec 100644
  
      InlineKeyboardMarkup::new(rows)
  }
-@@ -1364,9 +1753,14 @@ async fn build_provider_model_picker(
+@@ -1364,9 +1764,14 @@ async fn build_provider_model_picker(
      // Auto fetch if needed
      for prov in providers.iter_mut() {
          if prov.models.len() <= 1 && !prov.endpoint.is_empty() {
@@ -4773,7 +4886,7 @@ index a77b3ea..6b647ec 100644
                      prov.models = fetched;
                  }
              }
-@@ -1380,13 +1774,16 @@ async fn build_provider_model_picker(
+@@ -1380,13 +1785,16 @@ async fn build_provider_model_picker(
      let is_search = search_query.map(|s| !s.trim().is_empty()).unwrap_or(false);
      let clean_query = search_query.unwrap_or("").trim();
      let q_low = clean_query.to_lowercase();
@@ -4795,7 +4908,7 @@ index a77b3ea..6b647ec 100644
  
      // Aggregate catalog across all target providers: (prov_id, prov_name, orig_model_idx, model_name, is_active)
      let mut display_models: Vec<(String, String, usize, String, bool)> = Vec::new();
-@@ -1395,14 +1792,29 @@ async fn build_provider_model_picker(
+@@ -1395,19 +1803,34 @@ async fn build_provider_model_picker(
          let is_this_prov_active = prov.id == active_prov_id;
          for (orig_idx, m) in prov.models.iter().enumerate() {
              let whitelist_key = format!("{}::{}", prov.id, m);
@@ -4829,7 +4942,13 @@ index a77b3ea..6b647ec 100644
          }
      }
  
-@@ -1421,27 +1833,32 @@ async fn build_provider_model_picker(
+     let total_models = display_models.len();
+-    let total_pages = 1.max((total_models + page_size - 1) / page_size);
++    let total_pages = 1.max(total_models.div_ceil(page_size));
+     let curr_page = 1.max(page.min(total_pages));
+ 
+     let start_idx = (curr_page - 1) * page_size;
+@@ -1421,27 +1844,32 @@ async fn build_provider_model_picker(
      let is_multi_provider = providers.len() > 1;
  
      let text = if is_setup {
@@ -4867,7 +4986,7 @@ index a77b3ea..6b647ec 100644
              )
          }
      } else {
-@@ -1450,16 +1867,24 @@ async fn build_provider_model_picker(
+@@ -1450,16 +1878,24 @@ async fn build_provider_model_picker(
                  "<b>Model</b> (Total <b>{} model</b> dari <b>{} provider</b>)\n\
                   Model aktif saat ini: <code>{}</code> (Halaman {}/{})\n\n\
                   Sentuh salah satu model di bawah untuk langsung mengaktifkannya dalam 1x klik:",
@@ -4895,7 +5014,7 @@ index a77b3ea..6b647ec 100644
              )
          }
      };
-@@ -1483,9 +1908,12 @@ async fn build_provider_model_picker(
+@@ -1483,9 +1919,12 @@ async fn build_provider_model_picker(
          };
  
          if btn_txt.len() > 30 {
@@ -4910,7 +5029,7 @@ index a77b3ea..6b647ec 100644
          if current_row.len() == 2 {
              rows.push(current_row);
              current_row = Vec::new();
-@@ -1500,19 +1928,28 @@ async fn build_provider_model_picker(
+@@ -1500,19 +1939,28 @@ async fn build_provider_model_picker(
      if total_pages > 1 {
          let mut nav_row = Vec::new();
          if curr_page > 1 {
@@ -4945,7 +5064,7 @@ index a77b3ea..6b647ec 100644
      }
  
      (text, InlineKeyboardMarkup::new(rows))
-@@ -1534,7 +1971,9 @@ fn session_last_activity(session: &ai::service::ChatSession) -> String {
+@@ -1534,7 +1982,9 @@ fn session_last_activity(session: &ai::service::ChatSession) -> String {
      };
  
      match &message.content {
@@ -4956,7 +5075,16 @@ index a77b3ea..6b647ec 100644
          _ => session.created_at.clone(),
      }
  }
-@@ -1634,20 +2073,38 @@ async fn send_or_update_session_manager(
+@@ -1549,7 +1999,7 @@ async fn build_session_manager_ui(
+     let active_idx = ai_service.get_active_session_index(user_id).await;
+ 
+     let total_sessions = sessions.len();
+-    let total_pages = 1.max((total_sessions + page_size - 1) / page_size);
++    let total_pages = 1.max(total_sessions.div_ceil(page_size));
+     let curr_page = 1.max(page.min(total_pages));
+ 
+     let start_idx = (curr_page - 1) * page_size;
+@@ -1634,20 +2084,38 @@ async fn send_or_update_session_manager(
      let active_idx = ai_service.get_active_session_index(user_id).await;
  
      let rich_msg = build_session_manager_ui(ai_service, user_id, page, 5).await;
@@ -5001,7 +5129,7 @@ index a77b3ea..6b647ec 100644
          }
      }
  }
-@@ -1686,10 +2143,7 @@ fn to_small_caps(s: &str) -> String {
+@@ -1686,10 +2154,7 @@ fn to_small_caps(s: &str) -> String {
          .collect()
  }
  
@@ -5013,7 +5141,7 @@ index a77b3ea..6b647ec 100644
      let stats = ai_service.get_context_stats(user_id).await;
      let cap = &stats.capabilities;
  
-@@ -1714,40 +2168,57 @@ async fn build_context_monitor_ui(
+@@ -1714,40 +2179,57 @@ async fn build_context_monitor_ui(
  
      let mut cap_cells = Vec::new();
      if cap.vision {
@@ -5088,7 +5216,7 @@ index a77b3ea..6b647ec 100644
          )
      };
  
-@@ -1768,6 +2239,13 @@ async fn build_context_monitor_ui(
+@@ -1768,6 +2250,13 @@ async fn build_context_monitor_ui(
              text: progress_text,
              language: None,
          },
@@ -5102,7 +5230,7 @@ index a77b3ea..6b647ec 100644
      ])
  }
  
-@@ -1780,7 +2258,11 @@ async fn send_or_update_context_monitor(
+@@ -1780,7 +2269,11 @@ async fn send_or_update_context_monitor(
  ) {
      let rich_msg = build_context_monitor_ui(ai_service, user_id).await;
      if let Some(mid) = message_id {
@@ -5115,7 +5243,7 @@ index a77b3ea..6b647ec 100644
              return;
          }
      }
-@@ -1799,11 +2281,29 @@ async fn send_welcome(
+@@ -1799,11 +2292,29 @@ async fn send_welcome(
          let text = "👋 <b>Hi, selamat datang di XiaoAI!</b>\n\n\
                      ⚠️ <i>AI Provider belum dikonfigurasi.</i>\n\
                      Silakan jalankan perintah <code>xiao provider add</code> di terminal untuk menghubungkan provider AI.";
@@ -5137,7 +5265,7 @@ index a77b3ea..6b647ec 100644
 +        let _ = bot
 +            .send_message(
 +                chat_id,
-+                &text,
++                text,
 +                Some("HTML"),
 +                Some(get_main_menu_keyboard()),
 +                None,
@@ -5147,7 +5275,7 @@ index a77b3ea..6b647ec 100644
      }
  }
  
-@@ -1819,10 +2319,24 @@ fn extract_image_intent_prompt(text: &str) -> Option<String> {
+@@ -1819,10 +2330,24 @@ fn extract_image_intent_prompt(text: &str) -> Option<String> {
  
      let t_lower = t.to_lowercase();
      let inquiry_prefixes = [
@@ -5175,14 +5303,19 @@ index a77b3ea..6b647ec 100644
          return None;
      }
  
-@@ -1848,11 +2362,25 @@ fn extract_image_intent_prompt(text: &str) -> Option<String> {
+@@ -1844,15 +2369,30 @@ fn extract_image_intent_prompt(text: &str) -> Option<String> {
+         r"(?i)^(?:please\s+|can you\s+)?(?:generate|create|make|draw|render)\s+(?:me\s+)?(?:an?\s+|the\s+)?(?:image|picture|photo|illustration|drawing|wallpaper|artwork)\s+(?:of\s+|about\s+)?(.+)$",
+     ];
+ 
++    let clean_re =
++        Regex::new(r"(?i)^(?:tentang|mengenai|berupa|of|about|dong|ya|tolong)\s+")
++            .expect("static image intent cleanup regex must compile");
++
+     for pat in patterns {
          if let Some(caps) = Regex::new(pat).unwrap().captures(t) {
              if let Some(extracted_match) = caps.get(1) {
                  let mut extracted = extracted_match.as_str().trim().to_string();
 -                let clean_re = Regex::new(r"(?i)^(?:tentang|mengenai|berupa|of|about|dong|ya|tolong)\s+").unwrap();
-+                let clean_re =
-+                    Regex::new(r"(?i)^(?:tentang|mengenai|berupa|of|about|dong|ya|tolong)\s+")
-+                        .unwrap();
                  extracted = clean_re.replace(&extracted, "").trim().to_string();
  
                  let ext_low = extracted.to_lowercase();
@@ -5203,7 +5336,7 @@ index a77b3ea..6b647ec 100644
                      return Some("__CONTEXT_FOLLOWUP__".to_string());
                  }
                  if extracted.len() >= 3 {
-@@ -1876,7 +2404,17 @@ async fn handle_image_generation(
+@@ -1876,7 +2416,17 @@ async fn handle_image_generation(
      let mut clean_prompt = prompt.trim().to_string();
  
      if clean_prompt == "__CONTEXT_FOLLOWUP__"
@@ -5222,7 +5355,7 @@ index a77b3ea..6b647ec 100644
      {
          let sess = ai_service.get_active_session(user_id).await;
          let mut last_context = String::new();
-@@ -1890,22 +2428,28 @@ async fn handle_image_generation(
+@@ -1890,22 +2440,28 @@ async fn handle_image_generation(
          }
  
          if !last_context.is_empty() {
@@ -5259,7 +5392,7 @@ index a77b3ea..6b647ec 100644
          let _ = bot
              .send_message(
                  chat_id,
-@@ -1925,39 +2469,68 @@ async fn handle_image_generation(
+@@ -1925,39 +2481,68 @@ async fn handle_image_generation(
      }
  
      ai_service.user_wizard_state.write().await.remove(&user_id);
@@ -5337,7 +5470,7 @@ index a77b3ea..6b647ec 100644
      );
  
      let img_kb = InlineKeyboardMarkup::new(vec![
-@@ -1965,7 +2538,10 @@ async fn handle_image_generation(
+@@ -1965,7 +2550,10 @@ async fn handle_image_generation(
              InlineKeyboardButton::callback("🔄 Buat Ulang (Regenerate)", "img_regen"),
              InlineKeyboardButton::callback("🫟 Gambar Baru", "img_new"),
          ],
@@ -5349,10 +5482,34 @@ index a77b3ea..6b647ec 100644
      ]);
  
      let _ = bot
-@@ -2000,8 +2576,19 @@ async fn handle_ai_chat(
-     video_mime: Option<&str>,
-     video_duration: Option<i32>,
+@@ -1989,19 +2577,33 @@ async fn handle_ai_chat(
+     ai_service: &AIChatService,
+     chat_id: i64,
+     user_id: i64,
+-    user_prompt: &str,
+-    image_bytes: Option<Vec<u8>>,
+-    mime_type: Option<&str>,
+-    doc_text: Option<&str>,
+-    doc_name: Option<&str>,
+-    audio_bytes: Option<Vec<u8>>,
+-    audio_mime: Option<&str>,
+-    video_bytes: Option<Vec<u8>>,
+-    video_mime: Option<&str>,
+-    video_duration: Option<i32>,
++    input: ChatInput<'_>,
  ) {
++    let ChatInput {
++        prompt: user_prompt,
++        image_bytes,
++        mime_type,
++        doc_text,
++        doc_name,
++        audio_bytes,
++        audio_mime,
++        video_bytes,
++        video_mime,
++        video_duration,
++    } = input;
 +    let generation_lock = ai_service.generation_lock(user_id).await;
 +    let _generation_guard = generation_lock.lock().await;
 +
@@ -5370,7 +5527,7 @@ index a77b3ea..6b647ec 100644
  
      let (initial_lbl, initial_act) = if video_bytes.is_some() {
          ("Watching", ProgressActivity::Watching)
-@@ -2022,7 +2609,7 @@ async fn handle_ai_chat(
+@@ -2022,23 +2624,27 @@ async fn handle_ai_chat(
  
      let current_model = ai_service.get_user_model(user_id).await;
  
@@ -5378,11 +5535,30 @@ index a77b3ea..6b647ec 100644
 +    let (_thinking, mut answer_text, _cancelled) = ai_service
          .generate_response(
              user_id,
-             user_prompt,
-@@ -2036,9 +2623,11 @@ async fn handle_ai_chat(
-             video_bytes,
-             video_mime,
-             video_duration,
+-            user_prompt,
+-            Some(&timeline),
+-            image_bytes,
+-            mime_type,
+-            doc_text,
+-            doc_name,
+-            audio_bytes,
+-            audio_mime,
+-            video_bytes,
+-            video_mime,
+-            video_duration,
++            ai::service::GenerationInput {
++                prompt: user_prompt,
++                timeline: Some(&timeline),
++                image_bytes,
++                mime_type,
++                doc_text,
++                doc_name,
++                audio_bytes,
++                audio_mime,
++                video_bytes,
++                video_mime,
++                video_duration,
++            },
 +            &mut cancel_rx,
          )
          .await;
@@ -5391,7 +5567,7 @@ index a77b3ea..6b647ec 100644
      timeline.stop_ticker();
  
      if answer_text.trim().is_empty() {
-@@ -2047,12 +2636,30 @@ async fn handle_ai_chat(
+@@ -2047,12 +2653,30 @@ async fn handle_ai_chat(
  
      let full_rich_msg = build_full_rich_message(&answer_text, Some(&current_model));
      let res = bot
@@ -5425,7 +5601,7 @@ index a77b3ea..6b647ec 100644
              .await;
      }
  }
-@@ -2065,13 +2672,35 @@ async fn handle_update(
+@@ -2065,13 +2689,35 @@ async fn handle_update(
      bot: &TelegramBotClient,
      ai_service: &AIChatService,
      user_last_image_prompt: &UserLastImagePrompt,
@@ -5463,11 +5639,22 @@ index a77b3ea..6b647ec 100644
  
          let mut image_bytes = None;
          let mut mime_type = None;
-@@ -2117,25 +2746,87 @@ async fn handle_update(
+@@ -2103,7 +2749,7 @@ async fn handle_update(
+             video_duration = vid.duration;
+             if let Some((data, path)) = bot.get_file_bytes(&vid.file_id).await {
+                 video_bytes = Some(data);
+-                let ext = path.split('.').last().unwrap_or("mp4");
++                let ext = path.split('.').next_back().unwrap_or("mp4");
+                 video_mime = vid.mime_type.or_else(|| Some(format!("video/{ext}")));
+             }
+         } else if let Some(vn) = msg.video_note {
+@@ -2116,26 +2762,88 @@ async fn handle_update(
+             if let Some(largest) = photos.last() {
                  if let Some((data, path)) = bot.get_file_bytes(&largest.file_id).await {
                      image_bytes = Some(data);
-                     let ext = path.split('.').last().unwrap_or("jpeg");
+-                    let ext = path.split('.').last().unwrap_or("jpeg");
 -                    mime_type = Some(if ext == "jpg" { "image/jpeg".to_string() } else { format!("image/{ext}") });
++                    let ext = path.split('.').next_back().unwrap_or("jpeg");
 +                    mime_type = Some(if ext == "jpg" {
 +                        "image/jpeg".to_string()
 +                    } else {
@@ -5561,7 +5748,7 @@ index a77b3ea..6b647ec 100644
                  }
              }
          }
-@@ -2150,13 +2841,30 @@ async fn handle_update(
+@@ -2150,13 +2858,30 @@ async fn handle_update(
              if !text.is_empty() {
                  if ["/cancel", "/batal", "batal", "cancel"].contains(&text.as_str()) {
                      ai_service.user_wizard_state.write().await.remove(&user_id);
@@ -5594,7 +5781,7 @@ index a77b3ea..6b647ec 100644
                      return;
                  }
              }
-@@ -2167,23 +2875,33 @@ async fn handle_update(
+@@ -2167,23 +2892,33 @@ async fn handle_update(
              let guard = ai_service.user_waiting_rename.read().await;
              guard.get(&user_id).copied()
          };
@@ -5633,7 +5820,7 @@ index a77b3ea..6b647ec 100644
                  return;
              }
          }
-@@ -2197,13 +2915,25 @@ async fn handle_update(
+@@ -2197,13 +2932,25 @@ async fn handle_update(
          // Voice audio processing
          if let Some(a_bytes) = audio_bytes {
              let (stt_ok, transcript_res) = ai_service
@@ -5661,7 +5848,7 @@ index a77b3ea..6b647ec 100644
                      return;
                  }
                  let prompt_fmt = format!(
-@@ -2211,7 +2941,20 @@ async fn handle_update(
+@@ -2211,7 +2958,22 @@ async fn handle_update(
                      audio_duration, user_prompt
                  );
                  handle_ai_chat(
@@ -5670,36 +5857,99 @@ index a77b3ea..6b647ec 100644
 +                    ai_service,
 +                    chat_id,
 +                    user_id,
-+                    &prompt_fmt,
-+                    None,
-+                    None,
-+                    None,
-+                    None,
-+                    None,
-+                    None,
-+                    None,
-+                    None,
-+                    None,
++                    ChatInput {
++                        prompt: &prompt_fmt,
++                        image_bytes: None,
++                        mime_type: None,
++                        doc_text: None,
++                        doc_name: None,
++                        audio_bytes: None,
++                        audio_mime: None,
++                        video_bytes: None,
++                        video_mime: None,
++                        video_duration: None,
++                    },
                  )
                  .await;
                  return;
-@@ -2299,9 +3042,32 @@ async fn handle_update(
+@@ -2227,16 +2989,18 @@ async fn handle_update(
+                     ai_service,
+                     chat_id,
+                     user_id,
+-                    &prompt_audio,
+-                    None,
+-                    None,
+-                    None,
+-                    None,
+-                    Some(a_bytes),
+-                    audio_mime.as_deref(),
+-                    None,
+-                    None,
+-                    None,
++                    ChatInput {
++                        prompt: &prompt_audio,
++                        image_bytes: None,
++                        mime_type: None,
++                        doc_text: None,
++                        doc_name: None,
++                        audio_bytes: Some(a_bytes),
++                        audio_mime: audio_mime.as_deref(),
++                        video_bytes: None,
++                        video_mime: None,
++                        video_duration: None,
++                    },
+                 )
+                 .await;
+                 return;
+@@ -2256,16 +3020,18 @@ async fn handle_update(
+                 ai_service,
+                 chat_id,
+                 user_id,
+-                &prompt_video,
+-                None,
+-                None,
+-                None,
+-                None,
+-                None,
+-                None,
+-                Some(v_bytes),
+-                video_mime.as_deref(),
+-                Some(video_duration),
++                ChatInput {
++                    prompt: &prompt_video,
++                    image_bytes: None,
++                    mime_type: None,
++                    doc_text: None,
++                    doc_name: None,
++                    audio_bytes: None,
++                    audio_mime: None,
++                    video_bytes: Some(v_bytes),
++                    video_mime: video_mime.as_deref(),
++                    video_duration: Some(video_duration),
++                },
+             )
+             .await;
+             return;
+@@ -2297,11 +3063,33 @@ async fn handle_update(
+         }
+ 
          // Navigation Commands
-         if text.starts_with("/start") {
-             send_welcome(bot, ai_service, chat_id, user_id).await;
+-        if text.starts_with("/start") {
+-            send_welcome(bot, ai_service, chat_id, user_id).await;
 -        } else if ["📱 Menu", "Menu", "/menu", "🔙 Menu Utama", "🔙 Kembali ke Menu Utama", "Menu Utama", "Main Menu", "main menu", "Main menu"].contains(&text.as_str()) {
-+        } else if [
-+            "📱 Menu",
-+            "Menu",
-+            "/menu",
-+            "🔙 Menu Utama",
-+            "🔙 Kembali ke Menu Utama",
-+            "Menu Utama",
-+            "Main Menu",
-+            "main menu",
-+            "Main menu",
-+        ]
-+        .contains(&text.as_str())
++        if text.starts_with("/start")
++            || [
++                "📱 Menu",
++                "Menu",
++                "/menu",
++                "🔙 Menu Utama",
++                "🔙 Kembali ke Menu Utama",
++                "Menu Utama",
++                "Main Menu",
++                "main menu",
++                "Main menu",
++            ]
++            .contains(&text.as_str())
 +        {
              send_welcome(bot, ai_service, chat_id, user_id).await;
 -        } else if text.starts_with("/new") || ["ɴᴇᴡ", "➕ ɴᴇᴡ", "➕ New", "New", "new", "➕ Chat Baru", "Chat Baru"].contains(&text.as_str()) {
@@ -5718,7 +5968,7 @@ index a77b3ea..6b647ec 100644
              ai_service.create_new_session(user_id, None).await;
              let total_sessions = ai_service.get_sessions(user_id).await.len();
              let target_page = (total_sessions - 1) / 5 + 1;
-@@ -2315,12 +3081,31 @@ async fn handle_update(
+@@ -2315,12 +3103,31 @@ async fn handle_update(
                      None,
                  )
                  .await;
@@ -5754,7 +6004,7 @@ index a77b3ea..6b647ec 100644
              let active_idx = ai_service.get_active_session_index(user_id).await;
              ai_service.remove_session(user_id, active_idx).await;
              let new_active_idx = ai_service.get_active_session_index(user_id).await;
-@@ -2335,34 +3120,82 @@ async fn handle_update(
+@@ -2335,63 +3142,146 @@ async fn handle_update(
                      None,
                  )
                  .await;
@@ -5848,7 +6098,32 @@ index a77b3ea..6b647ec 100644
                  } else {
                      handle_ai_chat(
                          bot,
-@@ -2383,15 +3216,48 @@ async fn handle_update(
+                         ai_service,
+                         chat_id,
+                         user_id,
+-                        &text,
+-                        image_bytes,
+-                        mime_type.as_deref(),
+-                        doc_text.as_deref(),
+-                        doc_name.as_deref(),
+-                        None,
+-                        None,
+-                        None,
+-                        None,
+-                        None,
++                        ChatInput {
++                            prompt: &text,
++                            image_bytes,
++                            mime_type: mime_type.as_deref(),
++                            doc_text: doc_text.as_deref(),
++                            doc_name: doc_name.as_deref(),
++                            audio_bytes: None,
++                            audio_mime: None,
++                            video_bytes: None,
++                            video_mime: None,
++                            video_duration: None,
++                        },
+                     )
                      .await;
                  }
              }
@@ -5902,7 +6177,7 @@ index a77b3ea..6b647ec 100644
              let all_providers = ai_service.get_user_providers(user_id).await;
              let mut found_prov = None;
              for p in &all_providers {
-@@ -2403,12 +3269,18 @@ async fn handle_update(
+@@ -2403,12 +3293,18 @@ async fn handle_update(
  
              if let Some(prov) = found_prov {
                  ai_service.set_active_provider(user_id, &prov.id).await;
@@ -5923,7 +6198,32 @@ index a77b3ea..6b647ec 100644
                          Some("HTML"),
                          Some(get_main_menu_keyboard()),
                          None,
-@@ -2434,14 +3306,33 @@ async fn handle_update(
+@@ -2421,27 +3317,48 @@ async fn handle_update(
+                     ai_service,
+                     chat_id,
+                     user_id,
+-                    &text,
+-                    image_bytes,
+-                    mime_type.as_deref(),
+-                    doc_text.as_deref(),
+-                    doc_name.as_deref(),
+-                    None,
+-                    None,
+-                    None,
+-                    None,
+-                    None,
++                    ChatInput {
++                        prompt: &text,
++                        image_bytes,
++                        mime_type: mime_type.as_deref(),
++                        doc_text: doc_text.as_deref(),
++                        doc_name: doc_name.as_deref(),
++                        audio_bytes: None,
++                        audio_mime: None,
++                        video_bytes: None,
++                        video_mime: None,
++                        video_duration: None,
++                    },
                  )
                  .await;
              }
@@ -5960,7 +6260,7 @@ index a77b3ea..6b647ec 100644
              ai_service.clear_history(user_id).await;
              let _ = bot
                  .send_message(
-@@ -2453,7 +3344,9 @@ async fn handle_update(
+@@ -2453,7 +3370,9 @@ async fn handle_update(
                      None,
                  )
                  .await;
@@ -5971,7 +6271,7 @@ index a77b3ea..6b647ec 100644
              let help_text = "📖 <b>Perintah XiaoAI</b>\n\n\
                               /start — Mulai bot & tampilkan menu\n\
                               /menu — Buka menu utama\n\
-@@ -2465,7 +3358,16 @@ async fn handle_update(
+@@ -2465,7 +3384,16 @@ async fn handle_update(
                               /model [kata kunci] — Pilih atau cari model AI\n\
                               /image [prompt] — Buat gambar AI\n\n\
                               💬 Kirim teks, gambar, dokumen, video, atau voice note untuk mengobrol dengan AI.";
@@ -5989,7 +6289,7 @@ index a77b3ea..6b647ec 100644
          } else {
              let auto_img_prompt = if image_bytes.is_none() && doc_text.is_none() {
                  extract_image_intent_prompt(&text)
-@@ -2474,7 +3376,15 @@ async fn handle_update(
+@@ -2474,23 +3402,33 @@ async fn handle_update(
              };
  
              if let Some(ref img_p) = auto_img_prompt {
@@ -6006,7 +6306,35 @@ index a77b3ea..6b647ec 100644
              } else {
                  handle_ai_chat(
                      bot,
-@@ -2500,6 +3410,9 @@ async fn handle_update(
+                     ai_service,
+                     chat_id,
+                     user_id,
+-                    &text,
+-                    image_bytes,
+-                    mime_type.as_deref(),
+-                    doc_text.as_deref(),
+-                    doc_name.as_deref(),
+-                    None,
+-                    None,
+-                    video_bytes,
+-                    video_mime.as_deref(),
+-                    Some(video_duration),
++                    ChatInput {
++                        prompt: &text,
++                        image_bytes,
++                        mime_type: mime_type.as_deref(),
++                        doc_text: doc_text.as_deref(),
++                        doc_name: doc_name.as_deref(),
++                        audio_bytes: None,
++                        audio_mime: None,
++                        video_bytes,
++                        video_mime: video_mime.as_deref(),
++                        video_duration: Some(video_duration),
++                    },
+                 )
+                 .await;
+             }
+@@ -2500,6 +3438,9 @@ async fn handle_update(
          let cq_data = cq.data.unwrap_or_default();
          let user_id = cq.from.id;
          let chat_id = cq.message.as_ref().map(|m| m.chat.id).unwrap_or(user_id);
@@ -6016,7 +6344,7 @@ index a77b3ea..6b647ec 100644
          let msg_id = cq.message.as_ref().map(|m| m.message_id);
  
          if cq_data == "noop" {
-@@ -2529,26 +3442,122 @@ async fn handle_update(
+@@ -2529,26 +3470,122 @@ async fn handle_update(
              }
          }
  
@@ -6146,7 +6474,7 @@ index a77b3ea..6b647ec 100644
              }
          } else if let Some(idx_str) = cq_data.strip_prefix("session_detail:") {
              if let Ok(idx) = idx_str.parse::<usize>() {
-@@ -2560,22 +3569,39 @@ async fn handle_update(
+@@ -2560,22 +3597,39 @@ async fn handle_update(
                          session.name.trim().to_string()
                      };
                      let detail = format!(
@@ -6193,7 +6521,7 @@ index a77b3ea..6b647ec 100644
                  let _ = bot
                      .send_message(
                          chat_id,
-@@ -2596,7 +3622,9 @@ async fn handle_update(
+@@ -2596,7 +3650,9 @@ async fn handle_update(
              if let Some(mid) = msg_id {
                  let _ = bot.delete_message(chat_id, mid).await;
              }
@@ -6204,7 +6532,7 @@ index a77b3ea..6b647ec 100644
          } else if cq_data == "open_session" {
              let _ = bot.answer_callback_query(&cq_id, None, false).await;
              send_or_update_session_manager(bot, ai_service, chat_id, user_id, None, 1).await;
-@@ -2605,12 +3633,33 @@ async fn handle_update(
+@@ -2605,12 +3661,33 @@ async fn handle_update(
              let prov_id = parts[0];
              let target_page: usize = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(1);
              let _ = bot.answer_callback_query(&cq_id, None, false).await;
@@ -6241,7 +6569,7 @@ index a77b3ea..6b647ec 100644
                  }
              }
          } else if let Some(rest) = cq_data.strip_prefix("set_m:") {
-@@ -2619,68 +3668,151 @@ async fn handle_update(
+@@ -2619,68 +3696,151 @@ async fn handle_update(
                  let prov_id = parts[0];
                  let model_idx: usize = parts[1].parse().unwrap_or(0);
  
@@ -6414,7 +6742,7 @@ index a77b3ea..6b647ec 100644
                      Some("HTML"),
                      Some(get_collapsed_menu_keyboard()),
                      None,
-@@ -2690,7 +3822,9 @@ async fn handle_update(
+@@ -2690,7 +3850,9 @@ async fn handle_update(
              send_or_update_session_manager(bot, ai_service, chat_id, user_id, None, 1).await;
          } else if cq_data == "action_clear" {
              ai_service.clear_history(user_id).await;
@@ -6425,7 +6753,7 @@ index a77b3ea..6b647ec 100644
              let _ = bot
                  .send_message(
                      chat_id,
-@@ -2773,6 +3907,15 @@ async fn main() {
+@@ -2773,6 +3935,15 @@ async fn main() {
          return;
      };
  
@@ -6441,7 +6769,7 @@ index a77b3ea..6b647ec 100644
      let bot = TelegramBotClient::new(token);
      let user_last_image_prompt: UserLastImagePrompt = Arc::new(RwLock::new(HashMap::new()));
  
-@@ -2780,12 +3923,18 @@ async fn main() {
+@@ -2780,12 +3951,18 @@ async fn main() {
      match bot.get_me().await {
          Ok(resp) if resp.ok && resp.result.is_some() => {
              let bot_info = resp.result.unwrap();
@@ -6463,7 +6791,7 @@ index a77b3ea..6b647ec 100644
              return;
          }
          Err(e) => {
-@@ -2822,7 +3971,7 @@ async fn main() {
+@@ -2822,7 +3999,7 @@ async fn main() {
                  println!("\n🛑 Menerima sinyal berhenti. Bot dimatikan secara aman.");
                  break;
              }
@@ -6472,7 +6800,7 @@ index a77b3ea..6b647ec 100644
                  match updates_res {
                      Ok(resp) if resp.ok => {
                          if let Some(updates) = resp.result {
-@@ -2831,9 +3980,10 @@ async fn main() {
+@@ -2831,9 +4008,10 @@ async fn main() {
                                  let bot_clone = bot.clone();
                                  let ai_clone = Arc::clone(&ai_service);
                                  let last_img_clone = Arc::clone(&user_last_image_prompt);
@@ -6485,7 +6813,7 @@ index a77b3ea..6b647ec 100644
                              }
                          }
 diff --git a/src/parser.rs b/src/parser.rs
-index 9cdda24..76198e9 100644
+index 9cdda24..1898750 100644
 --- a/src/parser.rs
 +++ b/src/parser.rs
 @@ -1,9 +1,7 @@
@@ -6567,11 +6895,15 @@ index 9cdda24..76198e9 100644
      let mut blocks: Vec<RichBlock> = Vec::new();
  
      let mut i = 0;
-@@ -434,7 +445,11 @@ pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
+@@ -432,9 +443,13 @@ pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
+         }
+ 
          // 2. Fenced Code Block (```lang ... ```)
-         if stripped.starts_with("```") {
-             let lang = stripped[3..].trim();
+-        if stripped.starts_with("```") {
+-            let lang = stripped[3..].trim();
 -            let language = if lang.is_empty() { None } else { Some(lang.to_string()) };
++        if let Some(after_fence) = stripped.strip_prefix("```") {
++            let lang = after_fence.trim();
 +            let language = if lang.is_empty() {
 +                None
 +            } else {
