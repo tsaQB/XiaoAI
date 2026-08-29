@@ -23,7 +23,7 @@ index e6ae22d..9d47d59 100644
 +# Set ke pollinations hanya jika Anda menyetujui prompt gambar dikirim ke layanan tersebut.
 +IMAGE_FALLBACK_PROVIDER=none
 diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
-index 78b2ffa..1e0bb8b 100644
+index 78b2ffa..9d4b834 100644
 --- a/.github/workflows/build.yml
 +++ b/.github/workflows/build.yml
 @@ -9,65 +9,112 @@ on:
@@ -51,7 +51,7 @@ index 78b2ffa..1e0bb8b 100644
 +      - name: Install Rust
 +        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
 +        with:
-+          toolchain: stable
++          toolchain: 1.98.0
 +          components: rustfmt, clippy
 +
 +      - name: Format
@@ -64,7 +64,7 @@ index 78b2ffa..1e0bb8b 100644
 +        run: cargo test --locked
 +
 +      - name: Clippy
-+        run: cargo clippy --locked --all-targets --all-features
++        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 +
    armbian:
      name: Linux ARM64 (Armbian)
@@ -80,13 +80,13 @@ index 78b2ffa..1e0bb8b 100644
  
        - name: Install ARM64 toolchain
 -        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
++        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
  
        - name: Install Rust target
 -        uses: dtolnay/rust-toolchain@stable
 +        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
          with:
-+          toolchain: stable
++          toolchain: 1.98.0
            targets: aarch64-unknown-linux-gnu
  
        - name: Build
@@ -134,7 +134,7 @@ index 78b2ffa..1e0bb8b 100644
 +      - name: Install Rust target
 +        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
          with:
-+          toolchain: stable
++          toolchain: 1.98.0
            targets: aarch64-linux-android
  
        - name: Install cargo-ndk
@@ -597,7 +597,7 @@ index 2026d17..b136526 100644
 +- Memecah `main.rs` dan `ai/service.rs` menjadi application/domain/repository/provider modules yang lebih kecil.
 +- Mengganti parser SSE custom dengan parser event-stream yang lebih battle-tested dan menambah retry/backoff 429/5xx.
 diff --git a/src/ai/service.rs b/src/ai/service.rs
-index 3b94755..1faea6e 100644
+index 3b94755..ac00856 100644
 --- a/src/ai/service.rs
 +++ b/src/ai/service.rs
 @@ -1,22 +1,21 @@
@@ -644,16 +644,17 @@ index 3b94755..1faea6e 100644
              if let Ok(store) = serde_json::from_str(&value) {
                  return store;
              }
-@@ -65,7 +68,7 @@ pub fn load_provider_store() -> ProviderStore {
+@@ -64,8 +67,7 @@ pub fn load_provider_store() -> ProviderStore {
+ }
  
  pub fn save_provider_store(store: &ProviderStore) -> std::io::Result<()> {
-     let json_str = serde_json::to_string_pretty(store)
+-    let json_str = serde_json::to_string_pretty(store)
 -        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-+        .map_err(std::io::Error::other)?;
++    let json_str = serde_json::to_string_pretty(store).map_err(std::io::Error::other)?;
      let conn = open_session_db().map_err(|e| std::io::Error::other(e.to_string()))?;
      conn.execute("INSERT INTO settings(key,value) VALUES('provider_store',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![json_str])
          .map(|_| ())
-@@ -87,7 +90,9 @@ pub struct ChatSession {
+@@ -87,7 +89,9 @@ pub struct ChatSession {
  }
  
  fn session_db_path() -> std::path::PathBuf {
@@ -664,7 +665,7 @@ index 3b94755..1faea6e 100644
      base.join(".local/share/xiaoai/xiaoai.db")
  }
  
-@@ -97,7 +102,8 @@ fn open_session_db() -> rusqlite::Result<Connection> {
+@@ -97,7 +101,8 @@ fn open_session_db() -> rusqlite::Result<Connection> {
          let _ = std::fs::create_dir_all(parent);
      }
      let conn = Connection::open(path)?;
@@ -674,7 +675,7 @@ index 3b94755..1faea6e 100644
          CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS sessions (
              user_id INTEGER NOT NULL, session_id INTEGER NOT NULL, name TEXT NOT NULL,
-@@ -109,37 +115,217 @@ fn open_session_db() -> rusqlite::Result<Connection> {
+@@ -109,37 +114,217 @@ fn open_session_db() -> rusqlite::Result<Connection> {
          );
          CREATE TABLE IF NOT EXISTS active_sessions (
              user_id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL
@@ -901,7 +902,7 @@ index 3b94755..1faea6e 100644
      Ok(())
  }
  
-@@ -172,7 +358,8 @@ pub fn get_model_capabilities(model_name: &str) -> ModelCapability {
+@@ -172,7 +357,8 @@ pub fn get_model_capabilities(model_name: &str) -> ModelCapability {
          } else {
              (1048576, "1,048,576 tokens (1M Masif)".to_string())
          };
@@ -911,7 +912,7 @@ index 3b94755..1faea6e 100644
  
          ModelCapability {
              model_name: model_name.to_string(),
-@@ -181,15 +368,15 @@ pub fn get_model_capabilities(model_name: &str) -> ModelCapability {
+@@ -181,15 +367,15 @@ pub fn get_model_capabilities(model_name: &str) -> ModelCapability {
              context_limit,
              context_str,
              vision: true,
@@ -932,7 +933,7 @@ index 3b94755..1faea6e 100644
              strengths: "Konteks masif (1M-2M), video & audio langsung, kecepatan tinggi, penalaran multimodal adaptif".to_string(),
          }
      } else if m.contains("claude") {
-@@ -200,25 +387,27 @@ pub fn get_model_capabilities(model_name: &str) -> ModelCapability {
+@@ -200,25 +386,27 @@ pub fn get_model_capabilities(model_name: &str) -> ModelCapability {
              context_limit: 200000,
              context_str: "200,000 tokens (200k Luas)".to_string(),
              vision: true,
@@ -970,7 +971,7 @@ index 3b94755..1faea6e 100644
  
          let vision = !(m.contains("codex") && m.contains("spark"));
          let audio = m.contains("audio") || m.contains("realtime");
-@@ -230,16 +419,32 @@ pub fn get_model_capabilities(model_name: &str) -> ModelCapability {
+@@ -230,16 +418,32 @@ pub fn get_model_capabilities(model_name: &str) -> ModelCapability {
              context_limit,
              context_str,
              vision,
@@ -1008,7 +1009,7 @@ index 3b94755..1faea6e 100644
          }
      } else if m.contains("minimax") {
          ModelCapability {
-@@ -249,20 +454,28 @@ pub fn get_model_capabilities(model_name: &str) -> ModelCapability {
+@@ -249,20 +453,28 @@ pub fn get_model_capabilities(model_name: &str) -> ModelCapability {
              context_limit: 245760,
              context_str: "245,760 tokens (245k Luas)".to_string(),
              vision: true,
@@ -1043,7 +1044,7 @@ index 3b94755..1faea6e 100644
          ModelCapability {
              model_name: model_name.to_string(),
              family: "Qwen 2.5 / 2.0 (Alibaba)".to_string(),
-@@ -270,15 +483,15 @@ pub fn get_model_capabilities(model_name: &str) -> ModelCapability {
+@@ -270,15 +482,15 @@ pub fn get_model_capabilities(model_name: &str) -> ModelCapability {
              context_limit: 131072,
              context_str: "131,072 tokens (128k Luas)".to_string(),
              vision: true,
@@ -1063,7 +1064,7 @@ index 3b94755..1faea6e 100644
              strengths: "Keunggulan visual reasoning (Qwen VL/QVQ), coding, instruksi multibahasa tingkat tinggi".to_string(),
          }
      } else if m.contains("deepseek") {
-@@ -292,39 +505,63 @@ pub fn get_model_capabilities(model_name: &str) -> ModelCapability {
+@@ -292,39 +504,63 @@ pub fn get_model_capabilities(model_name: &str) -> ModelCapability {
              context_limit: 128000,
              context_str: "128,000 tokens (128k)".to_string(),
              vision,
@@ -1142,7 +1143,7 @@ index 3b94755..1faea6e 100644
          }
      }
  }
-@@ -372,7 +609,11 @@ pub fn get_capability_registry_path() -> std::path::PathBuf {
+@@ -372,7 +608,11 @@ pub fn get_capability_registry_path() -> std::path::PathBuf {
  
  pub fn load_capability_registry() -> CapabilityRegistry {
      if let Ok(conn) = open_session_db() {
@@ -1155,7 +1156,7 @@ index 3b94755..1faea6e 100644
              if let Ok(registry) = serde_json::from_str(&value) {
                  return registry;
              }
-@@ -388,8 +629,8 @@ pub fn load_capability_registry() -> CapabilityRegistry {
+@@ -388,8 +628,8 @@ pub fn load_capability_registry() -> CapabilityRegistry {
  }
  
  pub fn save_capability_registry(registry: &CapabilityRegistry) -> std::io::Result<()> {
@@ -1166,7 +1167,7 @@ index 3b94755..1faea6e 100644
      let conn = open_session_db().map_err(|e| std::io::Error::other(e.to_string()))?;
      conn.execute("INSERT INTO settings(key,value) VALUES('capability_registry',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![value])
          .map(|_| ())
-@@ -397,7 +638,14 @@ pub fn save_capability_registry(registry: &CapabilityRegistry) -> std::io::Resul
+@@ -397,7 +637,14 @@ pub fn save_capability_registry(registry: &CapabilityRegistry) -> std::io::Resul
  }
  
  pub fn load_app_setting(key: &str) -> Option<String> {
@@ -1182,7 +1183,7 @@ index 3b94755..1faea6e 100644
  }
  
  pub fn save_app_setting(key: &str, value: &str) -> std::io::Result<()> {
-@@ -420,7 +668,10 @@ fn format_number_with_commas(n: usize) -> String {
+@@ -420,7 +667,10 @@ fn format_number_with_commas(n: usize) -> String {
      result.chars().rev().collect()
  }
  
@@ -1194,7 +1195,7 @@ index 3b94755..1faea6e 100644
      let mut cap = get_model_capabilities(model_name);
  
      if let Some(m) = meta {
-@@ -439,12 +690,29 @@ pub fn get_model_capabilities_with_meta(model_name: &str, meta: Option<&ModelMet
+@@ -439,12 +689,29 @@ pub fn get_model_capabilities_with_meta(model_name: &str, meta: Option<&ModelMet
          }
          if let Some(ref mod_str) = m.modalities {
              let mod_low = mod_str.to_lowercase();
@@ -1228,7 +1229,7 @@ index 3b94755..1faea6e 100644
          }
      }
  
-@@ -478,12 +746,32 @@ pub struct ContextStats {
+@@ -478,12 +745,32 @@ pub struct ContextStats {
      pub messages_breakdown: Vec<ContextMessageItem>,
  }
  
@@ -1262,7 +1263,7 @@ index 3b94755..1faea6e 100644
      pub user_waiting_rename: Arc<RwLock<HashMap<i64, usize>>>,
      pub user_rename_msg_id: Arc<RwLock<HashMap<i64, i64>>>,
      pub user_session_msg_id: Arc<RwLock<HashMap<i64, i64>>>,
-@@ -495,7 +783,15 @@ pub struct AIChatService {
+@@ -495,7 +782,15 @@ pub struct AIChatService {
  
  impl AIChatService {
      pub fn new() -> Self {
@@ -1279,7 +1280,7 @@ index 3b94755..1faea6e 100644
              if load_app_setting(key).is_none() {
                  if let Ok(value) = std::env::var(key) {
                      if !value.trim().is_empty() {
-@@ -513,7 +809,9 @@ impl AIChatService {
+@@ -513,7 +808,9 @@ impl AIChatService {
              client,
              user_models: Arc::new(RwLock::new(HashMap::new())),
              user_sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -1290,7 +1291,7 @@ index 3b94755..1faea6e 100644
              user_waiting_rename: Arc::new(RwLock::new(HashMap::new())),
              user_rename_msg_id: Arc::new(RwLock::new(HashMap::new())),
              user_session_msg_id: Arc::new(RwLock::new(HashMap::new())),
-@@ -628,10 +926,17 @@ impl AIChatService {
+@@ -628,10 +925,17 @@ impl AIChatService {
              .collect();
          let provider_id = format!("prov_{}", random_suffix.to_lowercase());
  
@@ -1310,7 +1311,7 @@ index 3b94755..1faea6e 100644
              endpoint: endpoint.trim().trim_end_matches('/').to_string(),
              api_key: api_key.trim().to_string(),
              models,
-@@ -687,7 +992,12 @@ impl AIChatService {
+@@ -687,7 +991,12 @@ impl AIChatService {
          false
      }
  
@@ -1324,7 +1325,7 @@ index 3b94755..1faea6e 100644
          let mut store = load_provider_store();
          if let Some(p) = store.providers.iter_mut().find(|p| p.id == provider_id) {
              p.models = models.clone();
-@@ -704,13 +1014,23 @@ impl AIChatService {
+@@ -704,13 +1013,23 @@ impl AIChatService {
          }
      }
  
@@ -1350,7 +1351,7 @@ index 3b94755..1faea6e 100644
          let mut store = load_provider_store();
          let mut matched_endpoint = String::new();
          let mut matched_key = String::new();
-@@ -758,7 +1078,11 @@ impl AIChatService {
+@@ -758,7 +1077,11 @@ impl AIChatService {
  
          let mut req = self.client.get(&url).timeout(Duration::from_secs(15));
          let trimmed_key = api_key.trim();
@@ -1363,7 +1364,7 @@ index 3b94755..1faea6e 100644
              req = req.header("Authorization", format!("Bearer {trimmed_key}"));
          }
  
-@@ -776,33 +1100,50 @@ impl AIChatService {
+@@ -776,33 +1099,50 @@ impl AIChatService {
                                      if let Some(id_str) = item.get("id").and_then(|s| s.as_str()) {
                                          model_ids.push(id_str.to_string());
  
@@ -1426,7 +1427,7 @@ index 3b94755..1faea6e 100644
                                  for k in data_obj.keys() {
                                      model_ids.push(k.to_string());
                                  }
-@@ -811,23 +1152,50 @@ impl AIChatService {
+@@ -811,23 +1151,50 @@ impl AIChatService {
                              let mut registry = load_capability_registry();
                              let provider_id = clean_endpoint.to_string();
                              for model_id in &model_ids {
@@ -1484,7 +1485,7 @@ index 3b94755..1faea6e 100644
                                      *existing = record;
                                  } else {
                                      registry.models.push(record);
-@@ -841,7 +1209,10 @@ impl AIChatService {
+@@ -841,7 +1208,10 @@ impl AIChatService {
                                  (false, Err("Endpoint berhasil dihubungi, namun tidak ada daftar model yang dikembalikan (data kosong).".to_string()))
                              }
                          }
@@ -1496,7 +1497,7 @@ index 3b94755..1faea6e 100644
                      }
                  } else if status.as_u16() == 401 || status.as_u16() == 403 {
                      (false, Err(format!("HTTP {} Unauthorized: Autentikasi gagal. Mohon periksa kembali API Key Anda.", status.as_u16())))
-@@ -849,12 +1220,24 @@ impl AIChatService {
+@@ -849,12 +1219,24 @@ impl AIChatService {
                      (false, Err(format!("HTTP 404 Not Found: Path /models tidak ditemukan di {clean_endpoint}. Pastikan format endpoint URL benar (misal: https://api.openai.com/v1).")))
                  } else {
                      let err_text = resp.text().await.unwrap_or_default();
@@ -1523,7 +1524,7 @@ index 3b94755..1faea6e 100644
                  } else if e.is_connect() {
                      (false, Err(format!("Gagal terhubung ke {clean_endpoint}. Pastikan host/domain benar dan server aktif.")))
                  } else {
-@@ -871,14 +1254,20 @@ impl AIChatService {
+@@ -871,14 +1253,20 @@ impl AIChatService {
              }
          }
          let models = self.user_models.read().await;
@@ -1546,7 +1547,7 @@ index 3b94755..1faea6e 100644
      }
  
      // ==========================================
-@@ -886,126 +1275,217 @@ impl AIChatService {
+@@ -886,126 +1274,217 @@ impl AIChatService {
      // ==========================================
  
      pub async fn get_sessions(&self, user_id: i64) -> Vec<ChatSession> {
@@ -1841,7 +1842,7 @@ index 3b94755..1faea6e 100644
                  return true;
              }
          }
-@@ -1013,34 +1493,78 @@ impl AIChatService {
+@@ -1013,34 +1492,78 @@ impl AIChatService {
      }
  
      pub async fn rename_session(&self, user_id: i64, index: usize, new_name: &str) -> bool {
@@ -1936,7 +1937,7 @@ index 3b94755..1faea6e 100644
          let cap = get_model_capabilities_with_meta(&active_model, metadata.as_ref());
          let limit_tokens = cap.context_limit;
          let limit_str = cap.context_str.clone();
-@@ -1057,15 +1581,7 @@ impl AIChatService {
+@@ -1057,15 +1580,7 @@ impl AIChatService {
              let toks = (chars / 3).max(1);
              total_chars += chars;
  
@@ -1953,7 +1954,7 @@ index 3b94755..1faea6e 100644
  
              msg_stats.push(ContextMessageItem {
                  index: i + 1,
-@@ -1084,7 +1600,11 @@ impl AIChatService {
+@@ -1084,7 +1599,11 @@ impl AIChatService {
              filled_blocks = 1;
          }
          filled_blocks = filled_blocks.min(10);
@@ -1966,7 +1967,7 @@ index 3b94755..1faea6e 100644
  
          ContextStats {
              session_name: active_sess.name,
-@@ -1095,7 +1615,7 @@ impl AIChatService {
+@@ -1095,7 +1614,7 @@ impl AIChatService {
              limit_tokens,
              limit_str,
              total_messages: active_sess.messages.len(),
@@ -1975,7 +1976,7 @@ index 3b94755..1faea6e 100644
              total_tokens,
              total_chars,
              usage_pct,
-@@ -1114,21 +1634,39 @@ impl AIChatService {
+@@ -1114,21 +1633,39 @@ impl AIChatService {
          audio_bytes: Vec<u8>,
          file_name: &str,
      ) -> (bool, Result<String, String>) {
@@ -2023,7 +2024,7 @@ index 3b94755..1faea6e 100644
              req = req.header("Authorization", format!("Bearer {}", provider.api_key));
          }
  
-@@ -1151,7 +1689,14 @@ impl AIChatService {
+@@ -1151,7 +1688,14 @@ impl AIChatService {
                      (false, Err("ENDPOINT_NOT_SUPPORTED".to_string()))
                  } else {
                      let err_txt = resp.text().await.unwrap_or_default();
@@ -2039,7 +2040,7 @@ index 3b94755..1faea6e 100644
                  }
              }
              Err(e) => (false, Err(format!("Audio transcription error: {e}"))),
-@@ -1165,24 +1710,29 @@ impl AIChatService {
+@@ -1165,24 +1709,29 @@ impl AIChatService {
      pub async fn generate_response(
          &self,
          user_id: i64,
@@ -2081,7 +2082,7 @@ index 3b94755..1faea6e 100644
                  );
              }
          };
-@@ -1193,24 +1743,42 @@ impl AIChatService {
+@@ -1193,24 +1742,42 @@ impl AIChatService {
          } else if !provider.active_model.is_empty() {
              provider.active_model.clone()
          } else {
@@ -2131,7 +2132,7 @@ index 3b94755..1faea6e 100644
          let mut history: Vec<Value> = active_sess
              .messages
              .iter()
-@@ -1222,35 +1790,6 @@ impl AIChatService {
+@@ -1222,35 +1789,6 @@ impl AIChatService {
              history = history[start..].to_vec();
          }
  
@@ -2167,7 +2168,7 @@ index 3b94755..1faea6e 100644
          let mut clean_prompt = prompt.trim().to_string();
          if let Some(doc) = doc_text {
              let d_name = doc_name.unwrap_or("Dokumen");
-@@ -1261,7 +1800,9 @@ impl AIChatService {
+@@ -1261,7 +1799,9 @@ impl AIChatService {
                  format!("{doc_header}{clean_prompt}")
              };
          } else if video_bytes.is_some() && clean_prompt.is_empty() {
@@ -2178,7 +2179,7 @@ index 3b94755..1faea6e 100644
              clean_prompt = format!("Tonton dan analisis rekaman video ini{dur_str} secara mendalam. Jelaskan isi visual, alur peristiwa, teks di layar, dan suara di dalamnya.");
          } else if image_bytes.is_some() && clean_prompt.is_empty() {
              clean_prompt = "Jelaskan dan analisis gambar ini secara detail.".to_string();
-@@ -1269,27 +1810,16 @@ impl AIChatService {
+@@ -1269,27 +1809,16 @@ impl AIChatService {
              clean_prompt = "Dengarkan rekaman suara ini dan jawab pertanyaan atau instruksi di dalamnya secara lengkap.".to_string();
          }
  
@@ -2211,7 +2212,7 @@ index 3b94755..1faea6e 100644
          })];
  
          messages.extend(history);
-@@ -1321,7 +1851,11 @@ impl AIChatService {
+@@ -1321,7 +1850,11 @@ impl AIChatService {
          } else if let Some(a_bytes) = audio_bytes {
              use base64::Engine;
              let b64_audio = base64::engine::general_purpose::STANDARD.encode(&a_bytes);
@@ -2224,7 +2225,7 @@ index 3b94755..1faea6e 100644
              messages.push(json!({
                  "role": "user",
                  "content": [
-@@ -1342,7 +1876,10 @@ impl AIChatService {
+@@ -1342,7 +1875,10 @@ impl AIChatService {
              65536
          } else if m_lower.contains("claude") {
              64000
@@ -2236,7 +2237,7 @@ index 3b94755..1faea6e 100644
              65536
          } else {
              16384
-@@ -1360,124 +1897,157 @@ impl AIChatService {
+@@ -1360,124 +1896,158 @@ impl AIChatService {
              }))
              .timeout(Duration::from_secs(180));
  
@@ -2279,7 +2280,8 @@ index 3b94755..1faea6e 100644
 +                );
                  if let Some(tl) = timeline {
 -                    tl.fail_current(e.to_string()).await;
-+                    tl.fail_current("Provider connection failed".to_string()).await;
++                    tl.fail_current("Provider connection failed".to_string())
++                        .await;
                      tl.sync_draft(true).await;
                  }
 -                return (None, format!("⚠️ Terjadi kendala saat memproses jawaban AI: {e}"));
@@ -2495,7 +2497,7 @@ index 3b94755..1faea6e 100644
  
          if answer_text.is_empty() {
              if let Some(ref th) = thinking_text {
-@@ -1517,51 +2093,73 @@ impl AIChatService {
+@@ -1517,51 +2093,74 @@ impl AIChatService {
              }
          }
  
@@ -2525,7 +2527,8 @@ index 3b94755..1faea6e 100644
 +                tl.fail_current("Stopped by user".to_string()).await;
                  tl.sync_draft(true).await;
 +            } else if stream_interrupted {
-+                tl.fail_current("Provider stream interrupted".to_string()).await;
++                tl.fail_current("Provider stream interrupted".to_string())
++                    .await;
 +                tl.sync_draft(true).await;
 +            } else {
 +                if !has_started_answer {
@@ -2597,7 +2600,7 @@ index 3b94755..1faea6e 100644
      }
  
      // ==========================================
-@@ -1594,7 +2192,11 @@ impl AIChatService {
+@@ -1594,7 +2193,11 @@ impl AIChatService {
                      }))
                      .timeout(Duration::from_secs(45));
  
@@ -2610,7 +2613,7 @@ index 3b94755..1faea6e 100644
                      req = req.header("Authorization", format!("Bearer {}", p.api_key));
                  }
  
-@@ -1602,16 +2204,29 @@ impl AIChatService {
+@@ -1602,16 +2205,29 @@ impl AIChatService {
                      if resp.status().is_success() {
                          if let Ok(res_json) = resp.json::<Value>().await {
                              if let Some(data) = res_json.get("data").and_then(|d| d.get(0)) {
@@ -2645,7 +2648,7 @@ index 3b94755..1faea6e 100644
                                              }
                                          }
                                      }
-@@ -1623,28 +2238,61 @@ impl AIChatService {
+@@ -1623,28 +2239,61 @@ impl AIChatService {
              }
          }
  
@@ -2713,7 +2716,7 @@ index 3b94755..1faea6e 100644
                  } else {
                      (false, None, format!("Gagal membuat gambar: {e}"))
                  }
-@@ -1652,3 +2300,31 @@ impl AIChatService {
+@@ -1652,3 +2301,31 @@ impl AIChatService {
          }
      }
  }
@@ -3301,7 +3304,7 @@ index 48d558b..a7748b5 100644
 +    }
 +}
 diff --git a/src/bot/models.rs b/src/bot/models.rs
-index 89bbfd6..c5fcf7b 100644
+index 89bbfd6..73436a2 100644
 --- a/src/bot/models.rs
 +++ b/src/bot/models.rs
 @@ -11,29 +11,58 @@ use serde_json::Value;
@@ -3395,16 +3398,20 @@ index 89bbfd6..c5fcf7b 100644
  }
  
  impl ReplyKeyboardMarkup {
-@@ -99,7 +138,7 @@ impl ReplyKeyboardMarkup {
+@@ -97,11 +136,7 @@ impl ReplyKeyboardMarkup {
+     ) -> Self {
+         let keyboard = rows
              .into_iter()
-             .map(|row| {
-                 row.into_iter()
+-            .map(|row| {
+-                row.into_iter()
 -                    .map(|btn| KeyboardButton::new(btn))
-+                    .map(KeyboardButton::new)
-                     .collect()
-             })
+-                    .collect()
+-            })
++            .map(|row| row.into_iter().map(KeyboardButton::new).collect())
              .collect();
-@@ -111,6 +150,7 @@ impl ReplyKeyboardMarkup {
+ 
+         Self {
+@@ -111,6 +146,7 @@ impl ReplyKeyboardMarkup {
              one_time_keyboard: Some(false),
              input_field_placeholder: placeholder.map(|s| s.to_string()),
              selective: None,
@@ -3412,7 +3419,7 @@ index 89bbfd6..c5fcf7b 100644
          }
      }
  }
-@@ -149,9 +189,69 @@ impl BotCommand {
+@@ -149,9 +185,69 @@ impl BotCommand {
  }
  
  // ==========================================
@@ -3483,7 +3490,7 @@ index 89bbfd6..c5fcf7b 100644
  #[derive(Debug, Clone, Serialize, Deserialize)]
  pub struct RichBlockTableCell {
      pub text: Value,
-@@ -213,6 +313,13 @@ pub enum RichBlock {
+@@ -213,6 +309,13 @@ pub enum RichBlock {
          blocks: Vec<Value>, // [{"type": "paragraph", "text": ...}]
      },
  
@@ -3497,7 +3504,7 @@ index 89bbfd6..c5fcf7b 100644
      #[serde(rename = "divider")]
      Divider {},
  
-@@ -231,22 +338,33 @@ pub enum RichBlock {
+@@ -231,22 +334,33 @@ pub enum RichBlock {
          caption: Option<String>,
      },
  
@@ -3539,7 +3546,7 @@ index 89bbfd6..c5fcf7b 100644
  }
  
  #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-@@ -282,6 +400,14 @@ pub struct Update {
+@@ -282,6 +396,14 @@ pub struct Update {
      pub update_id: i64,
      pub message: Option<Message>,
      pub callback_query: Option<CallbackQuery>,
@@ -3554,7 +3561,7 @@ index 89bbfd6..c5fcf7b 100644
  }
  
  #[derive(Debug, Clone, Deserialize)]
-@@ -299,6 +425,16 @@ pub struct Message {
+@@ -299,6 +421,16 @@ pub struct Message {
      pub video: Option<Video>,
      pub video_note: Option<VideoNote>,
      pub reply_to_message: Option<Box<Message>>,
@@ -3571,7 +3578,7 @@ index 89bbfd6..c5fcf7b 100644
  }
  
  #[derive(Debug, Clone, Deserialize)]
-@@ -391,3 +527,71 @@ pub struct FileInfo {
+@@ -391,3 +523,71 @@ pub struct FileInfo {
      pub file_size: Option<i64>,
      pub file_path: Option<String>,
  }
@@ -3644,7 +3651,7 @@ index 89bbfd6..c5fcf7b 100644
 +    }
 +}
 diff --git a/src/main.rs b/src/main.rs
-index a77b3ea..7d68236 100644
+index a77b3ea..559306c 100644
 --- a/src/main.rs
 +++ b/src/main.rs
 @@ -2,30 +2,85 @@ mod ai;
@@ -5303,13 +5310,12 @@ index a77b3ea..7d68236 100644
          return None;
      }
  
-@@ -1844,15 +2369,30 @@ fn extract_image_intent_prompt(text: &str) -> Option<String> {
+@@ -1844,15 +2369,29 @@ fn extract_image_intent_prompt(text: &str) -> Option<String> {
          r"(?i)^(?:please\s+|can you\s+)?(?:generate|create|make|draw|render)\s+(?:me\s+)?(?:an?\s+|the\s+)?(?:image|picture|photo|illustration|drawing|wallpaper|artwork)\s+(?:of\s+|about\s+)?(.+)$",
      ];
  
-+    let clean_re =
-+        Regex::new(r"(?i)^(?:tentang|mengenai|berupa|of|about|dong|ya|tolong)\s+")
-+            .expect("static image intent cleanup regex must compile");
++    let clean_re = Regex::new(r"(?i)^(?:tentang|mengenai|berupa|of|about|dong|ya|tolong)\s+")
++        .expect("static image intent cleanup regex must compile");
 +
      for pat in patterns {
          if let Some(caps) = Regex::new(pat).unwrap().captures(t) {
@@ -5336,7 +5342,7 @@ index a77b3ea..7d68236 100644
                      return Some("__CONTEXT_FOLLOWUP__".to_string());
                  }
                  if extracted.len() >= 3 {
-@@ -1876,7 +2416,17 @@ async fn handle_image_generation(
+@@ -1876,7 +2415,17 @@ async fn handle_image_generation(
      let mut clean_prompt = prompt.trim().to_string();
  
      if clean_prompt == "__CONTEXT_FOLLOWUP__"
@@ -5355,7 +5361,7 @@ index a77b3ea..7d68236 100644
      {
          let sess = ai_service.get_active_session(user_id).await;
          let mut last_context = String::new();
-@@ -1890,22 +2440,28 @@ async fn handle_image_generation(
+@@ -1890,22 +2439,28 @@ async fn handle_image_generation(
          }
  
          if !last_context.is_empty() {
@@ -5392,7 +5398,7 @@ index a77b3ea..7d68236 100644
          let _ = bot
              .send_message(
                  chat_id,
-@@ -1925,39 +2481,68 @@ async fn handle_image_generation(
+@@ -1925,39 +2480,68 @@ async fn handle_image_generation(
      }
  
      ai_service.user_wizard_state.write().await.remove(&user_id);
@@ -5470,7 +5476,7 @@ index a77b3ea..7d68236 100644
      );
  
      let img_kb = InlineKeyboardMarkup::new(vec![
-@@ -1965,7 +2550,10 @@ async fn handle_image_generation(
+@@ -1965,7 +2549,10 @@ async fn handle_image_generation(
              InlineKeyboardButton::callback("🔄 Buat Ulang (Regenerate)", "img_regen"),
              InlineKeyboardButton::callback("🫟 Gambar Baru", "img_new"),
          ],
@@ -5482,7 +5488,7 @@ index a77b3ea..7d68236 100644
      ]);
  
      let _ = bot
-@@ -1989,19 +2577,33 @@ async fn handle_ai_chat(
+@@ -1989,19 +2576,33 @@ async fn handle_ai_chat(
      ai_service: &AIChatService,
      chat_id: i64,
      user_id: i64,
@@ -5527,7 +5533,7 @@ index a77b3ea..7d68236 100644
  
      let (initial_lbl, initial_act) = if video_bytes.is_some() {
          ("Watching", ProgressActivity::Watching)
-@@ -2022,23 +2624,27 @@ async fn handle_ai_chat(
+@@ -2022,23 +2623,27 @@ async fn handle_ai_chat(
  
      let current_model = ai_service.get_user_model(user_id).await;
  
@@ -5567,7 +5573,7 @@ index a77b3ea..7d68236 100644
      timeline.stop_ticker();
  
      if answer_text.trim().is_empty() {
-@@ -2047,12 +2653,30 @@ async fn handle_ai_chat(
+@@ -2047,12 +2652,30 @@ async fn handle_ai_chat(
  
      let full_rich_msg = build_full_rich_message(&answer_text, Some(&current_model));
      let res = bot
@@ -5601,7 +5607,7 @@ index a77b3ea..7d68236 100644
              .await;
      }
  }
-@@ -2065,13 +2689,35 @@ async fn handle_update(
+@@ -2065,13 +2688,35 @@ async fn handle_update(
      bot: &TelegramBotClient,
      ai_service: &AIChatService,
      user_last_image_prompt: &UserLastImagePrompt,
@@ -5639,7 +5645,7 @@ index a77b3ea..7d68236 100644
  
          let mut image_bytes = None;
          let mut mime_type = None;
-@@ -2103,7 +2749,7 @@ async fn handle_update(
+@@ -2103,7 +2748,7 @@ async fn handle_update(
              video_duration = vid.duration;
              if let Some((data, path)) = bot.get_file_bytes(&vid.file_id).await {
                  video_bytes = Some(data);
@@ -5648,7 +5654,7 @@ index a77b3ea..7d68236 100644
                  video_mime = vid.mime_type.or_else(|| Some(format!("video/{ext}")));
              }
          } else if let Some(vn) = msg.video_note {
-@@ -2116,26 +2762,88 @@ async fn handle_update(
+@@ -2116,26 +2761,88 @@ async fn handle_update(
              if let Some(largest) = photos.last() {
                  if let Some((data, path)) = bot.get_file_bytes(&largest.file_id).await {
                      image_bytes = Some(data);
@@ -5748,7 +5754,7 @@ index a77b3ea..7d68236 100644
                  }
              }
          }
-@@ -2150,13 +2858,30 @@ async fn handle_update(
+@@ -2150,13 +2857,30 @@ async fn handle_update(
              if !text.is_empty() {
                  if ["/cancel", "/batal", "batal", "cancel"].contains(&text.as_str()) {
                      ai_service.user_wizard_state.write().await.remove(&user_id);
@@ -5781,7 +5787,7 @@ index a77b3ea..7d68236 100644
                      return;
                  }
              }
-@@ -2167,23 +2892,33 @@ async fn handle_update(
+@@ -2167,23 +2891,33 @@ async fn handle_update(
              let guard = ai_service.user_waiting_rename.read().await;
              guard.get(&user_id).copied()
          };
@@ -5820,7 +5826,7 @@ index a77b3ea..7d68236 100644
                  return;
              }
          }
-@@ -2197,13 +2932,25 @@ async fn handle_update(
+@@ -2197,13 +2931,25 @@ async fn handle_update(
          // Voice audio processing
          if let Some(a_bytes) = audio_bytes {
              let (stt_ok, transcript_res) = ai_service
@@ -5848,7 +5854,7 @@ index a77b3ea..7d68236 100644
                      return;
                  }
                  let prompt_fmt = format!(
-@@ -2211,7 +2958,22 @@ async fn handle_update(
+@@ -2211,7 +2957,22 @@ async fn handle_update(
                      audio_duration, user_prompt
                  );
                  handle_ai_chat(
@@ -5872,7 +5878,7 @@ index a77b3ea..7d68236 100644
                  )
                  .await;
                  return;
-@@ -2227,16 +2989,18 @@ async fn handle_update(
+@@ -2227,16 +2988,18 @@ async fn handle_update(
                      ai_service,
                      chat_id,
                      user_id,
@@ -5901,7 +5907,7 @@ index a77b3ea..7d68236 100644
                  )
                  .await;
                  return;
-@@ -2256,16 +3020,18 @@ async fn handle_update(
+@@ -2256,16 +3019,18 @@ async fn handle_update(
                  ai_service,
                  chat_id,
                  user_id,
@@ -5930,7 +5936,7 @@ index a77b3ea..7d68236 100644
              )
              .await;
              return;
-@@ -2297,11 +3063,33 @@ async fn handle_update(
+@@ -2297,11 +3062,33 @@ async fn handle_update(
          }
  
          // Navigation Commands
@@ -5968,7 +5974,7 @@ index a77b3ea..7d68236 100644
              ai_service.create_new_session(user_id, None).await;
              let total_sessions = ai_service.get_sessions(user_id).await.len();
              let target_page = (total_sessions - 1) / 5 + 1;
-@@ -2315,12 +3103,31 @@ async fn handle_update(
+@@ -2315,12 +3102,31 @@ async fn handle_update(
                      None,
                  )
                  .await;
@@ -6004,7 +6010,7 @@ index a77b3ea..7d68236 100644
              let active_idx = ai_service.get_active_session_index(user_id).await;
              ai_service.remove_session(user_id, active_idx).await;
              let new_active_idx = ai_service.get_active_session_index(user_id).await;
-@@ -2335,63 +3142,146 @@ async fn handle_update(
+@@ -2335,63 +3141,146 @@ async fn handle_update(
                      None,
                  )
                  .await;
@@ -6177,7 +6183,7 @@ index a77b3ea..7d68236 100644
              let all_providers = ai_service.get_user_providers(user_id).await;
              let mut found_prov = None;
              for p in &all_providers {
-@@ -2403,12 +3293,18 @@ async fn handle_update(
+@@ -2403,12 +3292,18 @@ async fn handle_update(
  
              if let Some(prov) = found_prov {
                  ai_service.set_active_provider(user_id, &prov.id).await;
@@ -6198,7 +6204,7 @@ index a77b3ea..7d68236 100644
                          Some("HTML"),
                          Some(get_main_menu_keyboard()),
                          None,
-@@ -2421,27 +3317,48 @@ async fn handle_update(
+@@ -2421,27 +3316,48 @@ async fn handle_update(
                      ai_service,
                      chat_id,
                      user_id,
@@ -6260,7 +6266,7 @@ index a77b3ea..7d68236 100644
              ai_service.clear_history(user_id).await;
              let _ = bot
                  .send_message(
-@@ -2453,7 +3370,9 @@ async fn handle_update(
+@@ -2453,7 +3369,9 @@ async fn handle_update(
                      None,
                  )
                  .await;
@@ -6271,7 +6277,7 @@ index a77b3ea..7d68236 100644
              let help_text = "📖 <b>Perintah XiaoAI</b>\n\n\
                               /start — Mulai bot & tampilkan menu\n\
                               /menu — Buka menu utama\n\
-@@ -2465,7 +3384,16 @@ async fn handle_update(
+@@ -2465,7 +3383,16 @@ async fn handle_update(
                               /model [kata kunci] — Pilih atau cari model AI\n\
                               /image [prompt] — Buat gambar AI\n\n\
                               💬 Kirim teks, gambar, dokumen, video, atau voice note untuk mengobrol dengan AI.";
@@ -6289,7 +6295,7 @@ index a77b3ea..7d68236 100644
          } else {
              let auto_img_prompt = if image_bytes.is_none() && doc_text.is_none() {
                  extract_image_intent_prompt(&text)
-@@ -2474,23 +3402,33 @@ async fn handle_update(
+@@ -2474,23 +3401,33 @@ async fn handle_update(
              };
  
              if let Some(ref img_p) = auto_img_prompt {
@@ -6334,7 +6340,7 @@ index a77b3ea..7d68236 100644
                  )
                  .await;
              }
-@@ -2500,6 +3438,9 @@ async fn handle_update(
+@@ -2500,6 +3437,9 @@ async fn handle_update(
          let cq_data = cq.data.unwrap_or_default();
          let user_id = cq.from.id;
          let chat_id = cq.message.as_ref().map(|m| m.chat.id).unwrap_or(user_id);
@@ -6344,7 +6350,7 @@ index a77b3ea..7d68236 100644
          let msg_id = cq.message.as_ref().map(|m| m.message_id);
  
          if cq_data == "noop" {
-@@ -2529,26 +3470,122 @@ async fn handle_update(
+@@ -2529,26 +3469,122 @@ async fn handle_update(
              }
          }
  
@@ -6474,7 +6480,7 @@ index a77b3ea..7d68236 100644
              }
          } else if let Some(idx_str) = cq_data.strip_prefix("session_detail:") {
              if let Ok(idx) = idx_str.parse::<usize>() {
-@@ -2560,22 +3597,39 @@ async fn handle_update(
+@@ -2560,22 +3596,39 @@ async fn handle_update(
                          session.name.trim().to_string()
                      };
                      let detail = format!(
@@ -6521,7 +6527,7 @@ index a77b3ea..7d68236 100644
                  let _ = bot
                      .send_message(
                          chat_id,
-@@ -2596,7 +3650,9 @@ async fn handle_update(
+@@ -2596,7 +3649,9 @@ async fn handle_update(
              if let Some(mid) = msg_id {
                  let _ = bot.delete_message(chat_id, mid).await;
              }
@@ -6532,7 +6538,7 @@ index a77b3ea..7d68236 100644
          } else if cq_data == "open_session" {
              let _ = bot.answer_callback_query(&cq_id, None, false).await;
              send_or_update_session_manager(bot, ai_service, chat_id, user_id, None, 1).await;
-@@ -2605,12 +3661,33 @@ async fn handle_update(
+@@ -2605,12 +3660,33 @@ async fn handle_update(
              let prov_id = parts[0];
              let target_page: usize = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(1);
              let _ = bot.answer_callback_query(&cq_id, None, false).await;
@@ -6569,7 +6575,7 @@ index a77b3ea..7d68236 100644
                  }
              }
          } else if let Some(rest) = cq_data.strip_prefix("set_m:") {
-@@ -2619,68 +3696,151 @@ async fn handle_update(
+@@ -2619,68 +3695,151 @@ async fn handle_update(
                  let prov_id = parts[0];
                  let model_idx: usize = parts[1].parse().unwrap_or(0);
  
@@ -6742,7 +6748,7 @@ index a77b3ea..7d68236 100644
                      Some("HTML"),
                      Some(get_collapsed_menu_keyboard()),
                      None,
-@@ -2690,7 +3850,9 @@ async fn handle_update(
+@@ -2690,7 +3849,9 @@ async fn handle_update(
              send_or_update_session_manager(bot, ai_service, chat_id, user_id, None, 1).await;
          } else if cq_data == "action_clear" {
              ai_service.clear_history(user_id).await;
@@ -6753,7 +6759,7 @@ index a77b3ea..7d68236 100644
              let _ = bot
                  .send_message(
                      chat_id,
-@@ -2773,6 +3935,15 @@ async fn main() {
+@@ -2773,6 +3934,15 @@ async fn main() {
          return;
      };
  
@@ -6769,7 +6775,7 @@ index a77b3ea..7d68236 100644
      let bot = TelegramBotClient::new(token);
      let user_last_image_prompt: UserLastImagePrompt = Arc::new(RwLock::new(HashMap::new()));
  
-@@ -2780,12 +3951,18 @@ async fn main() {
+@@ -2780,12 +3950,18 @@ async fn main() {
      match bot.get_me().await {
          Ok(resp) if resp.ok && resp.result.is_some() => {
              let bot_info = resp.result.unwrap();
@@ -6791,7 +6797,7 @@ index a77b3ea..7d68236 100644
              return;
          }
          Err(e) => {
-@@ -2822,7 +3999,7 @@ async fn main() {
+@@ -2822,7 +3998,7 @@ async fn main() {
                  println!("\n🛑 Menerima sinyal berhenti. Bot dimatikan secara aman.");
                  break;
              }
@@ -6800,7 +6806,7 @@ index a77b3ea..7d68236 100644
                  match updates_res {
                      Ok(resp) if resp.ok => {
                          if let Some(updates) = resp.result {
-@@ -2831,9 +4008,10 @@ async fn main() {
+@@ -2831,9 +4007,10 @@ async fn main() {
                                  let bot_clone = bot.clone();
                                  let ai_clone = Arc::clone(&ai_service);
                                  let last_img_clone = Arc::clone(&user_last_image_prompt);
