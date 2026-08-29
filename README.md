@@ -1,37 +1,24 @@
-# 🤖 XiaoAI - Telegram Bot API 10.2 (Rust Single Binary)
+# XiaoAI
 
-**XiaoAI** adalah asisten AI Telegram berkinerja tinggi yang dibangun dengan **Rust** (single binary mandiri) dan mendukung penuh spesifikasi serta fitur terbaru **Telegram Bot API 10.2**.
+XiaoAI adalah bot Telegram asynchronous berbasis Rust untuk endpoint AI yang kompatibel dengan OpenAI. Aplikasi ini menangani provider/model, session percakapan, streaming timeline, rich message Telegram, gambar, dokumen, audio, dan video dari satu binary.
 
----
+## Fitur Saat Ini
 
-## 🌟 Fitur Unggulan Telegram Bot API 10.2
+- Rich message Telegram menggunakan `sendRichMessage` dan `editMessageText` dengan `rich_message`; jika endpoint rich message menolak request, XiaoAI memakai fallback HTML/monospace.
+- Parser Markdown membentuk blok heading, paragraf, list, quote, code block, math, divider, dan tabel native Telegram.
+- Session manager menampilkan maksimal lima session per halaman, dengan tombol pilih session, pagination saat diperlukan, `Delete`, `Rename`, `New`, dan `Close`.
+- Menu `context` menunjukkan capability model serta penggunaan konteks dengan progress bar monospace.
+- Provider OpenAI-compatible dikelola dari CLI dan katalog model dapat diambil dari endpoint `/models`.
+- Whitelist model Telegram dikelola dari `xiao model pick`; maksimal 10 model, dibedakan berdasarkan provider/alias, dan hanya daftar tersebut yang muncul pada menu model Telegram.
+- Pesan suara ditranskripsi melalui endpoint `/audio/transcriptions` bila provider mendukungnya. Gambar dikirim sebagai data URL ke input vision.
+- Video diteruskan sebagai data URL `video/*` ke input `image_url`. Ini hanya bekerja pada endpoint yang secara eksplisit menerima video pada format tersebut; banyak endpoint OpenAI-compatible menolaknya.
+- Pembuatan gambar memakai endpoint/provider yang tersedia pada konfigurasi.
 
-### 1. **Rich Messages (`InputRichMessage` & Block Formatting)**
-Mendukung penyusunan pesan berbasis blok terstruktur native Telegram:
-*   `InputRichBlockThinking` (Blok proses berpikir/penalaran AI yang expandable)
-*   `InputRichBlockSectionHeading` (Judul & Subjudul level 1-6)
-*   `InputRichBlockParagraph` (Paragraf teks)
-*   `InputRichBlockList` & `InputRichBlockListItem` (Daftar item ordered / unordered)
-*   `InputRichBlockBlockQuotation` & `InputRichBlockPullQuotation` (Kutipan blok & pull quote)
-*   `InputRichBlockPreformatted` (Blok kode dengan syntax highlighting)
-*   `InputRichBlockMathematicalExpression` (Formula matematika LaTeX / ekspresi)
-*   `InputRichBlockTable` & `RichBlockTableCell` (Tabel terstruktur native Telegram)
-*   `InputRichBlockDivider` (Garis pemisah horizontal)
-*   `InputRichBlockFooter` (Catatan kaki / footer pesan)
-*   `InputRichBlockAnchor` (Anchor link dalam pesan)
+## Batasan Multimedia
 
-### 2. **Real-time Live Execution Timeline Engine**
-*   Streaming tahapan proses komputasi AI secara langsung via `sendRichMessageDraft`.
-*   Animasi status aktif (💭 Thinking, 🔎 Searching, 🌐 Fetching, 💻 Coding, ⚙️ Tool, 🧪 Testing, 📑 Table, 🪶 Writing, 🫟 Drawing, 🎥 Watching) dengan elapsed seconds timer real-time.
-*   Finalisasi mulus digantikan oleh pesan permanen `sendRichMessage`.
-
-### 3. **OpenAI-Compatible Custom Provider Manager**
-*   Manajemen provider melalui CLI `xiao provider` untuk menghubungkan berbagai endpoint AI (OpenAI, OpenRouter, Groq, Cliproxy, Ollama, vLLM).
-*   Deteksi model otomatis langsung dari endpoint `/models` dengan 1-click model switcher.
-
-### 4. **Multimodal AI Support & Image Generator**
-*   Mendukung analisis gambar (Vision OCR), dokumen teks, video vision, dan pesan suara (Whisper STT / Native Audio).
-*   Pembuatan gambar resolusi tinggi (FLUX.1 via Pollinations & endpoint provider).
+- Capability berdasarkan nama model bersifat indikatif; capability aktual ditentukan oleh endpoint provider.
+- Endpoint yang tidak mendukung `input_audio` akan menolak audio. Gunakan provider dengan STT atau transkripsikan audio terlebih dahulu.
+- Endpoint yang tidak menerima `video/*` dalam `image_url` akan menolak video. Ekstraksi frame/audio dengan FFmpeg sebagai fallback hybrid belum diimplementasikan.
 
 ---
 
@@ -41,17 +28,17 @@ Mendukung penyusunan pesan berbasis blok terstruktur native Telegram:
 XiaoAI/
 ├── Cargo.toml            # Manifest & dependensi Rust
 ├── src/
-│   ├── main.rs           # Entry point CLI (xiao start, setup, provider, model, status)
+│   ├── main.rs           # Entry point CLI, bot handlers, keyboard dan UI builders
 │   ├── bot/
 │   │   ├── mod.rs        # Modul bot Telegram
 │   │   ├── client.rs     # Asynchronous Telegram Bot API 10.2 HTTP Client
 │   │   └── models.rs     # Data models & serialisasi AST Bot API 10.2
 │   ├── ai/
 │   │   ├── mod.rs        # Modul integrasi AI
-│   │   └── service.rs    # OpenAI-compatible engine, streaming SSE & multi-session
-│   ├── parser.rs         # Markdown to Bot API 10.2 Rich Message AST Parser
-│   └── timeline.rs       # State machine Live Execution Timeline
-├── .env                  # Konfigurasi Token Bot & AI Endpoint
+│   │   └── service.rs    # Provider, session, SSE chat, STT dan image generation
+│   ├── parser.rs         # Markdown ke Rich Message AST
+│   └── timeline.rs       # Streaming execution timeline
+├── .env                  # Token bot dan konfigurasi endpoint lokal (jangan commit)
 ├── .env.example          # Template environment
 └── README.md             # Dokumentasi lengkap
 ```
@@ -65,10 +52,14 @@ xiao start                               # Run Telegram bot
 xiao setup                               # Quickstart setup wizard
 xiao provider [add] [del] [status]       # Manage AI providers
 xiao telegram [check] [bind] [change]    # Manage Telegram bot token
-xiao model [query]                       # Select or search model
+xiao model [name]                        # Select/search model dari CLI
+xiao model pick                          # Pilih maksimal 10 model untuk Telegram
+xiao model [name] pick                   # Alias untuk membuka model whitelist picker
 xiao status                              # System health check
 xiao help                                # Show this help
 ```
+
+`xiao model pick` menyimpan whitelist ke `~/.xiao_providers.json` sebagai pasangan provider dan model. Tekan `Space` untuk toggle pilihan, ketik untuk filter, dan `Enter` atau `Esc` untuk menyimpan.
 
 ---
 
@@ -90,10 +81,10 @@ Setelah disalin ke `$PREFIX/bin/` (atau `/usr/local/bin/`), Anda dapat langsung 
 
 | Perintah / Aksi | Deskripsi |
 | :--- | :--- |
-| *Kirim Pesan / File* | Mengobrol dengan AI (Vision, Dokumen, Voice Note, Video) |
+| *Kirim Pesan / File* | Mengobrol dengan AI, gambar, dokumen, audio, atau video sesuai dukungan endpoint |
 | `/start` | Membuka menu sambutan & status model aktif |
 | `/menu` | Menampilkan menu navigasi utama interaktif |
-| `/model [keyword]` | Mengganti / mencari model AI aktif langsung dari chat |
+| `/model` | Mengganti model dari whitelist yang dikonfigurasi dengan `xiao model pick` |
 | `/image` | Menghasilkan gambar AI dari prompt teks |
 | `/context` | Monitor kapasitas token memori & kapabilitas model |
 | `/session` | Membuka Session Manager & tabel sesi aktif |
