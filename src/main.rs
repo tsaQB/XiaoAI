@@ -772,7 +772,7 @@ async fn run_cli_provider_menu(ai_service: &AIChatService, action: Option<&str>)
             let is_act = store.active_id.as_deref() == Some(target_prov.id.as_str());
 
             let meta_guard = ai_service.model_metadata.read().await;
-            let metadata = meta_guard.get(&target_prov.active_model).cloned();
+            let metadata = meta_guard.get(&ai::service::model_metadata_key(&target_prov.endpoint, &target_prov.active_model)).cloned();
             drop(meta_guard);
             let cap = crate::ai::service::get_model_capabilities_with_meta(&target_prov.active_model, metadata.as_ref());
 
@@ -1055,7 +1055,7 @@ async fn run_cli_status(ai_service: &AIChatService) {
         }
 
         let meta_guard = ai_service.model_metadata.read().await;
-        let metadata = meta_guard.get(&model).cloned();
+        let metadata = meta_guard.get(&ai::service::model_metadata_key(&endpoint, &model)).cloned();
         drop(meta_guard);
         let cap = crate::ai::service::get_model_capabilities_with_meta(&model, metadata.as_ref());
         println!("\n\x1b[1;37m3. MODEL CAPABILITIES ({})\x1b[0m", cap.family);

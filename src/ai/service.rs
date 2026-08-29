@@ -270,6 +270,10 @@ pub struct ModelMetadata {
     pub max_completion_tokens: Option<usize>,
 }
 
+pub fn model_metadata_key(endpoint: &str, model: &str) -> String {
+    format!("{}::{}", endpoint.trim_end_matches('/'), model)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CapabilityRecord {
     pub provider_id: String,
@@ -695,7 +699,7 @@ impl AIChatService {
                                             .and_then(|m| m.as_u64())
                                             .map(|u| u as usize);
 
-                                        meta_guard.insert(id_str.to_string(), ModelMetadata {
+                                        meta_guard.insert(model_metadata_key(clean_endpoint, id_str), ModelMetadata {
                                             id: id_str.to_string(),
                                             name: item.get("name").and_then(|s| s.as_str()).map(|s| s.to_string()),
                                             context_length,
@@ -715,7 +719,7 @@ impl AIChatService {
                             let mut registry = load_capability_registry();
                             let provider_id = clean_endpoint.to_string();
                             for model_id in &model_ids {
-                                let meta = meta_guard.get(model_id);
+                                let meta = meta_guard.get(&model_metadata_key(clean_endpoint, model_id));
                                 let modalities = meta.and_then(|m| m.modalities.as_deref()).unwrap_or("").to_ascii_lowercase();
                                 let record = CapabilityRecord {
                                     provider_id: provider_id.clone(),
@@ -912,7 +916,8 @@ impl AIChatService {
     pub async fn get_context_stats(&self, user_id: i64) -> ContextStats {
         let active_sess = self.get_active_session(user_id).await;
         let active_model = self.get_user_model(user_id).await;
-        let metadata = self.model_metadata.read().await.get(&active_model).cloned();
+        let endpoint = self.get_active_provider(user_id).await.map(|provider| provider.endpoint).unwrap_or_default();
+        let metadata = self.model_metadata.read().await.get(&model_metadata_key(&endpoint, &active_model)).cloned();
         let cap = get_model_capabilities_with_meta(&active_model, metadata.as_ref());
         let limit_tokens = cap.context_limit;
         let limit_str = cap.context_str.clone();
