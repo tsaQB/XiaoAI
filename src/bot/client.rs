@@ -255,7 +255,7 @@ impl TelegramBotClient {
                 if is_first {
                     if let Some(rep) = reply_to_message_id {
                         payload["reply_parameters"] =
-                            serde_json::to_value(ReplyParameters::new(rep)).unwrap_or(json!({}));
+                serde_json::to_value(ReplyParameters::new(rep)).unwrap_or(json!({}));
                     }
                 }
                 last_res = self.post_json("sendMessage", payload).await?;
