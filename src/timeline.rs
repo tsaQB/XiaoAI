@@ -6,8 +6,9 @@ use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 use tracing::debug;
 
-use crate::bot::client::TelegramBotClient;
+use crate::bot::client::{TelegramBotClient, TelegramDeliveryContext};
 use crate::bot::models::{InputRichMessage, RichBlock};
+use crate::parser::parse_markdown_to_rich_blocks;
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +108,7 @@ pub struct ExecutionTimeline {
     sync_lock: Arc<Mutex<()>>,
     stopped: Arc<AtomicBool>,
     partial_answer: Arc<RwLock<String>>,
+    delivery_context: TelegramDeliveryContext,
 }
 
 impl ExecutionTimeline {
@@ -131,6 +133,7 @@ impl ExecutionTimeline {
             sync_lock: Arc::new(Mutex::new(())),
             stopped: Arc::new(AtomicBool::new(false)),
             partial_answer: Arc::new(RwLock::new(String::new())),
+            delivery_context: TelegramBotClient::current_delivery_context(),
         }
     }
 
@@ -209,7 +212,11 @@ impl ExecutionTimeline {
                 if timeline.stopped.load(Ordering::SeqCst) {
                     break;
                 }
-                timeline.sync_draft(false).await;
+                TelegramBotClient::with_delivery_context(
+                    timeline.delivery_context.clone(),
+                    timeline.sync_draft(false),
+                )
+                .await;
             }
         });
     }
@@ -284,9 +291,11 @@ impl ExecutionTimeline {
             text: Value::String(status),
         }];
         if !partial.trim().is_empty() {
-            blocks.push(RichBlock::Paragraph {
-                text: Value::String(partial),
-            });
+            // The model streams Markdown. Feed the accumulated answer through
+            // the same semantic parser used by the permanent final so users do
+            // not see serialization markers such as **, ###, or --- while
+            // Xiao is in the Writing state.
+            blocks.extend(parse_markdown_to_rich_blocks(&partial));
         }
         let rich_message = InputRichMessage::new(blocks);
 
@@ -303,5 +312,30 @@ impl ExecutionTimeline {
         {
             debug!("Failed to sync draft update: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streamed_markdown_uses_native_rich_blocks() {
+        let partial = "## Dua Gaya yang Bertarung\n\nOrbit itu **jatuh terus-menerus**.\n\n---\n\n1. **Gravitasi Bumi** — tarik ke bawah\n2. **Kecepatan tangensial** — dorong ke samping";
+        let blocks = parse_markdown_to_rich_blocks(partial);
+        let wire = serde_json::to_string(&blocks).unwrap();
+
+        assert!(blocks
+            .iter()
+            .any(|block| matches!(block, RichBlock::SectionHeading { .. })));
+        assert!(blocks
+            .iter()
+            .any(|block| matches!(block, RichBlock::Divider { .. })));
+        assert!(blocks
+            .iter()
+            .any(|block| matches!(block, RichBlock::List { .. })));
+        assert!(wire.contains("\"type\":\"bold\""));
+        assert!(!wire.contains("## Dua Gaya"));
+        assert!(!wire.contains("**jatuh terus-menerus**"));
     }
 }

@@ -22,6 +22,7 @@ use super::http::{is_retryable_status, retry_delay, MAX_PROVIDER_ATTEMPTS};
 use super::stream::{SseDecoder, StreamEvent};
 use crate::timeline::{ExecutionTimeline, ProgressActivity, ProgressState};
 
+use super::capability::model_metadata_key;
 pub use super::capability::{ModelCapability, ModelMetadata};
 
 use super::storage::{
@@ -76,6 +77,117 @@ fn estimate_stored_content_tokens(content: &Value) -> usize {
         Value::String(text) => estimate_text_tokens(text),
         value => estimate_text_tokens(&value.to_string()),
     }
+}
+
+const MAX_GENERATED_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
+fn is_unsafe_remote_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+        }
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+        }
+    }
+}
+
+fn validate_generated_image_bytes(bytes: &[u8]) -> Result<(), String> {
+    if bytes.is_empty() || bytes.len() > MAX_GENERATED_IMAGE_BYTES {
+        return Err("generated image exceeded XiaoAI byte limits".to_string());
+    }
+    let supported = bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || bytes.starts_with(&[0xff, 0xd8, 0xff])
+        || bytes.starts_with(b"GIF87a")
+        || bytes.starts_with(b"GIF89a")
+        || (bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP");
+    if !supported {
+        return Err("generated image response has an unsupported file signature".to_string());
+    }
+    Ok(())
+}
+
+async fn download_generated_image(url: &str) -> Result<Vec<u8>, String> {
+    let parsed = url::Url::parse(url).map_err(|_| "provider returned an invalid image URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("provider image URL must use http or https".to_string());
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "provider image URL has no host".to_string())?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "provider image URL has no usable port".to_string())?;
+
+    let resolved = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|_| "provider image host could not be resolved".to_string())?
+        .collect::<Vec<_>>();
+    if resolved.is_empty() || resolved.iter().any(|addr| is_unsafe_remote_ip(addr.ip())) {
+        return Err("provider image URL resolved to a blocked network address".to_string());
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(host, resolved[0])
+        .build()
+        .map_err(|_| "failed to build bounded image downloader".to_string())?;
+    let response = client
+        .get(parsed)
+        .send()
+        .await
+        .map_err(|_| "provider image download failed".to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "provider image download returned status {}",
+            response.status().as_u16()
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_GENERATED_IMAGE_BYTES as u64)
+    {
+        return Err("provider image exceeded XiaoAI byte limits".to_string());
+    }
+    if !response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().starts_with("image/"))
+    {
+        return Err("provider image URL did not return an image content type".to_string());
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| "provider image stream failed".to_string())?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_GENERATED_IMAGE_BYTES {
+            return Err("provider image exceeded XiaoAI byte limits".to_string());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    validate_generated_image_bytes(&bytes)?;
+    Ok(bytes)
+}
+
+fn provider_url(endpoint: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        endpoint.trim().trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
 }
 
 fn max_output_tokens_for_model(model: &str) -> usize {
@@ -198,7 +310,7 @@ impl AIChatService {
             let allowed = match attachment.kind.as_str() {
                 "image" | "document_page" => capability
                     .and_then(|record| record.supports_image)
-                    .unwrap_or(true),
+                    .unwrap_or(false),
                 "audio" => capability
                     .and_then(|record| record.supports_audio)
                     .unwrap_or(false),
@@ -303,16 +415,21 @@ impl AIChatService {
 
         let mut existing = load_sessions_db_async(user_id).await;
         if existing.is_empty() {
+            let Some(session_id) = allocate_session_id_db_async(user_id).await else {
+                warn!("Session initialization deferred because durable ID allocation failed");
+                return Vec::new();
+            };
             let now_str = Local::now().format("%d %b %H:%M").to_string();
             let session = ChatSession {
-                id: allocate_session_id_db_async(user_id)
-                    .await
-                    .expect("persistent session ID allocation failed; refusing to reuse an ID"),
+                id: session_id,
                 name: format!("Session {now_str}"),
                 messages: Vec::new(),
                 created_at: now_str,
             };
-            let _ = save_session_metadata_db_async(user_id, session.clone()).await;
+            if !save_session_metadata_db_async(user_id, session.clone()).await {
+                warn!("Session initialization deferred because metadata persistence failed");
+                return Vec::new();
+            }
             existing.push(session);
         }
         let _ = ensure_session_identity_v2_db_async(user_id, existing.clone()).await;
@@ -323,11 +440,14 @@ impl AIChatService {
         existing
     }
 
-    pub async fn get_active_session_id(&self, user_id: i64) -> usize {
+    pub async fn get_active_session_id(&self, user_id: i64) -> Option<usize> {
         let sessions = self.get_sessions(user_id).await;
+        if sessions.is_empty() {
+            return None;
+        }
         if let Some(id) = self.active_session_id.read().await.get(&user_id).copied() {
             if sessions.iter().any(|session| session.id == id) {
-                return id;
+                return Some(id);
             }
         }
 
@@ -341,34 +461,37 @@ impl AIChatService {
             .await
             .insert(user_id, stored_id);
         let _ = save_active_session_db_async(user_id, stored_id).await;
-        stored_id
+        Some(stored_id)
     }
 
     pub async fn get_active_session_index(&self, user_id: i64) -> usize {
         let sessions = self.get_sessions(user_id).await;
-        let active_id = self.get_active_session_id(user_id).await;
+        let Some(active_id) = self.get_active_session_id(user_id).await else {
+            return 0;
+        };
         sessions
             .iter()
             .position(|session| session.id == active_id)
             .unwrap_or(0)
     }
 
-    pub async fn get_active_session(&self, user_id: i64) -> ChatSession {
+    pub async fn get_active_session(&self, user_id: i64) -> Option<ChatSession> {
         let sessions = self.get_sessions(user_id).await;
-        let active_id = self.get_active_session_id(user_id).await;
+        let active_id = self.get_active_session_id(user_id).await?;
         sessions
             .iter()
             .find(|session| session.id == active_id)
             .cloned()
-            .unwrap_or_else(|| sessions[0].clone())
     }
 
-    pub async fn create_new_session(&self, user_id: i64, custom_name: Option<&str>) -> ChatSession {
+    pub async fn create_new_session(
+        &self,
+        user_id: i64,
+        custom_name: Option<&str>,
+    ) -> Option<ChatSession> {
         let _ = self.get_sessions(user_id).await;
         let now_str = Local::now().format("%d %b %H:%M").to_string();
-        let new_id = allocate_session_id_db_async(user_id)
-            .await
-            .expect("persistent session ID allocation failed; refusing to reuse an ID");
+        let new_id = allocate_session_id_db_async(user_id).await?;
         let name = custom_name
             .map(|value| truncate_chars(value.trim(), 60))
             .filter(|value| !value.is_empty())
@@ -380,6 +503,9 @@ impl AIChatService {
             created_at: now_str,
         };
 
+        if !save_session_metadata_db_async(user_id, session.clone()).await {
+            return None;
+        }
         {
             let mut sessions_map = self.user_sessions.write().await;
             sessions_map
@@ -387,10 +513,9 @@ impl AIChatService {
                 .or_default()
                 .push(session.clone());
         }
-        let _ = save_session_metadata_db_async(user_id, session.clone()).await;
         self.active_session_id.write().await.insert(user_id, new_id);
         let _ = save_active_session_db_async(user_id, new_id).await;
-        session
+        Some(session)
     }
 
     pub async fn switch_session_by_id(&self, user_id: i64, session_id: usize) -> bool {
@@ -415,51 +540,61 @@ impl AIChatService {
     }
 
     pub async fn remove_session_by_id(&self, user_id: i64, session_id: usize) -> bool {
-        let active_id = self.get_active_session_id(user_id).await;
-        let (removed_id, mut new_active_id, create_replacement) = {
-            let mut sessions_map = self.user_sessions.write().await;
-            let Some(list) = sessions_map.get_mut(&user_id) else {
-                return false;
-            };
-            let Some(index) = list.iter().position(|session| session.id == session_id) else {
-                return false;
-            };
-            let removed = list.remove(index);
-            let create_replacement = list.is_empty();
-            let new_active_id = if !create_replacement
-                && (removed.id == active_id || !list.iter().any(|session| session.id == active_id))
-            {
-                let target_index = index.min(list.len().saturating_sub(1));
-                list[target_index].id
-            } else {
-                active_id
-            };
-            (removed.id, new_active_id, create_replacement)
+        let Some(active_id) = self.get_active_session_id(user_id).await else {
+            return false;
         };
-
-        let _ = delete_session_db_async(user_id, removed_id).await;
-        delete_session_attachments(user_id, removed_id).await;
-
-        if create_replacement {
+        let sessions = self.get_sessions(user_id).await;
+        if !sessions.iter().any(|session| session.id == session_id) {
+            return false;
+        }
+        let replacement = if sessions.len() == 1 {
+            let Some(replacement_id) = allocate_session_id_db_async(user_id).await else {
+                warn!(
+                    "Refusing to remove the last session because replacement ID allocation failed"
+                );
+                return false;
+            };
             let now_str = Local::now().format("%d %b %H:%M").to_string();
             let replacement = ChatSession {
-                id: allocate_session_id_db_async(user_id)
-                    .await
-                    .expect("persistent session ID allocation failed; refusing to reuse an ID"),
+                id: replacement_id,
                 name: format!("Session {now_str}"),
                 messages: Vec::new(),
                 created_at: now_str,
             };
-            let _ = save_session_metadata_db_async(user_id, replacement.clone()).await;
-            new_active_id = replacement.id;
-            self.user_sessions
-                .write()
-                .await
-                .entry(user_id)
-                .or_default()
-                .push(replacement);
-        }
+            if !save_session_metadata_db_async(user_id, replacement.clone()).await {
+                warn!("Refusing to remove the last session because replacement persistence failed");
+                return false;
+            }
+            Some(replacement)
+        } else {
+            None
+        };
 
+        let new_active_id = {
+            let mut sessions_map = self.user_sessions.write().await;
+            let Some(list) = sessions_map.get_mut(&user_id) else {
+                return false;
+            };
+            let Some(current_index) = list.iter().position(|session| session.id == session_id)
+            else {
+                return false;
+            };
+            let removed = list.remove(current_index);
+            if let Some(replacement) = replacement.clone() {
+                let replacement_id = replacement.id;
+                list.push(replacement);
+                replacement_id
+            } else if removed.id == active_id || !list.iter().any(|session| session.id == active_id)
+            {
+                let target_index = current_index.min(list.len().saturating_sub(1));
+                list[target_index].id
+            } else {
+                active_id
+            }
+        };
+
+        let _ = delete_session_db_async(user_id, session_id).await;
+        delete_session_attachments(user_id, session_id).await;
         self.active_session_id
             .write()
             .await
@@ -510,7 +645,9 @@ impl AIChatService {
     }
 
     pub async fn clear_history(&self, user_id: i64) {
-        let active_id = self.get_active_session_id(user_id).await;
+        let Some(active_id) = self.get_active_session_id(user_id).await else {
+            return;
+        };
         let cleared = {
             let mut sessions_map = self.user_sessions.write().await;
             sessions_map.get_mut(&user_id).and_then(|list| {
@@ -581,7 +718,15 @@ impl AIChatService {
     }
 
     pub async fn get_context_stats(&self, user_id: i64) -> ContextStats {
-        let active_sess = self.get_active_session(user_id).await;
+        let active_sess = self
+            .get_active_session(user_id)
+            .await
+            .unwrap_or(ChatSession {
+                id: 0,
+                name: "Storage unavailable".to_string(),
+                messages: Vec::new(),
+                created_at: "-".to_string(),
+            });
         let active_model = self.get_user_model(user_id).await;
         let endpoint = self
             .get_active_provider(user_id)
@@ -687,7 +832,7 @@ impl AIChatService {
                 ),
             };
 
-        let stt_url = format!("{}/audio/transcriptions", provider.endpoint);
+        let stt_url = provider_url(&provider.endpoint, "audio/transcriptions");
         let part = match Part::bytes(audio_bytes)
             .file_name(file_name.to_string())
             .mime_str("audio/ogg")
@@ -830,7 +975,13 @@ impl AIChatService {
             }
         }
 
-        let active_sess = self.get_active_session(user_id).await;
+        let Some(active_sess) = self.get_active_session(user_id).await else {
+            return (
+                None,
+                "Penyimpanan session sedang tidak tersedia. XiaoAI tidak akan membuat ID session sementara yang berisiko dipakai ulang. Coba lagi setelah storage pulih.".to_string(),
+                false,
+            );
+        };
         let request_session_id = active_sess.id;
 
         let mut clean_prompt = prompt.trim().to_string();
@@ -865,8 +1016,17 @@ impl AIChatService {
         let resolved_capability = self
             .resolved_model_capability(&provider.endpoint, &model)
             .await;
-        let max_output_tokens = max_output_tokens_for_model(&model)
+        let metadata_max_completion_tokens = self
+            .model_metadata
+            .read()
+            .await
+            .get(&model_metadata_key(&provider.endpoint, &model))
+            .and_then(|metadata| metadata.max_completion_tokens);
+        let mut max_output_tokens = max_output_tokens_for_model(&model)
             .min(resolved_capability.context_limit.saturating_div(2).max(1));
+        if let Some(limit) = metadata_max_completion_tokens.filter(|limit| *limit > 0) {
+            max_output_tokens = max_output_tokens.min(limit);
+        }
         let max_prompt_tokens = resolved_capability
             .context_limit
             .saturating_sub(max_output_tokens)
@@ -991,13 +1151,17 @@ impl AIChatService {
             }));
         }
 
-        let url = format!("{}/chat/completions", provider.endpoint);
-        let payload = json!({
+        let url = provider_url(&provider.endpoint, "chat/completions");
+        let mut payload = json!({
             "model": model,
             "messages": messages,
             "stream": true,
-            "max_tokens": max_output_tokens,
         });
+        if metadata_max_completion_tokens.is_some() {
+            payload["max_completion_tokens"] = json!(max_output_tokens);
+        } else {
+            payload["max_tokens"] = json!(max_output_tokens);
+        }
 
         let use_auth = !provider.api_key.is_empty()
             && !["none", "-", "no"]
@@ -1168,7 +1332,15 @@ impl AIChatService {
                 }
             };
 
-            for event in decoder.push(&bytes) {
+            let events = match decoder.push(&bytes) {
+                Ok(events) => events,
+                Err(error) => {
+                    stream_interrupted = true;
+                    warn!("AI response SSE decode failed: {error}");
+                    break;
+                }
+            };
+            for event in events {
                 match event {
                     StreamEvent::Done => {
                         stream_done = true;
@@ -1224,13 +1396,21 @@ impl AIChatService {
         }
 
         if !stream_done && !cancelled && !stream_interrupted {
-            for event in decoder.finish() {
-                if matches!(event, StreamEvent::Done) {
-                    stream_done = true;
+            match decoder.finish() {
+                Ok(events) => {
+                    for event in events {
+                        if matches!(event, StreamEvent::Done) {
+                            stream_done = true;
+                        }
+                    }
+                    if !stream_done {
+                        stream_interrupted = true;
+                    }
                 }
-            }
-            if !stream_done {
-                stream_interrupted = true;
+                Err(error) => {
+                    warn!("AI response SSE final decode failed: {error}");
+                    stream_interrupted = true;
+                }
             }
         }
 
@@ -1253,13 +1433,8 @@ impl AIChatService {
                 let parts: Vec<&str> = accumulated_raw.split("<think>").collect();
                 let before_think = parts[0].trim();
                 let inside_think = parts.get(1).copied().unwrap_or("").trim();
-                if !inside_think.is_empty() && before_think.is_empty() {
-                    thinking_text = Some(inside_think.to_string());
-                    answer_text = inside_think.to_string();
-                } else {
-                    thinking_text = Some(inside_think.to_string());
-                    answer_text = before_think.to_string();
-                }
+                thinking_text = (!inside_think.is_empty()).then(|| inside_think.to_string());
+                answer_text = before_think.to_string();
             }
         }
 
@@ -1268,12 +1443,6 @@ impl AIChatService {
             .replace_all(&answer_text, "")
             .trim()
             .to_string();
-
-        if answer_text.is_empty() {
-            if let Some(ref th) = thinking_text {
-                answer_text = tag_clean_re.replace_all(th, "").trim().to_string();
-            }
-        }
 
         if cancelled {
             if answer_text.trim().is_empty() {
@@ -1309,6 +1478,13 @@ impl AIChatService {
                 }
                 tl.finish_all(ProgressState::Done).await;
             }
+        }
+
+        // Cancelled/interrupted output is presentation-only. Do not make a
+        // partial answer canonical history: retry/follow-up context must only
+        // see completed assistant turns.
+        if cancelled || stream_interrupted {
+            return (thinking_text, answer_text, cancelled);
         }
 
         // Persist only to the stable session that originated this request. Multimodal
@@ -1433,7 +1609,7 @@ impl AIChatService {
         // 1. Try Custom Provider /images/generations endpoint
         if let Some(ref p) = provider {
             if !p.endpoint.is_empty() {
-                let gen_url = format!("{}/images/generations", p.endpoint);
+                let gen_url = provider_url(&p.endpoint, "images/generations");
                 let mut req = self
                     .client
                     .post(&gen_url)
@@ -1464,24 +1640,27 @@ impl AIChatService {
                                     if let Ok(bytes) =
                                         base64::engine::general_purpose::STANDARD.decode(b64_str)
                                     {
-                                        return (
-                                            true,
-                                            Some(bytes),
-                                            format!("OpenAI Compatible ({})", p.name),
-                                        );
+                                        if validate_generated_image_bytes(&bytes).is_ok() {
+                                            return (
+                                                true,
+                                                Some(bytes),
+                                                format!("OpenAI Compatible ({})", p.name),
+                                            );
+                                        }
                                     }
                                 } else if let Some(img_url) =
                                     data.get("url").and_then(|s| s.as_str())
                                 {
-                                    if let Ok(img_resp) = self.client.get(img_url).send().await {
-                                        if img_resp.status().is_success() {
-                                            if let Ok(bytes) = img_resp.bytes().await {
-                                                return (
-                                                    true,
-                                                    Some(bytes.to_vec()),
-                                                    format!("OpenAI Compatible ({})", p.name),
-                                                );
-                                            }
+                                    match download_generated_image(img_url).await {
+                                        Ok(bytes) => {
+                                            return (
+                                                true,
+                                                Some(bytes),
+                                                format!("OpenAI Compatible ({})", p.name),
+                                            );
+                                        }
+                                        Err(error) => {
+                                            warn!("Rejected provider image URL: {error}");
                                         }
                                     }
                                 }

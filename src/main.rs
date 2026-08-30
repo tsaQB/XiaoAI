@@ -21,7 +21,7 @@ use tracing::{error, info, warn};
 
 use ai::service::ProviderConfig;
 use ai::AIChatService;
-use bot::client::TelegramBotClient;
+use bot::client::{TelegramBotClient, TelegramDeliveryContext};
 use bot::models::{
     BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputRichMessage, ReplyKeyboardMarkup,
     RichBlock, RichBlockTableCell, RichMessageButton, Update,
@@ -913,17 +913,18 @@ async fn handle_image_generation(
         ]
         .contains(&clean_prompt.as_str())
     {
-        let sess = ai_service.get_active_session(user_id).await;
         let mut last_context = String::new();
-        for msg in sess.messages.iter().rev() {
-            let candidate = match &msg.content {
-                Value::String(value) => Some(value.clone()),
-                value => attachments::decode_user_content(value).map(|content| content.text),
-            };
-            if let Some(candidate) = candidate {
-                if candidate.trim().chars().count() > 8 {
-                    last_context = candidate.trim().to_string();
-                    break;
+        if let Some(sess) = ai_service.get_active_session(user_id).await {
+            for msg in sess.messages.iter().rev() {
+                let candidate = match &msg.content {
+                    Value::String(value) => Some(value.clone()),
+                    value => attachments::decode_user_content(value).map(|content| content.text),
+                };
+                if let Some(candidate) = candidate {
+                    if candidate.trim().chars().count() > 8 {
+                        last_context = candidate.trim().to_string();
+                        break;
+                    }
                 }
             }
         }
@@ -1179,6 +1180,228 @@ async fn handle_ai_chat(
 // ==========================================
 // Update Router
 // ==========================================
+
+fn delivery_context_for_update(update: &Update) -> TelegramDeliveryContext {
+    if let Some(message) = update.message.as_ref() {
+        return TelegramDeliveryContext {
+            message_thread_id: message.message_thread_id,
+            receiver_user_id: message
+                .ephemeral_message_id
+                .and_then(|_| message.from.as_ref().map(|user| user.id)),
+            source_ephemeral_message_id: message.ephemeral_message_id,
+            callback_query_id: None,
+        };
+    }
+    if let Some(callback) = update.callback_query.as_ref() {
+        let message = callback.message.as_ref();
+        let source_ephemeral_message_id = message.and_then(|message| message.ephemeral_message_id);
+        return TelegramDeliveryContext {
+            message_thread_id: message.and_then(|message| message.message_thread_id),
+            receiver_user_id: source_ephemeral_message_id.map(|_| callback.from.id),
+            source_ephemeral_message_id,
+            callback_query_id: source_ephemeral_message_id.map(|_| callback.id.clone()),
+        };
+    }
+    if let Some(stopped) = update.stopped_message_generation.as_ref() {
+        return TelegramDeliveryContext {
+            message_thread_id: stopped.message_thread_id,
+            ..TelegramDeliveryContext::default()
+        };
+    }
+    TelegramDeliveryContext::default()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateLane {
+    Control,
+    Generation,
+}
+
+fn command_matches(text: &str, command: &str) -> bool {
+    text == command
+        || text
+            .strip_prefix(command)
+            .is_some_and(|rest| rest.starts_with(' ') || rest.starts_with('@'))
+}
+
+fn is_control_message_text(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    if command_matches(text, "/image") {
+        return false;
+    }
+
+    let commands = [
+        "/start", "/menu", "/new", "/session", "/context", "/model", "/clear", "/help",
+    ];
+    if commands
+        .iter()
+        .any(|command| command_matches(text, command))
+    {
+        return true;
+    }
+
+    if text.chars().all(|character| character.is_ascii_digit())
+        || text.starts_with("✅")
+        || text.starts_with("Session ")
+        || (text.starts_with("Hal") && text.chars().any(|character| character.is_ascii_digit()))
+    {
+        return true;
+    }
+
+    [
+        "📱 Menu",
+        "Menu",
+        "🔙 Menu Utama",
+        "🔙 Kembali ke Menu Utama",
+        "Menu Utama",
+        "Main Menu",
+        "main menu",
+        "Main menu",
+        "ɴᴇᴡ",
+        "➕ ɴᴇᴡ",
+        "➕ New",
+        "New",
+        "new",
+        "➕ Chat Baru",
+        "Chat Baru",
+        "📑 Session",
+        "Session",
+        "session",
+        "📑 Session Manager",
+        "📑 Lihat Daftar Session",
+        "🗑️ Hapus Session",
+        "🗑️ Remove Session",
+        "Delete",
+        "delete",
+        "Delete Session",
+        "✏️ Rename Session",
+        "✏️ Ubah Nama Session",
+        "Rename",
+        "rename",
+        "Rename Session",
+        "ᴄᴏɴᴛᴇxᴛ",
+        "🧠 ᴄᴏɴᴛᴇxᴛ",
+        "🧠 Context",
+        "Context",
+        "context",
+        "🧠 Info Konteks",
+        "Info Konteks",
+        "ᴍᴏᴅᴇʟ",
+        "⚙️ ᴍᴏᴅᴇʟ",
+        "⚙️ Model",
+        "Model",
+        "model",
+        "⚙️ Model AI",
+        "Pilih Model",
+        "🗑️ Reset Chat",
+        "🗑️ Reset Obrolan",
+        "❓ Help",
+        "Help",
+        "help",
+        "Bantuan",
+    ]
+    .contains(&text)
+}
+
+async fn classify_update_lane(ai_service: &AIChatService, update: &Update) -> UpdateLane {
+    if update.stopped_message_generation.is_some() {
+        return UpdateLane::Control;
+    }
+
+    if let Some(callback) = update.callback_query.as_ref() {
+        return if matches!(callback.data.as_deref(), Some("img_new" | "img_regen")) {
+            UpdateLane::Generation
+        } else {
+            UpdateLane::Control
+        };
+    }
+
+    let Some(message) = update.message.as_ref() else {
+        return UpdateLane::Control;
+    };
+
+    if message.photo.is_some()
+        || message.document.is_some()
+        || message.voice.is_some()
+        || message.audio.is_some()
+        || message.video.is_some()
+        || message.video_note.is_some()
+    {
+        return UpdateLane::Generation;
+    }
+
+    let user_id = message
+        .from
+        .as_ref()
+        .map(|user| user.id)
+        .unwrap_or(message.chat.id);
+    let text = message
+        .text
+        .as_deref()
+        .or(message.caption.as_deref())
+        .unwrap_or("")
+        .trim();
+
+    let wizard = ai_service
+        .user_wizard_state
+        .read()
+        .await
+        .get(&user_id)
+        .cloned();
+    if let Some(wizard) = wizard {
+        if ["/cancel", "/batal", "batal", "cancel"].contains(&text) {
+            return UpdateLane::Control;
+        }
+        return if wizard.get("step").map(String::as_str) == Some("awaiting_image_prompt") {
+            UpdateLane::Generation
+        } else {
+            UpdateLane::Control
+        };
+    }
+
+    if ai_service
+        .user_waiting_rename
+        .read()
+        .await
+        .contains_key(&user_id)
+        && !text.starts_with('/')
+    {
+        return UpdateLane::Control;
+    }
+
+    if is_control_message_text(text) {
+        UpdateLane::Control
+    } else {
+        UpdateLane::Generation
+    }
+}
+
+async fn process_durable_update(
+    bot: &TelegramBotClient,
+    ai_service: &AIChatService,
+    user_last_image_prompt: &UserLastImagePrompt,
+    access: &AccessPolicy,
+    update: Update,
+) {
+    let update_id = update.update_id;
+    if !ai::storage::mark_telegram_processing_async(update_id).await {
+        return;
+    }
+
+    let delivery_context = delivery_context_for_update(&update);
+    TelegramBotClient::with_delivery_context(
+        delivery_context,
+        handle_update(bot, ai_service, user_last_image_prompt, access, update),
+    )
+    .await;
+
+    if !ai::storage::mark_telegram_processed_async(update_id).await {
+        warn!("Gagal menyelesaikan durable Telegram inbox update {update_id}");
+    }
+}
 
 async fn handle_update(
     bot: &TelegramBotClient,
@@ -1595,9 +1818,21 @@ async fn handle_update(
             ]
             .contains(&text.as_str())
         {
-            ai_service.create_new_session(user_id, None).await;
+            if ai_service.create_new_session(user_id, None).await.is_none() {
+                let _ = bot
+                    .send_message(
+                        chat_id,
+                        "⚠️ <b>Session baru tidak dibuat.</b> Penyimpanan sedang tidak tersedia; XiaoAI menolak memakai ID sementara yang dapat bentrok.",
+                        Some("HTML"),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                return;
+            }
             let total_sessions = ai_service.get_sessions(user_id).await.len();
-            let target_page = (total_sessions - 1) / 5 + 1;
+            let target_page = total_sessions.saturating_sub(1) / 5 + 1;
             let _ = bot
                 .send_message(
                     chat_id,
@@ -1659,7 +1894,19 @@ async fn handle_update(
         .contains(&text.as_str())
         {
             let active_idx = ai_service.get_active_session_index(user_id).await;
-            let active_session_id = ai_service.get_active_session_id(user_id).await;
+            let Some(active_session_id) = ai_service.get_active_session_id(user_id).await else {
+                let _ = bot
+                    .send_message(
+                        chat_id,
+                        "⚠️ Session aktif tidak tersedia karena storage gagal diakses.",
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                return;
+            };
             ai_service
                 .user_waiting_rename
                 .write()
@@ -2069,9 +2316,18 @@ async fn handle_update(
                 .await;
             }
         } else if cq_data == "session_new" {
-            ai_service.create_new_session(user_id, None).await;
+            if ai_service.create_new_session(user_id, None).await.is_none() {
+                let _ = bot
+                    .answer_callback_query(
+                        &cq_id,
+                        Some("Storage tidak tersedia; session tidak dibuat."),
+                        true,
+                    )
+                    .await;
+                return;
+            }
             let total_sessions = ai_service.get_sessions(user_id).await.len();
-            let target_page = (total_sessions - 1) / 5 + 1;
+            let target_page = total_sessions.saturating_sub(1) / 5 + 1;
             let _ = bot
                 .answer_callback_query(&cq_id, Some("Session baru berhasil dibuat! ➕"), false)
                 .await;
@@ -2334,7 +2590,16 @@ async fn handle_update(
                 let _ = bot.delete_message(chat_id, mid).await;
             }
         } else if cq_data == "open_new_session" {
-            let new_sess = ai_service.create_new_session(user_id, None).await;
+            let Some(new_sess) = ai_service.create_new_session(user_id, None).await else {
+                let _ = bot
+                    .answer_callback_query(
+                        &cq_id,
+                        Some("Storage tidak tersedia; sesi tidak dibuat."),
+                        true,
+                    )
+                    .await;
+                return;
+            };
             let _ = bot
                 .answer_callback_query(
                     &cq_id,
@@ -2498,26 +2763,77 @@ async fn main() {
         info!("Commands berhasil didaftarkan ke Telegram.");
     }
 
-    let (update_tx, mut update_rx) = tokio::sync::mpsc::channel::<Update>(64);
-    let worker_bot = bot.clone();
-    let worker_ai = Arc::clone(&ai_service);
-    let worker_last_image = Arc::clone(&user_last_image_prompt);
-    let worker_access = Arc::clone(&access);
-    let worker_handle = tokio::spawn(async move {
-        while let Some(update) = update_rx.recv().await {
-            handle_update(
-                &worker_bot,
-                &worker_ai,
-                &worker_last_image,
-                &worker_access,
+    let (generation_tx, mut generation_rx) = tokio::sync::mpsc::channel::<Update>(64);
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<Update>(64);
+
+    let generation_bot = bot.clone();
+    let generation_ai = Arc::clone(&ai_service);
+    let generation_last_image = Arc::clone(&user_last_image_prompt);
+    let generation_access = Arc::clone(&access);
+    let generation_worker = tokio::spawn(async move {
+        while let Some(update) = generation_rx.recv().await {
+            process_durable_update(
+                &generation_bot,
+                &generation_ai,
+                &generation_last_image,
+                &generation_access,
                 update,
             )
             .await;
         }
     });
 
-    let mut offset: Option<i64> = None;
-    info!("Memulai polling pesan dengan bounded ordered update queue...");
+    let control_bot = bot.clone();
+    let control_ai = Arc::clone(&ai_service);
+    let control_last_image = Arc::clone(&user_last_image_prompt);
+    let control_access = Arc::clone(&access);
+    let control_worker = tokio::spawn(async move {
+        while let Some(update) = control_rx.recv().await {
+            process_durable_update(
+                &control_bot,
+                &control_ai,
+                &control_last_image,
+                &control_access,
+                update,
+            )
+            .await;
+        }
+    });
+
+    let interrupted = ai::storage::quarantine_telegram_processing_async().await;
+    if interrupted > 0 {
+        warn!(
+            "{interrupted} Telegram update dikarantina karena daemon berhenti saat processing; replay otomatis dinonaktifkan untuk mencegah side effect ganda"
+        );
+    }
+
+    for record in ai::storage::pending_telegram_updates_async(500).await {
+        match serde_json::from_str::<Update>(&record.payload_json) {
+            Ok(update) => {
+                let lane = classify_update_lane(&ai_service, &update).await;
+                let send_result = match lane {
+                    UpdateLane::Control => control_tx.send(update).await,
+                    UpdateLane::Generation => generation_tx.send(update).await,
+                };
+                if send_result.is_err() {
+                    error!("Update worker stopped while replaying durable inbox");
+                    return;
+                }
+            }
+            Err(error) => {
+                warn!(
+                    "Durable Telegram update {} tidak dapat didecode: {error}",
+                    record.update_id
+                );
+                if ai::storage::mark_telegram_processing_async(record.update_id).await {
+                    let _ = ai::storage::mark_telegram_processed_async(record.update_id).await;
+                }
+            }
+        }
+    }
+
+    let mut offset = ai::storage::load_telegram_offset_async().await;
+    info!("Memulai polling pesan dengan durable control/generation queues...");
 
     loop {
         tokio::select! {
@@ -2530,11 +2846,36 @@ async fn main() {
                     Ok(resp) if resp.ok => {
                         if let Some(updates) = resp.result {
                             for update in updates {
-                                offset = Some(update.update_id + 1);
+                                let update_id = update.update_id;
+                                let payload_json = match serde_json::to_string(&update) {
+                                    Ok(payload) => payload,
+                                    Err(error) => {
+                                        error!("Gagal serialize Telegram update {update_id}: {error}");
+                                        break;
+                                    }
+                                };
+                                let Some(accepted) = ai::storage::enqueue_telegram_update_async(
+                                    update_id,
+                                    payload_json,
+                                )
+                                .await
+                                else {
+                                    // Never acknowledge a later Telegram update if the durable
+                                    // acceptance transaction for this update failed.
+                                    error!(
+                                        "Durable Telegram intake gagal untuk update {update_id}; offset tidak dimajukan"
+                                    );
+                                    break;
+                                };
+                                offset = Some(update_id.saturating_add(1));
+                                if !accepted {
+                                    continue;
+                                }
+
                                 if update.stopped_message_generation.is_some() {
-                                    // Native Stop must bypass the ordered queue so it can cancel
-                                    // the generation currently occupying the single-owner worker.
-                                    handle_update(
+                                    // Native Stop bypasses both queues so cancellation cannot be
+                                    // blocked by either control work or an active generation.
+                                    process_durable_update(
                                         &bot,
                                         &ai_service,
                                         &user_last_image_prompt,
@@ -2542,9 +2883,16 @@ async fn main() {
                                         update,
                                     )
                                     .await;
-                                } else if update_tx.send(update).await.is_err() {
-                                    error!("Update worker stopped unexpectedly");
-                                    return;
+                                } else {
+                                    let lane = classify_update_lane(&ai_service, &update).await;
+                                    let send_result = match lane {
+                                        UpdateLane::Control => control_tx.send(update).await,
+                                        UpdateLane::Generation => generation_tx.send(update).await,
+                                    };
+                                    if send_result.is_err() {
+                                        error!("Update worker stopped unexpectedly");
+                                        return;
+                                    }
                                 }
                             }
                         }
@@ -2563,10 +2911,50 @@ async fn main() {
     }
 
     ai_service.cancel_all_generations().await;
-    drop(update_tx);
-    match tokio::time::timeout(Duration::from_secs(5), worker_handle).await {
+    drop(control_tx);
+    drop(generation_tx);
+
+    match tokio::time::timeout(Duration::from_secs(5), control_worker).await {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => warn!("Update worker terminated with error: {err}"),
-        Err(_) => warn!("Update worker did not stop within shutdown grace period"),
+        Ok(Err(err)) => warn!("Control worker terminated with error: {err}"),
+        Err(_) => warn!("Control worker did not stop within shutdown grace period"),
+    }
+    match tokio::time::timeout(Duration::from_secs(5), generation_worker).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => warn!("Generation worker terminated with error: {err}"),
+        Err(_) => warn!("Generation worker did not stop within shutdown grace period"),
+    }
+}
+
+#[cfg(test)]
+mod update_lane_tests {
+    use super::*;
+
+    #[test]
+    fn known_controls_do_not_share_generation_lane() {
+        for text in [
+            "/menu",
+            "/session",
+            "/model",
+            "/context",
+            "/help",
+            "📱 Menu",
+            "Session",
+            "Rename Session",
+            "Hal 2",
+        ] {
+            assert!(is_control_message_text(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn generation_prompts_remain_outside_control_lane() {
+        for text in [
+            "Jelaskan orbit satelit",
+            "/image seekor rubah di kota neon",
+            "buatkan gambar pemandangan",
+        ] {
+            assert!(!is_control_message_text(text), "{text}");
+        }
     }
 }
