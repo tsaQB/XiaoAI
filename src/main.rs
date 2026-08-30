@@ -1667,12 +1667,16 @@ async fn handle_image_generation(
     timeline.start_ticker();
     let _ = bot.send_chat_action(chat_id, "upload_photo").await;
 
+    let width = 1024usize;
+    let height = 1024usize;
+    let image_started = Instant::now();
     let mut cancel_rx = ai_service.begin_generation(chat_id, draft_id).await;
     let image_result = ai_service
-        .generate_image(user_id, &clean_prompt, 1024, 1024, &mut cancel_rx)
+        .generate_image(user_id, &clean_prompt, width, height, &mut cancel_rx)
         .await;
     ai_service.end_generation(chat_id, draft_id).await;
     timeline.stop_ticker();
+    let elapsed_secs = image_started.elapsed().as_secs_f64();
 
     let generated = match image_result {
         Ok(image) => image,
@@ -1681,16 +1685,23 @@ async fn handle_image_generation(
             timeline.sync_draft(true).await;
 
             if error.kind == ImageGenerationErrorKind::Cancelled {
-                let _ = bot
-                    .send_message(
-                        chat_id,
-                        "⏹️ <b>Pembuatan gambar dibatalkan.</b>",
-                        Some("HTML"),
-                        Some(get_main_menu_keyboard()),
-                        None,
-                        None,
-                    )
-                    .await;
+                let rich = InputRichMessage::new(vec![
+                    RichBlock::SectionHeading {
+                        text: Value::String("IMAGE GENERATION CANCELLED".to_string()),
+                        level: 1,
+                    },
+                    RichBlock::Paragraph {
+                        text: Value::String("Image generation was cancelled.".to_string()),
+                    },
+                    RichBlock::Buttons {
+                        buttons: vec![
+                            RichMessageButton::callback("New Image", "img_new"),
+                            RichMessageButton::callback("Menu", "action_menu"),
+                        ],
+                        align: Some("center".to_string()),
+                    },
+                ]);
+                let _ = bot.send_rich_message(chat_id, &rich, None, None).await;
                 return;
             }
 
@@ -1714,30 +1725,58 @@ async fn handle_image_generation(
                 ImageGenerationErrorKind::FallbackDisabled => "Fallback disabled",
                 ImageGenerationErrorKind::Provider => "Provider error",
             };
-            let safe_error = escape_html(&error.message);
-            let err_text = format!(
-                "❌ <b>Gagal Membuat Gambar</b>\n\n\
-                 <b>Status:</b> <code>{status}</code>\n\
-                 <b>Detail:</b> {safe_error}\n\n\
-                 Silakan periksa Image Generation Model atau coba lagi."
-            );
-            let retry_kb = InlineKeyboardMarkup::new(vec![
-                vec![InlineKeyboardButton::callback("🔄 Coba Lagi", "img_regen")],
-                vec![InlineKeyboardButton::callback(
-                    "📱 Menu Utama",
-                    "action_menu",
-                )],
-            ]);
-            let _ = bot
-                .send_message(
-                    chat_id,
-                    &err_text,
-                    Some("HTML"),
-                    serde_json::to_value(retry_kb).ok(),
-                    None,
-                    None,
-                )
-                .await;
+            let mut blocks = vec![
+                RichBlock::SectionHeading {
+                    text: Value::String("IMAGE GENERATION FAILED".to_string()),
+                    level: 1,
+                },
+                RichBlock::Table {
+                    cells: vec![
+                        vec![
+                            RichBlockTableCell::text_only("Status", true, Some("left")),
+                            RichBlockTableCell::text_only("Detail", true, Some("left")),
+                        ],
+                        vec![
+                            RichBlockTableCell::text_only(status, false, Some("left")),
+                            RichBlockTableCell::text_only(
+                                &truncate_chars(&error.message, 240),
+                                false,
+                                Some("left"),
+                            ),
+                        ],
+                    ],
+                    has_header: true,
+                    is_bordered: true,
+                    is_striped: true,
+                    is_compact: true,
+                    caption: None,
+                },
+            ];
+            if matches!(
+                error.kind,
+                ImageGenerationErrorKind::CapabilityUnknown
+                    | ImageGenerationErrorKind::CapabilityUnsupported
+                    | ImageGenerationErrorKind::RouteDisabled
+                    | ImageGenerationErrorKind::ProviderNotFound
+                    | ImageGenerationErrorKind::ModelNotFound
+            ) {
+                blocks.push(RichBlock::BlockQuotation {
+                    blocks: vec![json!({
+                        "type":"paragraph",
+                        "text":"Check the Image Generation Model route with: xiao model addon show image_gen. Configure it with: xiao model addon set image_gen"
+                    })],
+                });
+            }
+            blocks.push(RichBlock::Buttons {
+                buttons: vec![
+                    RichMessageButton::callback_styled("Retry", "img_regen", "primary"),
+                    RichMessageButton::callback("New Image", "img_new"),
+                    RichMessageButton::callback("Menu", "action_menu"),
+                ],
+                align: Some("center".to_string()),
+            });
+            let rich = InputRichMessage::new(blocks);
+            let _ = bot.send_rich_message(chat_id, &rich, None, None).await;
             return;
         }
     };
@@ -1762,7 +1801,9 @@ async fn handle_image_generation(
         "🫟 <b>Gambar Berhasil Dibuat!</b>\n\n\
          📝 <b>Prompt:</b> <i>\"{safe_prompt}\"</i>\n\
          🧩 <b>Provider:</b> <code>{safe_provider}</code>\n\
-         🤖 <b>Model:</b> <code>{safe_model}</code>{fallback_note}"
+         🤖 <b>Model:</b> <code>{safe_model}</code>\n\
+         📐 <b>Size:</b> <code>{width} × {height}</code>\n\
+         ⏱️ <b>Elapsed:</b> <code>{elapsed_secs:.1}s</code>{fallback_note}"
     );
 
     let img_kb = InlineKeyboardMarkup::new(vec![
