@@ -166,18 +166,22 @@ pub fn decode_user_content(value: &Value) -> Option<PersistedUserContent> {
 }
 
 fn extension_for_mime(mime: &str) -> &'static str {
-    match mime.to_ascii_lowercase().as_str() {
+    let normalized = mime.to_ascii_lowercase();
+    match normalized.as_str() {
         "image/png" => "png",
         "image/webp" => "webp",
         "image/gif" => "gif",
         "image/jpeg" | "image/jpg" => "jpg",
-        "audio/ogg" | "audio/opus" => "ogg",
-        "audio/wav" | "audio/x-wav" => "wav",
-        "audio/mp4" | "audio/m4a" => "m4a",
+        "audio/ogg" | "application/ogg" => "ogg",
+        "audio/opus" => "opus",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
+        "audio/mp4" | "audio/m4a" | "audio/x-m4a" => "m4a",
+        "audio/flac" | "audio/x-flac" => "flac",
+        "audio/webm" => "webm",
         "video/webm" => "webm",
         "application/pdf" => "pdf",
-        _ if mime.starts_with("audio/") => "mp3",
-        _ if mime.starts_with("video/") => "mp4",
+        _ if normalized.starts_with("video/") => "mp4",
         _ => "bin",
     }
 }
@@ -200,6 +204,32 @@ mod tests {
         let decoded = decode_user_content(&value).unwrap();
         assert_eq!(decoded.text, "describe this");
         assert_eq!(decoded.attachments.len(), 1);
+    }
+
+    #[test]
+    fn audio_storage_extensions_never_guess_mp3() {
+        let cases = [
+            ("audio/ogg", "ogg"),
+            ("application/ogg", "ogg"),
+            ("audio/opus", "opus"),
+            ("audio/mpeg", "mp3"),
+            ("audio/mp3", "mp3"),
+            ("audio/mp4", "m4a"),
+            ("audio/m4a", "m4a"),
+            ("audio/x-m4a", "m4a"),
+            ("audio/wav", "wav"),
+            ("audio/x-wav", "wav"),
+            ("audio/wave", "wav"),
+            ("audio/flac", "flac"),
+            ("audio/x-flac", "flac"),
+            ("audio/webm", "webm"),
+            ("audio/x-unknown", "bin"),
+            ("application/octet-stream", "bin"),
+        ];
+
+        for (mime, expected) in cases {
+            assert_eq!(extension_for_mime(mime), expected, "{mime}");
+        }
     }
 
     #[tokio::test]
