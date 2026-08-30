@@ -1489,7 +1489,6 @@ impl CapabilityRecord {
             None => EvidenceFreshness::Stale,
         }
     }
-
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
