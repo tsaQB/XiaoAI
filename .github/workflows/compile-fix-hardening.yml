@@ -1,0 +1,135 @@
+name: Compile-fix hardening checkpoint
+
+on:
+  push:
+    branches:
+      - fix/post-merge-p1-p2-p3-hardening
+    paths:
+      - '.github/workflows/compile-fix-hardening.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Apply compiler-driven fixes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one match, found {count}")
+              p.write_text(text.replace(old, new, 1))
+
+          replace_once(
+              "src/parser.rs",
+              '''    let underline_match = Regex::new(r"^-{3,}$")
+                  .ok()
+                  .is_some_and(|regex| i + 1 < n && regex.is_match(lines[i + 1].trim()));
+              if underline_match {
+                  let cols_hdr: Vec<&str> = Regex::new(r"\\s{2,}|\\t+")
+                      .ok()
+                      .map(|regex| regex.split(line).collect())
+                      .unwrap_or_else(|| line.split_whitespace().collect());''',
+              '''    let underline_re = Regex::new(r"^-{3,}$").ok();
+              let space_split_re = Regex::new(r"\\s{2,}|\\t+").ok();
+              let underline_match = underline_re
+                  .as_ref()
+                  .is_some_and(|regex| i + 1 < n && regex.is_match(lines[i + 1].trim()));
+              if underline_match {
+                  let cols_hdr: Vec<&str> = space_split_re
+                      .as_ref()
+                      .map(|regex| regex.split(line).collect())
+                      .unwrap_or_else(|| line.split_whitespace().collect());'''
+          )
+          replace_once(
+              "src/parser.rs",
+              '''                if underline_re.is_match(curr) {
+                      curr_i += 1;
+                      continue;
+                  }
+                  let data_cols: Vec<&str> = space_split_re
+                      .split(curr)
+                      .map(|c| c.trim())
+                      .filter(|c| !c.is_empty())
+                      .collect();''',
+              '''                if underline_re
+                      .as_ref()
+                      .is_some_and(|regex| regex.is_match(curr))
+                  {
+                      curr_i += 1;
+                      continue;
+                  }
+                  let data_cols: Vec<&str> = space_split_re
+                      .as_ref()
+                      .map(|regex| regex.split(curr).collect())
+                      .unwrap_or_else(|| curr.split_whitespace().collect());
+                  let data_cols: Vec<&str> = data_cols
+                      .into_iter()
+                      .map(|c| c.trim())
+                      .filter(|c| !c.is_empty())
+                      .collect();'''
+          )
+          replace_once(
+              "src/main.rs",
+              '''                    if !ai_service.switch_session(user_id, idx).await {
+                          bot.send_message_with_context(
+                              chat_id,
+                              "❌ Gagal mengganti sesi karena state aktif tidak dapat disimpan.",
+                              None,
+                              message_context,
+                          )
+                          .await?;
+                          return Ok(());
+                      }''',
+              '''                    if !ai_service.switch_session(user_id, idx).await {
+                          let _ = bot
+                              .send_message(
+                                  chat_id,
+                                  "❌ Gagal mengganti sesi karena state aktif tidak dapat disimpan.",
+                                  None,
+                                  None,
+                                  None,
+                                  None,
+                              )
+                              .await;
+                          return;
+                      }'''
+          )
+          replace_once(
+              "src/ai/storage.rs",
+              "    let mut newly_written_refs = Vec::new();",
+              "    let mut newly_written_refs: Vec<String> = Vec::new();"
+          )
+          replace_once(
+              "src/bot/client.rs",
+              '''                let stripped = tag_clean_re.replace_all(&b_html, "").into_owned();
+                  let plain = html_escape::decode_html_entities(&stripped).into_owned();''',
+              '''                let stripped = tag_clean_re
+                      .as_ref()
+                      .map(|regex| regex.replace_all(&b_html, "").into_owned())
+                      .unwrap_or_else(|| b_html.clone());
+                  let plain = html_escape::decode_html_entities(&stripped).into_owned();'''
+          )
+          PY
+          cargo fmt --all
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src
+          git commit -m "fix: resolve hardening compiler errors"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${GITHUB_REF_NAME}"
