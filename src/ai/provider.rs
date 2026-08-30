@@ -14,6 +14,134 @@ use super::storage::{
     ProviderConfig,
 };
 
+#[derive(Debug)]
+enum CapabilityProbeResponse {
+    Success(Value),
+    Rejected,
+    Unknown,
+}
+
+fn assistant_text(body: &Value) -> Option<String> {
+    let content = body
+        .get("choices")?
+        .as_array()?
+        .first()?
+        .get("message")?
+        .get("content")?;
+
+    if let Some(text) = content.as_str() {
+        return Some(text.trim().to_string());
+    }
+
+    let parts = content.as_array()?;
+    let text = parts
+        .iter()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("");
+    (!text.trim().is_empty()).then(|| text.trim().to_string())
+}
+
+fn validate_text_probe(response: &CapabilityProbeResponse) -> Option<bool> {
+    match response {
+        CapabilityProbeResponse::Rejected => Some(false),
+        CapabilityProbeResponse::Unknown => None,
+        CapabilityProbeResponse::Success(body) => {
+            assistant_text(body).filter(|text| !text.is_empty()).map(|_| true)
+        }
+    }
+}
+
+fn validate_tools_probe(response: &CapabilityProbeResponse) -> Option<bool> {
+    match response {
+        CapabilityProbeResponse::Rejected => Some(false),
+        CapabilityProbeResponse::Unknown => None,
+        CapabilityProbeResponse::Success(body) => {
+            let tool_calls = body
+                .get("choices")
+                .and_then(Value::as_array)
+                .and_then(|choices| choices.first())
+                .and_then(|choice| choice.get("message"))
+                .and_then(|message| message.get("tool_calls"))
+                .and_then(Value::as_array);
+            match tool_calls {
+                Some(calls)
+                    if calls.iter().any(|call| {
+                        call.get("function")
+                            .and_then(|function| function.get("name"))
+                            .and_then(Value::as_str)
+                            == Some("xiao_capability_probe")
+                    }) =>
+                {
+                    Some(true)
+                }
+                _ => None,
+            }
+        }
+    }
+}
+
+fn validate_structured_probe(response: &CapabilityProbeResponse) -> Option<bool> {
+    match response {
+        CapabilityProbeResponse::Rejected => Some(false),
+        CapabilityProbeResponse::Unknown => None,
+        CapabilityProbeResponse::Success(body) => assistant_text(body)
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|value| {
+                (value.get("xiao_probe").and_then(Value::as_bool) == Some(true)).then_some(true)
+            }),
+    }
+}
+
+fn validate_color_probe(response: &CapabilityProbeResponse, expected: &str) -> Option<bool> {
+    match response {
+        CapabilityProbeResponse::Rejected => Some(false),
+        CapabilityProbeResponse::Unknown => None,
+        CapabilityProbeResponse::Success(body) => {
+            let text = assistant_text(body)?;
+            let normalized = text
+                .trim()
+                .trim_matches(|ch: char| !ch.is_ascii_alphabetic())
+                .to_ascii_lowercase();
+            (normalized == expected).then_some(true)
+        }
+    }
+}
+
+fn combine_vision_probe_results(first: Option<bool>, second: Option<bool>) -> Option<bool> {
+    if first == Some(false) || second == Some(false) {
+        Some(false)
+    } else if first == Some(true) && second == Some(true) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+fn vision_probe_payload(model: &str, png_base64: &str) -> Value {
+    json!({
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Return only the dominant color visible in the image as one lowercase English word."
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:image/png;base64,{png_base64}"),
+                        "detail": "low"
+                    }
+                }
+            ]
+        }],
+        "stream": false,
+        "max_tokens": 8
+    })
+}
+
 impl AIChatService {
     pub async fn reload_provider_store(&self) -> bool {
         let store = match tokio::task::spawn_blocking(load_provider_store).await {
@@ -168,7 +296,7 @@ impl AIChatService {
         &self,
         provider: &ProviderConfig,
         payload: Value,
-    ) -> Option<bool> {
+    ) -> CapabilityProbeResponse {
         let url = format!(
             "{}/chat/completions",
             provider.endpoint.trim_end_matches('/')
@@ -187,13 +315,19 @@ impl AIChatService {
             req = req.header("Authorization", format!("Bearer {}", provider.api_key));
         }
 
-        let response = req.send().await.ok()?;
+        let response = match req.send().await {
+            Ok(response) => response,
+            Err(_) => return CapabilityProbeResponse::Unknown,
+        };
         if response.status().is_success() {
-            return Some(true);
+            return match response.json::<Value>().await {
+                Ok(body) => CapabilityProbeResponse::Success(body),
+                Err(_) => CapabilityProbeResponse::Unknown,
+            };
         }
         match response.status().as_u16() {
-            400 | 404 | 405 | 415 | 422 => Some(false),
-            _ => None,
+            400 | 404 | 405 | 415 | 422 => CapabilityProbeResponse::Rejected,
+            _ => CapabilityProbeResponse::Unknown,
         }
     }
 
@@ -202,76 +336,83 @@ impl AIChatService {
         provider: &ProviderConfig,
         model: &str,
     ) -> CapabilityRecord {
-        const ONE_PIXEL_PNG: &str =
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+        const RED_PNG: &str =
+            "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAF0lEQVR4nGP8z0AaYCJR/aiGUQ1DSAMAQC4BH2bjRnMAAAAASUVORK5CYII=";
+        const BLUE_PNG: &str =
+            "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAGUlEQVR4nGNkYPjPQApgIkn1qIZRDUNKAwA+MAEfWiW9ygAAAABJRU5ErkJggg==";
 
-        let base = json!({
-            "model": model,
-            "messages": [{"role": "user", "content": "Reply with OK."}],
-            "stream": false,
-            "max_tokens": 1
-        });
-        let text = self
-            .run_capability_probe_request(provider, base.clone())
-            .await;
-
-        let tools = self
+        let text_probe = self
             .run_capability_probe_request(
                 provider,
                 json!({
                     "model": model,
-                    "messages": [{"role": "user", "content": "Reply with OK."}],
+                    "messages": [{"role": "user", "content": "Reply with exactly OK."}],
                     "stream": false,
-                    "max_tokens": 1,
-                    "tools": [{
-                        "type": "function",
-                        "function": {
-                            "name": "xiao_capability_probe",
-                            "description": "No-op capability probe",
-                            "parameters": {"type": "object", "properties": {}}
-                        }
-                    }],
-                    "tool_choice": "none"
+                    "max_tokens": 4
                 }),
             )
             .await;
+        let text = validate_text_probe(&text_probe);
 
-        let structured = self
-            .run_capability_probe_request(
-                provider,
-                json!({
-                    "model": model,
-                    "messages": [{"role": "user", "content": "Return a JSON object with key ok and value true."}],
-                    "stream": false,
-                    "max_tokens": 8,
-                    "response_format": {"type": "json_object"}
-                }),
-            )
-            .await;
-
-        let image = self
+        let tools_probe = self
             .run_capability_probe_request(
                 provider,
                 json!({
                     "model": model,
                     "messages": [{
                         "role": "user",
-                        "content": [
-                            {"type": "text", "text": "Reply with OK."},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": format!("data:image/png;base64,{ONE_PIXEL_PNG}"),
-                                    "detail": "low"
-                                }
-                            }
-                        ]
+                        "content": "Call the xiao_capability_probe function now. Do not answer with normal text."
                     }],
                     "stream": false,
-                    "max_tokens": 1
+                    "max_tokens": 16,
+                    "tools": [{
+                        "type": "function",
+                        "function": {
+                            "name": "xiao_capability_probe",
+                            "description": "No-op capability probe",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {},
+                                "additionalProperties": false
+                            }
+                        }
+                    }],
+                    "tool_choice": {
+                        "type": "function",
+                        "function": {"name": "xiao_capability_probe"}
+                    }
                 }),
             )
             .await;
+        let tools = validate_tools_probe(&tools_probe);
+
+        let structured_probe = self
+            .run_capability_probe_request(
+                provider,
+                json!({
+                    "model": model,
+                    "messages": [{
+                        "role": "user",
+                        "content": "Return exactly this JSON object: {\\"xiao_probe\\":true}"
+                    }],
+                    "stream": false,
+                    "max_tokens": 16,
+                    "response_format": {"type": "json_object"}
+                }),
+            )
+            .await;
+        let structured = validate_structured_probe(&structured_probe);
+
+        let red_probe = self
+            .run_capability_probe_request(provider, vision_probe_payload(model, RED_PNG))
+            .await;
+        let blue_probe = self
+            .run_capability_probe_request(provider, vision_probe_payload(model, BLUE_PNG))
+            .await;
+        let image = combine_vision_probe_results(
+            validate_color_probe(&red_probe, "red"),
+            validate_color_probe(&blue_probe, "blue"),
+        );
 
         let provider_id = provider.endpoint.trim_end_matches('/').to_string();
         let metadata = self
@@ -625,4 +766,68 @@ impl AIChatService {
     // ==========================================
     // Multi-Session Management
     // ==========================================
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response_with_message(message: Value) -> CapabilityProbeResponse {
+        CapabilityProbeResponse::Success(json!({
+            "choices": [{"message": message}]
+        }))
+    }
+
+    #[test]
+    fn successful_http_without_tool_call_does_not_prove_tools() {
+        let response = response_with_message(json!({"content": "OK"}));
+        assert_eq!(validate_tools_probe(&response), None);
+    }
+
+    #[test]
+    fn named_tool_call_proves_tools() {
+        let response = response_with_message(json!({
+            "content": null,
+            "tool_calls": [{
+                "type": "function",
+                "function": {"name": "xiao_capability_probe", "arguments": "{}"}
+            }]
+        }));
+        assert_eq!(validate_tools_probe(&response), Some(true));
+    }
+
+    #[test]
+    fn structured_probe_requires_expected_json_behavior() {
+        let good = response_with_message(json!({"content": "{\"xiao_probe\":true}"}));
+        let ignored = response_with_message(json!({"content": "sure"}));
+        assert_eq!(validate_structured_probe(&good), Some(true));
+        assert_eq!(validate_structured_probe(&ignored), None);
+    }
+
+    #[test]
+    fn vision_probe_requires_two_demonstrated_colors() {
+        let red = response_with_message(json!({"content": "red"}));
+        let blue = response_with_message(json!({"content": "blue"}));
+        assert_eq!(validate_color_probe(&red, "red"), Some(true));
+        assert_eq!(validate_color_probe(&blue, "blue"), Some(true));
+        assert_eq!(
+            combine_vision_probe_results(
+                validate_color_probe(&red, "red"),
+                validate_color_probe(&blue, "blue")
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn explicit_probe_rejection_is_unsupported() {
+        assert_eq!(
+            validate_tools_probe(&CapabilityProbeResponse::Rejected),
+            Some(false)
+        );
+        assert_eq!(
+            validate_structured_probe(&CapabilityProbeResponse::Rejected),
+            Some(false)
+        );
+    }
 }

@@ -1,6 +1,8 @@
 use regex::Regex;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 use tokio::process::Command;
 use zip::ZipArchive;
 
@@ -10,6 +12,10 @@ const MAX_RENDERED_PDF_BYTES: usize = 12 * 1024 * 1024;
 const MAX_ZIP_XML_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_PDF_STREAM_BYTES: usize = 8 * 1024 * 1024;
 const MAX_XLSX_WORKSHEETS: usize = 64;
+const MAX_XLSX_XML_BYTES_TOTAL: usize = 24 * 1024 * 1024;
+const PDF_PAGE_RENDER_TIMEOUT: Duration = Duration::from_secs(12);
+const PDF_RENDER_TOTAL_TIMEOUT: Duration = Duration::from_secs(45);
+const MAX_RENDERED_PAGE_DIMENSION: usize = 1600;
 
 #[derive(Debug, Default)]
 pub struct ExtractedDocument {
@@ -102,19 +108,21 @@ pub async fn extract_document(
 
     if mime == "application/pdf" || name_lower.ends_with(".pdf") {
         let pdf_bytes = data.clone();
-        let extracted = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            let document = lopdf::Document::load_mem_with_options(
-                &pdf_bytes,
-                lopdf::LoadOptions::with_max_decompressed_size(MAX_PDF_STREAM_BYTES),
-            )
-            .map_err(|err| format!("PDF tidak dapat dibaca: {err}"))?;
-            let pages: Vec<u32> = document.get_pages().keys().copied().collect();
-            document
-                .extract_text_with_limit(&pages, MAX_PDF_STREAM_BYTES)
-                .map_err(|err| format!("Teks PDF tidak dapat diekstrak: {err}"))
-        })
-        .await
-        .map_err(|err| format!("Task extractor PDF gagal: {err}"))??;
+        let (extracted, page_count) =
+            tokio::task::spawn_blocking(move || -> Result<(String, usize), String> {
+                let document = lopdf::Document::load_mem_with_options(
+                    &pdf_bytes,
+                    lopdf::LoadOptions::with_max_decompressed_size(MAX_PDF_STREAM_BYTES),
+                )
+                .map_err(|err| format!("PDF tidak dapat dibaca: {err}"))?;
+                let pages: Vec<u32> = document.get_pages().keys().copied().collect();
+                let text = document
+                    .extract_text_with_limit(&pages, MAX_PDF_STREAM_BYTES)
+                    .map_err(|err| format!("Teks PDF tidak dapat diekstrak: {err}"))?;
+                Ok((text, pages.len()))
+            })
+            .await
+            .map_err(|err| format!("Task extractor PDF gagal: {err}"))??;
         let cleaned = normalize_extracted_text(&extracted);
         if cleaned.chars().filter(|c| !c.is_whitespace()).count() >= 24 {
             return Ok(ExtractedDocument {
@@ -123,7 +131,7 @@ pub async fn extract_document(
             });
         }
 
-        match render_scanned_pdf_pages(&data).await {
+        match render_scanned_pdf_pages(&data, page_count).await {
             Ok(pages) if !pages.is_empty() => Ok(ExtractedDocument {
                 text: None,
                 rendered_pages: pages,
@@ -191,6 +199,10 @@ fn extract_xlsx_text(data: &[u8]) -> Result<String, String> {
     let mut archive =
         ZipArchive::new(Cursor::new(data)).map_err(|err| format!("XLSX invalid: {err}"))?;
     let shared = read_zip_text_optional(&mut archive, "xl/sharedStrings.xml")?;
+    let mut xml_budget = 0usize;
+    if let Some(shared_xml) = shared.as_deref() {
+        add_xlsx_xml_budget(&mut xml_budget, shared_xml.len())?;
+    }
     let shared_strings = shared
         .as_deref()
         .map(extract_all_t_nodes)
@@ -217,6 +229,7 @@ fn extract_xlsx_text(data: &[u8]) -> Result<String, String> {
 
     for sheet_name in worksheet_names {
         let xml = read_zip_text(&mut archive, &sheet_name)?;
+        add_xlsx_xml_budget(&mut xml_budget, xml.len())?;
         if !output.is_empty() {
             output.push_str("\n\n");
         }
@@ -264,6 +277,18 @@ fn extract_xlsx_text(data: &[u8]) -> Result<String, String> {
     } else {
         Ok(normalized)
     }
+}
+
+fn add_xlsx_xml_budget(total: &mut usize, additional: usize) -> Result<(), String> {
+    let next = total.saturating_add(additional);
+    if next > MAX_XLSX_XML_BYTES_TOTAL {
+        return Err(format!(
+            "Total XML XLSX melebihi batas aman {} MiB.",
+            MAX_XLSX_XML_BYTES_TOTAL / (1024 * 1024)
+        ));
+    }
+    *total = next;
+    Ok(())
 }
 
 fn read_zip_text_optional<R: std::io::Read + std::io::Seek>(
@@ -334,60 +359,104 @@ fn limit_text(text: String) -> String {
     }
 }
 
-async fn render_scanned_pdf_pages(data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+async fn render_scanned_pdf_pages(
+    data: &[u8],
+    page_count: usize,
+) -> Result<Vec<Vec<u8>>, String> {
     let suffix: u64 = rand::random();
-    let base = std::env::temp_dir().join(format!("xiao-pdf-{suffix}"));
-    let input = base.with_extension("pdf");
-    let prefix = base.with_extension("page");
-    tokio::fs::write(&input, data)
+    let temp_dir = std::env::temp_dir().join(format!("xiao-pdf-{suffix}"));
+    let input = temp_dir.join("input.pdf");
+
+    tokio::fs::create_dir(&temp_dir)
         .await
-        .map_err(|err| format!("Gagal menulis PDF sementara: {err}"))?;
-
-    let output = Command::new("pdftoppm")
-        .arg("-png")
-        .arg("-r")
-        .arg("120")
-        .arg("-f")
-        .arg("1")
-        .arg("-l")
-        .arg(MAX_SCANNED_PDF_PAGES.to_string())
-        .arg(&input)
-        .arg(&prefix)
-        .output()
-        .await;
-
-    let _ = tokio::fs::remove_file(&input).await;
-    let output = output.map_err(|err| {
-        format!("Renderer pdftoppm tidak tersedia ({err}). Instal poppler-utils pada host Linux untuk OCR PDF scan.")
-    })?;
-    if !output.status.success() {
-        return Err(format!(
-            "pdftoppm gagal: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        .map_err(|err| format!("Gagal membuat direktori PDF sementara: {err}"))?;
+    if let Err(err) = tokio::fs::write(&input, data).await {
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        return Err(format!("Gagal menulis PDF sementara: {err}"));
     }
 
-    let mut pages = Vec::new();
-    let mut total = 0usize;
-    for index in 1..=MAX_SCANNED_PDF_PAGES {
-        let path = rendered_page_path(&prefix, index);
-        let bytes = match tokio::fs::read(&path).await {
-            Ok(bytes) => bytes,
-            Err(_) => continue,
-        };
-        let _ = tokio::fs::remove_file(&path).await;
-        total = total.saturating_add(bytes.len());
-        if total > MAX_RENDERED_PDF_BYTES {
-            break;
+    let render_result = tokio::time::timeout(PDF_RENDER_TOTAL_TIMEOUT, async {
+        let mut pages = Vec::new();
+        let mut total = 0usize;
+        let pages_to_render = page_count.min(MAX_SCANNED_PDF_PAGES);
+
+        for index in 1..=pages_to_render {
+            let prefix = temp_dir.join(format!("page-{index}"));
+            let output_path = prefix.with_extension("png");
+            let mut child = Command::new("pdftoppm")
+                .arg("-png")
+                .arg("-q")
+                .arg("-scale-to")
+                .arg(MAX_RENDERED_PAGE_DIMENSION.to_string())
+                .arg("-f")
+                .arg(index.to_string())
+                .arg("-l")
+                .arg(index.to_string())
+                .arg("-singlefile")
+                .arg(&input)
+                .arg(&prefix)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|err| {
+                    format!(
+                        "Renderer pdftoppm tidak tersedia ({err}). Instal poppler-utils pada host Linux untuk OCR PDF scan."
+                    )
+                })?;
+
+            let status = match tokio::time::timeout(PDF_PAGE_RENDER_TIMEOUT, child.wait()).await {
+                Ok(Ok(status)) => status,
+                Ok(Err(err)) => return Err(format!("pdftoppm gagal dijalankan: {err}")),
+                Err(_) => {
+                    let _ = child.kill().await;
+                    return Err(format!(
+                        "pdftoppm melebihi timeout {} detik per halaman.",
+                        PDF_PAGE_RENDER_TIMEOUT.as_secs()
+                    ));
+                }
+            };
+            if !status.success() {
+                return Err(format!("pdftoppm gagal saat merender halaman {index}."));
+            }
+
+            let metadata = tokio::fs::metadata(&output_path)
+                .await
+                .map_err(|err| format!("Output pdftoppm halaman {index} tidak tersedia: {err}"))?;
+            let page_size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+            if page_size > MAX_RENDERED_PDF_BYTES
+                || total.saturating_add(page_size) > MAX_RENDERED_PDF_BYTES
+            {
+                return Err(format!(
+                    "Output render PDF melebihi batas aman {} MiB.",
+                    MAX_RENDERED_PDF_BYTES / (1024 * 1024)
+                ));
+            }
+
+            let bytes = tokio::fs::read(&output_path)
+                .await
+                .map_err(|err| format!("Gagal membaca render PDF halaman {index}: {err}"))?;
+            total = total.saturating_add(bytes.len());
+            pages.push(bytes);
+            let _ = tokio::fs::remove_file(&output_path).await;
         }
-        pages.push(bytes);
-    }
-    Ok(pages)
+
+        Ok(pages)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(format!(
+            "Render PDF melebihi timeout total {} detik.",
+            PDF_RENDER_TOTAL_TIMEOUT.as_secs()
+        ))
+    });
+
+    // One private temp directory contains the input and every page output, so
+    // timeout/error/budget exits cannot leak later pages into /tmp.
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    render_result
 }
 
-fn rendered_page_path(prefix: &Path, index: usize) -> PathBuf {
-    PathBuf::from(format!("{}-{index}.png", prefix.display()))
-}
 
 #[cfg(test)]
 mod tests {
@@ -403,6 +472,13 @@ mod tests {
             "application/octet-stream",
             "archive.zip"
         ));
+    }
+
+    #[test]
+    fn xlsx_aggregate_xml_budget_is_bounded() {
+        let mut total = 0usize;
+        assert!(add_xlsx_xml_budget(&mut total, MAX_XLSX_XML_BYTES_TOTAL).is_ok());
+        assert!(add_xlsx_xml_budget(&mut total, 1).is_err());
     }
 
     #[test]

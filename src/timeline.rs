@@ -297,7 +297,7 @@ impl ExecutionTimeline {
                 self.draft_id,
                 &rich_message,
                 self.can_stop,
-                self.can_stop,
+                false,
             )
             .await
         {

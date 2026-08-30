@@ -305,7 +305,9 @@ impl AIChatService {
         if existing.is_empty() {
             let now_str = Local::now().format("%d %b %H:%M").to_string();
             let session = ChatSession {
-                id: allocate_session_id_db_async(user_id).await.unwrap_or(1),
+                id: allocate_session_id_db_async(user_id)
+                    .await
+                    .expect("persistent session ID allocation failed; refusing to reuse an ID"),
                 name: format!("Session {now_str}"),
                 messages: Vec::new(),
                 created_at: now_str,
@@ -364,18 +366,9 @@ impl AIChatService {
     pub async fn create_new_session(&self, user_id: i64, custom_name: Option<&str>) -> ChatSession {
         let _ = self.get_sessions(user_id).await;
         let now_str = Local::now().format("%d %b %H:%M").to_string();
-        let fallback_next_id = {
-            let sessions_map = self.user_sessions.read().await;
-            sessions_map
-                .get(&user_id)
-                .and_then(|list| list.iter().map(|session| session.id).max())
-                .unwrap_or(0)
-                .saturating_add(1)
-                .max(1)
-        };
         let new_id = allocate_session_id_db_async(user_id)
             .await
-            .unwrap_or(fallback_next_id);
+            .expect("persistent session ID allocation failed; refusing to reuse an ID");
         let name = custom_name
             .map(|value| truncate_chars(value.trim(), 60))
             .filter(|value| !value.is_empty())
@@ -452,7 +445,7 @@ impl AIChatService {
             let replacement = ChatSession {
                 id: allocate_session_id_db_async(user_id)
                     .await
-                    .unwrap_or(active_id.saturating_add(1).max(1)),
+                    .expect("persistent session ID allocation failed; refusing to reuse an ID"),
                 name: format!("Session {now_str}"),
                 messages: Vec::new(),
                 created_at: now_str,
@@ -1030,7 +1023,7 @@ impl AIChatService {
                     if changed.is_ok() && *cancel_rx.borrow() {
                         if let Some(tl) = timeline {
                             tl.fail_current("Stopped by user".to_string()).await;
-                            tl.sync_draft(true).await;
+                            tl.stop_ticker();
                         }
                         return (None, "⏹️ Generasi dihentikan oleh pengguna.".to_string(), true);
                     }
@@ -1059,7 +1052,7 @@ impl AIChatService {
                             if changed.is_ok() && *cancel_rx.borrow() {
                                 if let Some(tl) = timeline {
                                     tl.fail_current("Stopped by user".to_string()).await;
-                                    tl.sync_draft(true).await;
+                                    tl.stop_ticker();
                                 }
                                 return (None, "⏹️ Generasi dihentikan oleh pengguna.".to_string(), true);
                             }
@@ -1086,7 +1079,7 @@ impl AIChatService {
                                 if changed.is_ok() && *cancel_rx.borrow() {
                                     if let Some(tl) = timeline {
                                         tl.fail_current("Stopped by user".to_string()).await;
-                                        tl.sync_draft(true).await;
+                                        tl.stop_ticker();
                                     }
                                     return (None, "⏹️ Generasi dihentikan oleh pengguna.".to_string(), true);
                                 }
@@ -1303,7 +1296,7 @@ impl AIChatService {
             tl.set_partial_answer(&answer_text).await;
             if cancelled {
                 tl.fail_current("Stopped by user".to_string()).await;
-                tl.sync_draft(true).await;
+                tl.stop_ticker();
             } else if stream_interrupted {
                 tl.fail_current("Provider stream interrupted".to_string())
                     .await;
