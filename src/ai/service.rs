@@ -331,10 +331,7 @@ fn select_audio_execution_mode(
     let transcription = capability.effective_state_for(CapabilityKind::AudioTranscription);
     let native_format = native_audio_input_format(mime_type, file_name);
 
-    if inherited_main
-        && native == CapabilityState::Supported
-        && native_format.is_ok()
-    {
+    if inherited_main && native == CapabilityState::Supported && native_format.is_ok() {
         Ok(AudioExecutionMode::Native)
     } else if transcription == CapabilityState::Supported {
         Ok(AudioExecutionMode::Transcription)
@@ -1711,16 +1708,15 @@ impl AIChatService {
 
         if role == ModelRole::AudioStt {
             let inherited_main = same_as_main && specialist.route_origin == RouteOrigin::MainModel;
-            let audio_mode =
-                match select_audio_execution_mode(
-                    &specialist.capability,
-                    inherited_main,
-                    audio_mime,
-                    doc_name,
-                ) {
-                    Ok(mode) => mode,
-                    Err(error) => return (None, error, false),
-                };
+            let audio_mode = match select_audio_execution_mode(
+                &specialist.capability,
+                inherited_main,
+                audio_mime,
+                doc_name,
+            ) {
+                Ok(mode) => mode,
+                Err(error) => return (None, error, false),
+            };
 
             if audio_mode == AudioExecutionMode::Native {
                 return self
