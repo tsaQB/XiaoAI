@@ -249,7 +249,7 @@ fn save_provider_state_db(store: &ProviderStore) -> std::io::Result<()> {
 
     let mut sanitized = store.clone();
     let mut superseded_refs = Vec::new();
-    let mut newly_written_refs = Vec::new();
+    let mut newly_written_refs: Vec<String> = Vec::new();
     for provider in &mut sanitized.providers {
         let old_ref = provider
             .api_key_ref
