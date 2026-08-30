@@ -913,17 +913,18 @@ async fn handle_image_generation(
         ]
         .contains(&clean_prompt.as_str())
     {
-        let sess = ai_service.get_active_session(user_id).await;
         let mut last_context = String::new();
-        for msg in sess.messages.iter().rev() {
-            let candidate = match &msg.content {
-                Value::String(value) => Some(value.clone()),
-                value => attachments::decode_user_content(value).map(|content| content.text),
-            };
-            if let Some(candidate) = candidate {
-                if candidate.trim().chars().count() > 8 {
-                    last_context = candidate.trim().to_string();
-                    break;
+        if let Some(sess) = ai_service.get_active_session(user_id).await {
+            for msg in sess.messages.iter().rev() {
+                let candidate = match &msg.content {
+                    Value::String(value) => Some(value.clone()),
+                    value => attachments::decode_user_content(value).map(|content| content.text),
+                };
+                if let Some(candidate) = candidate {
+                    if candidate.trim().chars().count() > 8 {
+                        last_context = candidate.trim().to_string();
+                        break;
+                    }
                 }
             }
         }
@@ -1595,9 +1596,21 @@ async fn handle_update(
             ]
             .contains(&text.as_str())
         {
-            ai_service.create_new_session(user_id, None).await;
+            if ai_service.create_new_session(user_id, None).await.is_none() {
+                let _ = bot
+                    .send_message(
+                        chat_id,
+                        "⚠️ <b>Session baru tidak dibuat.</b> Penyimpanan sedang tidak tersedia; XiaoAI menolak memakai ID sementara yang dapat bentrok.",
+                        Some("HTML"),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                return;
+            }
             let total_sessions = ai_service.get_sessions(user_id).await.len();
-            let target_page = (total_sessions - 1) / 5 + 1;
+            let target_page = total_sessions.saturating_sub(1) / 5 + 1;
             let _ = bot
                 .send_message(
                     chat_id,
@@ -1659,7 +1672,19 @@ async fn handle_update(
         .contains(&text.as_str())
         {
             let active_idx = ai_service.get_active_session_index(user_id).await;
-            let active_session_id = ai_service.get_active_session_id(user_id).await;
+            let Some(active_session_id) = ai_service.get_active_session_id(user_id).await else {
+                let _ = bot
+                    .send_message(
+                        chat_id,
+                        "⚠️ Session aktif tidak tersedia karena storage gagal diakses.",
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                return;
+            };
             ai_service
                 .user_waiting_rename
                 .write()
@@ -2069,9 +2094,18 @@ async fn handle_update(
                 .await;
             }
         } else if cq_data == "session_new" {
-            ai_service.create_new_session(user_id, None).await;
+            if ai_service.create_new_session(user_id, None).await.is_none() {
+                let _ = bot
+                    .answer_callback_query(
+                        &cq_id,
+                        Some("Storage tidak tersedia; session tidak dibuat."),
+                        true,
+                    )
+                    .await;
+                return;
+            }
             let total_sessions = ai_service.get_sessions(user_id).await.len();
-            let target_page = (total_sessions - 1) / 5 + 1;
+            let target_page = total_sessions.saturating_sub(1) / 5 + 1;
             let _ = bot
                 .answer_callback_query(&cq_id, Some("Session baru berhasil dibuat! ➕"), false)
                 .await;
@@ -2334,7 +2368,16 @@ async fn handle_update(
                 let _ = bot.delete_message(chat_id, mid).await;
             }
         } else if cq_data == "open_new_session" {
-            let new_sess = ai_service.create_new_session(user_id, None).await;
+            let Some(new_sess) = ai_service.create_new_session(user_id, None).await else {
+                let _ = bot
+                    .answer_callback_query(
+                        &cq_id,
+                        Some("Storage tidak tersedia; sesi tidak dibuat."),
+                        true,
+                    )
+                    .await;
+                return;
+            };
             let _ = bot
                 .answer_callback_query(
                     &cq_id,
