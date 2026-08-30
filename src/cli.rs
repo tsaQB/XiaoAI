@@ -1369,6 +1369,9 @@ pub(crate) async fn run_cli_model_addon(ai_service: &AIChatService, args: &[Stri
             }
         }
         "probe" => {
+            println!(
+                "Probe refreshes and persists safe capability evidence. Active image-generation probing is skipped here because it may consume credits."
+            );
             if let Some(role_name) = args.get(1) {
                 let Some(role) = ModelRole::parse(role_name) else {
                     println!("[ERROR] Unknown role: {}", role_name);
@@ -1390,7 +1393,9 @@ pub(crate) async fn run_cli_model_addon(ai_service: &AIChatService, args: &[Stri
                 println!("[ERROR] Main Model is not an addon route.");
                 return;
             }
-            println!("Testing saved route end-to-end without changing routing...");
+            println!(
+                "Test sends a role-specific functional sample to the saved route without changing routing or refreshing the normal capability registry."
+            );
             match role {
                 ModelRole::ImageGeneration => {
                     println!("[WARN] This explicit image-generation test can consume provider credits.");
@@ -1408,23 +1413,12 @@ pub(crate) async fn run_cli_model_addon(ai_service: &AIChatService, args: &[Stri
                         Err(error) => println!("[FAIL] {error}"),
                     }
                 }
-                ModelRole::Vision | ModelRole::AudioStt => {
-                    probe_addon_role(ai_service, role).await;
-                    match ai_service.resolve_model_route(role).await {
-                        Ok(resolved) => println!(
-                            "[OK] {} functional sample verified on {} / {}.",
-                            role.display_name(), resolved.provider.name, resolved.model
-                        ),
+                ModelRole::Vision | ModelRole::Video | ModelRole::AudioStt => {
+                    match ai_service.test_model_role(role).await {
+                        Ok(detail) => println!("[OK] {detail}"),
                         Err(error) => println!("[FAIL] {error}"),
                     }
                 }
-                ModelRole::Video => match ai_service.resolve_model_route(role).await {
-                    Ok(resolved) => println!(
-                        "[OK] Video route is verified by available evidence: {} / {}. No portable active video sample is sent automatically.",
-                        resolved.provider.name, resolved.model
-                    ),
-                    Err(error) => println!("[FAIL] {error}"),
-                },
                 ModelRole::Main => unreachable!(),
             }
         }
