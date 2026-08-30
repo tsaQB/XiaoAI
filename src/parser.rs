@@ -608,7 +608,7 @@ pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
                 if is_ordered && numbered_re.is_match(curr) {
                     let item_text = numbered_re.replace(curr, "").trim().to_string();
                     let value = curr
-                        .split_once(|character: char| character == '.' || character == ')')
+                        .split_once(['.', ')'])
                         .and_then(|(prefix, _)| prefix.parse::<i64>().ok());
                     list_items.push(RichBlockListItem::ordered(
                         vec![json!({
