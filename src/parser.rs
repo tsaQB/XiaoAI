@@ -572,7 +572,7 @@ fn sanitize_provisional_markdown(tail: &str) -> String {
     if let Ok(re) = Regex::new(r"(?m)^\s*(?:[-*•]|\d+[.)])\s+") {
         safe = re.replace_all(&safe, "").into_owned();
     }
-    if let Ok(re) = Regex::new(r"(?m)^\s*(?:-{3,}|\*{3,}|_{3,})\s*$") {
+    if let Ok(re) = Regex::new(r"(?m)^\s*(?:-{1,}|\*{3,}|_{3,})\s*$") {
         safe = re.replace_all(&safe, "").into_owned();
     }
 
