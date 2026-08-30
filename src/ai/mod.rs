@@ -1,5 +1,6 @@
 pub mod capability;
 pub mod http;
+pub mod routing;
 pub mod service;
 pub mod stream;
 
