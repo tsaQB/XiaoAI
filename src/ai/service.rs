@@ -38,7 +38,8 @@ use super::storage::{
 pub use super::storage::{
     load_app_setting, load_capability_registry, load_model_routing, load_provider_store,
     save_app_setting, save_provider_store, CapabilityKind, CapabilityRecord, CapabilityRegistry,
-    CapabilityState, ChatMessage, ChatSession, ProbeEvent, ProviderConfig, ProviderStore,
+    CapabilityState, ChatMessage, ChatSession, ProbeEvent, ProbeOutcome, ProviderConfig,
+    ProviderStore,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

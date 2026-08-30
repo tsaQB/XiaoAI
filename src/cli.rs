@@ -18,7 +18,7 @@ use crossterm::{
 
 use crate::ai::service::{
     load_provider_store, save_provider_store, CapabilityKind, ModelRole, ModelRoute, ProbeEvent,
-    ProviderConfig,
+    ProbeOutcome, ProviderConfig,
 };
 
 struct CleanRawMode;
@@ -1434,12 +1434,12 @@ pub(crate) async fn run_cli_model_addon(ai_service: &AIChatService, args: &[Stri
                         .probe_image_generation_active_with_observer(role, print_probe_event)
                         .await
                     {
-                        Ok(record) if record.supports_image_generation == Some(true) => {
+                        Ok((_record, ProbeOutcome::Supported)) => {
                             println!("[OK] Image Generation Model completed an active functional probe and the evidence was saved.");
                         }
-                        Ok(record) => println!(
-                            "[FAIL] Image generation remains {:?}; timeout/provider errors remain Unknown rather than Unsupported.",
-                            record.state_for(CapabilityKind::ImageGeneration)
+                        Ok((record, outcome)) => println!(
+                            "[FAIL] Current image-generation probe finished as {outcome:?}; previous saved evidence remains {:?} and is not misreported as a new success.",
+                            record.effective_state_for(CapabilityKind::ImageGeneration)
                         ),
                         Err(error) => println!("[FAIL] {error}"),
                     }

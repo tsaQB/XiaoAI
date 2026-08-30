@@ -1099,7 +1099,7 @@ impl AIChatService {
         &self,
         role: ModelRole,
         mut observer: F,
-    ) -> Result<CapabilityRecord, String>
+    ) -> Result<(CapabilityRecord, ProbeOutcome), String>
     where
         F: FnMut(ProbeEvent),
     {
@@ -1174,7 +1174,7 @@ impl AIChatService {
         observer(ProbeEvent::Persistence { saved: published });
         observer(ProbeEvent::Finished);
         if saved {
-            Ok(record)
+            Ok((record, outcome))
         } else {
             Err(
                 "image-generation probe result was not published because persistence failed"
@@ -2058,6 +2058,38 @@ mod tests {
             false
         ));
         assert_eq!(runtime.models[0].supports_image_input, Some(false));
+    }
+
+    #[test]
+    fn transient_probe_result_preserves_previous_authoritative_evidence() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut record = CapabilityRecord {
+            evidence: vec![CapabilityEvidence {
+                capability: CapabilityKind::ImageGeneration,
+                source: CapabilityEvidenceSource::ActiveProbe,
+                outcome: CapabilityState::Supported,
+                checked_at: now.clone(),
+                detail: Some("previous successful active probe".to_string()),
+            }],
+            ..CapabilityRecord::default()
+        };
+        replace_capability_evidence(
+            &mut record,
+            CapabilityKind::ImageGeneration,
+            CapabilityEvidenceSource::ActiveProbe,
+            None,
+            &now,
+            Some("transient timeout".to_string()),
+        );
+        assert_eq!(record.evidence.len(), 1);
+        assert_eq!(
+            record.effective_state_for(CapabilityKind::ImageGeneration),
+            CapabilityState::Supported
+        );
+        assert_eq!(
+            record.evidence[0].detail.as_deref(),
+            Some("previous successful active probe")
+        );
     }
 
     #[test]
