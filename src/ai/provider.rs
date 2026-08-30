@@ -316,18 +316,6 @@ impl AIChatService {
         self.model_routing.read().await.clone()
     }
 
-    pub async fn reload_model_routing(&self) -> bool {
-        let config = match tokio::task::spawn_blocking(super::storage::load_model_routing).await {
-            Ok(config) => config,
-            Err(error) => {
-                warn!("Failed to reload model routing: {error}");
-                return false;
-            }
-        };
-        *self.model_routing.write().await = config;
-        true
-    }
-
     pub async fn set_model_route(&self, role: ModelRole, route: ModelRoute) -> Result<(), String> {
         if role == ModelRole::Main {
             return Err(
@@ -507,7 +495,6 @@ impl AIChatService {
             });
 
         Ok(ResolvedModelRoute {
-            role,
             provider,
             model,
             capability,
