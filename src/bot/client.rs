@@ -7,8 +7,8 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 
 use super::models::{
-    ApiResponse, BotCommand, EphemeralMessageParameters, FileInfo, InputRichMessage, RichBlock,
-    RichBlockTableCell, Update, User,
+    ApiResponse, BotCommand, EphemeralMessageParameters, FileInfo, InputRichMessage,
+    ReplyParameters, RichBlock, RichBlockTableCell, Update, User,
 };
 
 const MAX_TELEGRAM_DOWNLOAD_BYTES: usize = 20 * 1024 * 1024;
@@ -56,32 +56,37 @@ impl TelegramBotClient {
         &self.token
     }
 
-    async fn post_json(&self, method: &str, payload: Value) -> Result<Value, String> {
+    fn telegram_api_error(method: &str, response: &Value) -> String {
+        let code = response
+            .get("error_code")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        let description = response
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("Telegram API request failed");
+        let retry_after = response
+            .pointer("/parameters/retry_after")
+            .and_then(Value::as_i64)
+            .map(|seconds| format!(" retry_after={seconds}s"))
+            .unwrap_or_default();
+        format!("Telegram API error [{method}] code={code}: {description}{retry_after}")
+    }
+
+    async fn post_json_raw(&self, method: &str, payload: Value) -> Result<Value, String> {
         let url = format!("{}/{}", self.base_url, method);
         match self.client.post(&url).json(&payload).send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                match resp.json::<Value>().await {
-                    Ok(json_res) => {
-                        if !json_res
-                            .get("ok")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false)
-                        {
-                            warn!("Telegram API error [{method}] status {status}: {json_res}");
-                        }
-                        Ok(json_res)
-                    }
-                    Err(e) => {
-                        let err_msg = format!(
-                            "Failed to parse response JSON for {method}: {}",
-                            reqwest_error_kind(&e)
-                        );
-                        error!("{err_msg}");
-                        Err(err_msg)
-                    }
+            Ok(resp) => match resp.json::<Value>().await {
+                Ok(json_res) => Ok(json_res),
+                Err(e) => {
+                    let err_msg = format!(
+                        "Failed to parse response JSON for {method}: {}",
+                        reqwest_error_kind(&e)
+                    );
+                    error!("{err_msg}");
+                    Err(err_msg)
                 }
-            }
+            },
             Err(e) => {
                 // Do not format reqwest::Error directly here: it can contain the full
                 // Telegram URL, and Telegram URLs contain the bot token.
@@ -90,6 +95,16 @@ impl TelegramBotClient {
                 Err(err_msg)
             }
         }
+    }
+
+    async fn post_json(&self, method: &str, payload: Value) -> Result<Value, String> {
+        let response = self.post_json_raw(method, payload).await?;
+        if response.get("ok").and_then(Value::as_bool) == Some(true) {
+            return Ok(response);
+        }
+        let error = Self::telegram_api_error(method, &response);
+        warn!("{error}");
+        Err(error)
     }
 
     // ==========================================
@@ -239,7 +254,8 @@ impl TelegramBotClient {
                 }
                 if is_first {
                     if let Some(rep) = reply_to_message_id {
-                        payload["reply_to_message_id"] = json!(rep);
+                        payload["reply_parameters"] =
+                            serde_json::to_value(ReplyParameters::new(rep)).unwrap_or(json!({}));
                     }
                 }
                 last_res = self.post_json("sendMessage", payload).await?;
@@ -267,7 +283,8 @@ impl TelegramBotClient {
                 .unwrap_or(json!({}));
         }
         if let Some(rep) = reply_to_message_id {
-            payload["reply_to_message_id"] = json!(rep);
+            payload["reply_parameters"] =
+                            serde_json::to_value(ReplyParameters::new(rep)).unwrap_or(json!({}));
         }
 
         self.post_json("sendMessage", payload).await
@@ -283,9 +300,23 @@ impl TelegramBotClient {
         reply_to_message_id: Option<i64>,
     ) -> Result<Value, String> {
         let url = format!("{}/sendPhoto", self.base_url);
+        let (file_name, mime_type) = if photo_bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            ("image.png", "image/png")
+        } else if photo_bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+            ("image.jpg", "image/jpeg")
+        } else if photo_bytes.starts_with(b"GIF87a") || photo_bytes.starts_with(b"GIF89a") {
+            ("image.gif", "image/gif")
+        } else if photo_bytes.len() >= 12
+            && &photo_bytes[..4] == b"RIFF"
+            && &photo_bytes[8..12] == b"WEBP"
+        {
+            ("image.webp", "image/webp")
+        } else {
+            return Err("sendPhoto rejected bytes with an unsupported image signature".to_string());
+        };
         let part = Part::bytes(photo_bytes)
-            .file_name("image.png")
-            .mime_str("image/png")
+            .file_name(file_name)
+            .mime_str(mime_type)
             .map_err(|e| e.to_string())?;
 
         let mut form = Form::new()
@@ -299,19 +330,28 @@ impl TelegramBotClient {
             form = form.text("parse_mode", pm.to_string());
         }
         if let Some(rep) = reply_to_message_id {
-            form = form.text("reply_to_message_id", rep.to_string());
+            let reply_parameters =
+                serde_json::to_string(&ReplyParameters::new(rep)).map_err(|e| e.to_string())?;
+            form = form.text("reply_parameters", reply_parameters);
         }
         if let Some(rm) = reply_markup {
             form = form.text("reply_markup", rm.to_string());
         }
 
         match self.client.post(&url).multipart(form).send().await {
-            Ok(resp) => resp.json::<Value>().await.map_err(|e| {
-                format!(
-                    "sendPhoto response decode error: {}",
-                    reqwest_error_kind(&e)
-                )
-            }),
+            Ok(resp) => {
+                let response = resp.json::<Value>().await.map_err(|e| {
+                    format!(
+                        "sendPhoto response decode error: {}",
+                        reqwest_error_kind(&e)
+                    )
+                })?;
+                if response.get("ok").and_then(Value::as_bool) == Some(true) {
+                    Ok(response)
+                } else {
+                    Err(Self::telegram_api_error("sendPhoto", &response))
+                }
+            }
             Err(e) => Err(format!(
                 "sendPhoto multipart error: {}",
                 reqwest_error_kind(&e)
@@ -361,7 +401,7 @@ impl TelegramBotClient {
             payload["reply_markup"] = rm.clone();
         }
 
-        let res = self.post_json("editMessageText", payload).await?;
+        let res = self.post_json_raw("editMessageText", payload).await?;
         if res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
             return Ok(res);
         }
@@ -439,7 +479,7 @@ impl TelegramBotClient {
             "keep_on_stop": keep_on_stop,
         });
 
-        let res = self.post_json("sendRichMessageDraft", payload).await?;
+        let res = self.post_json_raw("sendRichMessageDraft", payload).await?;
         let is_ok = res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
 
         if !is_ok {
@@ -513,7 +553,7 @@ impl TelegramBotClient {
                 .unwrap_or(json!({}));
         }
 
-        let res = self.post_json("sendRichMessage", payload).await?;
+        let res = self.post_json_raw("sendRichMessage", payload).await?;
         if res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
             return Ok(res);
         }
@@ -699,18 +739,18 @@ impl TelegramBotClient {
             RichBlock::List { items } => {
                 let mut list_lines = Vec::new();
                 for item in items {
-                    let item_str = if let Some(obj) = item.as_object() {
-                        if let Some(b) = obj.get("blocks") {
-                            self.rich_value_to_html(b)
-                        } else if let Some(t) = obj.get("text") {
-                            self.rich_value_to_html(t)
-                        } else {
-                            self.rich_value_to_html(item)
-                        }
-                    } else {
-                        self.rich_value_to_html(item)
-                    };
-                    list_lines.push(format!("• {item_str}"));
+                    let item_str = item
+                        .blocks
+                        .iter()
+                        .map(|block| self.rich_value_to_html(block))
+                        .collect::<Vec<_>>()
+                        .join("");
+                    let marker = item
+                        .value
+                        .map(|value| format!("{value}."))
+                        .or_else(|| item.kind.as_deref().map(|_| "1.".to_string()))
+                        .unwrap_or_else(|| "•".to_string());
+                    list_lines.push(format!("{marker} {item_str}"));
                 }
                 list_lines.join("\n")
             }
