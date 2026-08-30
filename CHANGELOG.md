@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — xiaochat v0.3.0 role-based multimodal routing
+## xiaochat v0.3.0 — 2026-08-30 — role-based multimodal routing
 
 ### Model routing
 - Add five explicit roles: Main Model, Vision Model, Video Model, Audio STT Model, and Image Generation Model.
