@@ -206,7 +206,8 @@ chmod +x "$PREFIX/bin/xiao"
 | `/context` | Estimasi context dan capability |
 | `/session` | Session manager |
 | `/new` | Session baru |
-| `/clear` | Hapus history session aktif |
+| `/clear` | Hapus history session aktif setelah konfirmasi |
+| `/cancel` | Batalkan wizard/aksi interaktif; generation dibatalkan lewat native Stop Telegram |
 | `/help` | Bantuan |
 
 ## Reliability Notes
