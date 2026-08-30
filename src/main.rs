@@ -776,6 +776,35 @@ fn build_help_ui() -> InputRichMessage {
     ])
 }
 
+fn telegram_can_edit_model_role(role: ai::service::ModelRole) -> bool {
+    role == ai::service::ModelRole::Main
+}
+
+fn specialist_context_policy(
+    role: ai::service::ModelRole,
+    origin: ai::service::RouteOrigin,
+) -> &'static str {
+    if origin == ai::service::RouteOrigin::MainModel {
+        return "Direct on Main; canonical history stays on Main";
+    }
+    match role {
+        ai::service::ModelRole::Vision | ai::service::ModelRole::Video => {
+            "Transient media + current question; no full history"
+        }
+        ai::service::ModelRole::AudioStt => "Transcript only; no full history",
+        ai::service::ModelRole::ImageGeneration => "Prompt/config only; no canonical history",
+        ai::service::ModelRole::Main => "Canonical Main context",
+    }
+}
+
+fn main_context_overflow_warning(model: &str, used: usize, usable_limit: usize) -> Option<String> {
+    (used > usable_limit).then(|| {
+        format!(
+            "Main Model changed to {model}. Current canonical history (~{used} tokens) exceeds the new usable context (~{usable_limit} tokens). Xiao will compact before the next request when needed; history was not deleted."
+        )
+    })
+}
+
 fn capability_state_label(value: Option<bool>) -> &'static str {
     match value {
         Some(true) => "Supported",
@@ -990,11 +1019,19 @@ async fn build_model_dashboard_ui(ai_service: &AIChatService, user_id: i64) -> I
             is_open: Some(false),
         },
         RichBlock::Buttons {
-            buttons: vec![
-                RichMessageButton::callback_styled("Change Main", "model_change_main", "primary"),
-                RichMessageButton::callback("Refresh", "model_dashboard"),
-                RichMessageButton::callback("Close", "provider_close"),
-            ],
+            buttons: {
+                let mut buttons = Vec::new();
+                if telegram_can_edit_model_role(ai::service::ModelRole::Main) {
+                    buttons.push(RichMessageButton::callback_styled(
+                        "Change Main",
+                        "model_change_main",
+                        "primary",
+                    ));
+                }
+                buttons.push(RichMessageButton::callback("Refresh", "model_dashboard"));
+                buttons.push(RichMessageButton::callback("Close", "provider_close"));
+                buttons
+            },
             align: Some("center".to_string()),
         },
     ])
@@ -1144,11 +1181,7 @@ async fn build_context_monitor_ui(ai_service: &AIChatService, user_id: i64) -> I
         let resolved = ai_service.resolve_model_route_unchecked(role).await;
         match resolved {
             Ok(route) => {
-                let relationship = if route.route_origin == ai::service::RouteOrigin::MainModel {
-                    "direct Main when capability is verified"
-                } else {
-                    "transient; current request/minimum context only"
-                };
+                let relationship = specialist_context_policy(role, route.route_origin);
                 specialist_lines.push(format!(
                     "{}: {} / {} — {}",
                     role.display_name(),
@@ -3080,14 +3113,11 @@ async fn handle_update(
                     }
 
                     let new_stats = ai_service.get_context_stats(user_id).await;
-                    let warning = if new_stats.total_tokens > new_stats.limit_tokens {
-                        Some(format!(
-                            "Main Model changed to {}. Current canonical history (~{} tokens) exceeds the new usable context (~{} tokens). Xiao will compact before the next request when needed; history was not deleted.",
-                            model_name, new_stats.total_tokens, new_stats.limit_tokens
-                        ))
-                    } else {
-                        None
-                    };
+                    let warning = main_context_overflow_warning(
+                        &model_name,
+                        new_stats.total_tokens,
+                        new_stats.limit_tokens,
+                    );
                     if let Some(warning) = warning {
                         let warning_rich = InputRichMessage::new(vec![
                             RichBlock::SectionHeading {
@@ -3556,6 +3586,54 @@ mod update_lane_tests {
         ] {
             assert!(!is_control_message_text(text), "{text}");
         }
+    }
+
+    #[test]
+    fn telegram_model_editing_is_main_only() {
+        assert!(telegram_can_edit_model_role(ai::service::ModelRole::Main));
+        for role in ai::service::ModelRole::addon_roles() {
+            assert!(!telegram_can_edit_model_role(role));
+        }
+    }
+
+    #[test]
+    fn specialist_context_policies_are_minimal_and_role_specific() {
+        assert!(specialist_context_policy(
+            ai::service::ModelRole::Vision,
+            ai::service::RouteOrigin::Specific
+        )
+        .contains("no full history"));
+        assert!(specialist_context_policy(
+            ai::service::ModelRole::AudioStt,
+            ai::service::RouteOrigin::Specific
+        )
+        .starts_with("Transcript only"));
+        assert!(specialist_context_policy(
+            ai::service::ModelRole::ImageGeneration,
+            ai::service::RouteOrigin::Specific
+        )
+        .starts_with("Prompt/config only"));
+        assert!(specialist_context_policy(
+            ai::service::ModelRole::Vision,
+            ai::service::RouteOrigin::MainModel
+        )
+        .starts_with("Direct on Main"));
+    }
+
+    #[test]
+    fn smaller_main_context_warns_only_when_history_exceeds_usable_budget() {
+        assert!(main_context_overflow_warning("small-model", 80_000, 64_000).is_some());
+        assert!(main_context_overflow_warning("large-model", 40_000, 64_000).is_none());
+    }
+
+    #[test]
+    fn help_ui_is_typed_rich_and_declares_addons_read_only() {
+        let value = serde_json::to_value(build_help_ui()).unwrap();
+        let serialized = value.to_string();
+        assert!(serialized.contains("\"type\":\"table\""));
+        assert!(serialized.contains("\"type\":\"details\""));
+        assert!(serialized.contains("read-only"));
+        assert!(serialized.contains("xiao model addon"));
     }
 
     #[test]
