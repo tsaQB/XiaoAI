@@ -13,8 +13,8 @@ use tokio::sync::{watch, Mutex, RwLock};
 use tracing::{error, warn};
 
 use crate::attachments::{
-    decode_user_content, delete_session_attachments, encode_user_content, load_attachment,
-    persist_attachment,
+    decode_user_content, delete_attachment_refs, delete_session_attachments, encode_user_content,
+    load_attachment, persist_attachment,
 };
 use crate::util::{truncate_chars, truncate_chars_with_ellipsis};
 
@@ -26,10 +26,11 @@ use super::capability::model_metadata_key;
 pub use super::capability::{ModelCapability, ModelMetadata};
 
 use super::storage::{
-    allocate_session_id_db_async, append_session_messages_db_async, delete_session_db_async,
+    append_session_messages_db_async, create_session_and_activate_db_async,
     ensure_session_identity_v2_db_async, load_active_session_id_db_async, load_app_setting_async,
-    load_sessions_db_async, replace_session_messages_db_async, save_active_session_db_async,
-    save_session_metadata_db_async,
+    load_sessions_db_async, remove_session_transaction_db_async,
+    replace_session_messages_if_revision_db_async, save_session_metadata_db_async,
+    switch_active_session_db_async,
 };
 pub use super::storage::{
     load_app_setting, load_capability_registry, load_provider_store, save_app_setting,
@@ -80,6 +81,40 @@ fn estimate_stored_content_tokens(content: &Value) -> usize {
 }
 
 const MAX_GENERATED_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_PROVIDER_JSON_BYTES: usize = 32 * 1024 * 1024;
+const MAX_STREAM_VISIBLE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_STREAM_REASONING_BYTES: usize = 8 * 1024 * 1024;
+const MAX_STREAM_WIRE_BYTES: usize = 32 * 1024 * 1024;
+
+fn push_bounded(target: &mut String, chunk: &str, max_bytes: usize) -> bool {
+    if target.len().saturating_add(chunk.len()) > max_bytes {
+        return false;
+    }
+    target.push_str(chunk);
+    true
+}
+
+fn require_verified_capability(
+    capability: Option<&CapabilityRecord>,
+    capability_name: &str,
+    value: impl FnOnce(&CapabilityRecord) -> Option<bool>,
+) -> Result<(), String> {
+    match capability.and_then(value) {
+        Some(true) => Ok(()),
+        Some(false) => Err(format!("{capability_name} tidak didukung oleh model aktif")),
+        None => Err(format!(
+            "capability {capability_name} belum terverifikasi; XiaoAI menolak input ini sampai probe/metadata mengonfirmasi dukungan"
+        )),
+    }
+}
+
+fn generation_revision_matches(
+    session: Option<&ChatSession>,
+    session_id: usize,
+    revision: u64,
+) -> bool {
+    session.is_some_and(|session| session.id == session_id && session.revision == revision)
+}
 
 fn is_unsafe_remote_ip(ip: std::net::IpAddr) -> bool {
     match ip {
@@ -182,6 +217,33 @@ async fn download_generated_image(url: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+async fn read_bounded_response_bytes(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(format!("provider response exceeded {max_bytes} bytes"));
+    }
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| "provider response stream failed".to_string())?;
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(format!("provider response exceeded {max_bytes} bytes"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn read_bounded_json(response: reqwest::Response) -> Result<Value, String> {
+    let bytes = read_bounded_response_bytes(response, MAX_PROVIDER_JSON_BYTES).await?;
+    serde_json::from_slice(&bytes).map_err(|error| format!("invalid provider JSON: {error}"))
+}
+
 fn provider_url(endpoint: &str, path: &str) -> String {
     format!(
         "{}/{}",
@@ -255,7 +317,11 @@ impl AIChatService {
             if load_app_setting(key).is_none() {
                 if let Ok(value) = std::env::var(key) {
                     if !value.trim().is_empty() {
-                        let _ = save_app_setting(key, &value);
+                        if let Err(error) = save_app_setting(key, &value) {
+                            eprintln!(
+                                "[WARN] Failed to migrate environment setting {key}: {error}"
+                            );
+                        }
                     }
                 }
             }
@@ -264,6 +330,7 @@ impl AIChatService {
         let capability_registry = load_capability_registry();
         let client = Client::builder()
             .timeout(Duration::from_secs(90))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| Client::new());
 
@@ -415,24 +482,22 @@ impl AIChatService {
 
         let mut existing = load_sessions_db_async(user_id).await;
         if existing.is_empty() {
-            let Some(session_id) = allocate_session_id_db_async(user_id).await else {
-                warn!("Session initialization deferred because durable ID allocation failed");
-                return Vec::new();
-            };
             let now_str = Local::now().format("%d %b %H:%M").to_string();
-            let session = ChatSession {
-                id: session_id,
-                name: format!("Session {now_str}"),
-                messages: Vec::new(),
-                created_at: now_str,
-            };
-            if !save_session_metadata_db_async(user_id, session.clone()).await {
-                warn!("Session initialization deferred because metadata persistence failed");
+            let Some(session) = create_session_and_activate_db_async(
+                user_id,
+                format!("Session {now_str}"),
+                now_str,
+            )
+            .await
+            else {
+                warn!("Session initialization deferred because durable creation failed");
                 return Vec::new();
-            }
+            };
             existing.push(session);
         }
-        let _ = ensure_session_identity_v2_db_async(user_id, existing.clone()).await;
+        if !ensure_session_identity_v2_db_async(user_id, existing.clone()).await {
+            warn!("Session identity migration/check could not be persisted");
+        }
         self.user_sessions
             .write()
             .await
@@ -451,17 +516,31 @@ impl AIChatService {
             }
         }
 
-        let stored_id = load_active_session_id_db_async(user_id)
+        if let Some(stored_id) = load_active_session_id_db_async(user_id)
             .await
             .filter(|id| sessions.iter().any(|session| session.id == *id))
-            .unwrap_or(sessions[0].id);
+        {
+            self.active_session_id
+                .write()
+                .await
+                .insert(user_id, stored_id);
+            return Some(stored_id);
+        }
 
-        self.active_session_id
-            .write()
-            .await
-            .insert(user_id, stored_id);
-        let _ = save_active_session_db_async(user_id, stored_id).await;
-        Some(stored_id)
+        let fallback_id = sessions[0].id;
+        match switch_active_session_db_async(user_id, fallback_id).await {
+            Some(true) => {
+                self.active_session_id
+                    .write()
+                    .await
+                    .insert(user_id, fallback_id);
+                Some(fallback_id)
+            }
+            _ => {
+                warn!("Active session fallback was not published because persistence failed");
+                None
+            }
+        }
     }
 
     pub async fn get_active_session_index(&self, user_id: i64) -> usize {
@@ -490,22 +569,14 @@ impl AIChatService {
         custom_name: Option<&str>,
     ) -> Option<ChatSession> {
         let _ = self.get_sessions(user_id).await;
+        let session_lock = self.session_lock(user_id).await;
+        let _guard = session_lock.lock().await;
         let now_str = Local::now().format("%d %b %H:%M").to_string();
-        let new_id = allocate_session_id_db_async(user_id).await?;
         let name = custom_name
             .map(|value| truncate_chars(value.trim(), 60))
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| format!("Session {now_str}"));
-        let session = ChatSession {
-            id: new_id,
-            name,
-            messages: Vec::new(),
-            created_at: now_str,
-        };
-
-        if !save_session_metadata_db_async(user_id, session.clone()).await {
-            return None;
-        }
+        let session = create_session_and_activate_db_async(user_id, name, now_str).await?;
         {
             let mut sessions_map = self.user_sessions.write().await;
             sessions_map
@@ -513,22 +584,34 @@ impl AIChatService {
                 .or_default()
                 .push(session.clone());
         }
-        self.active_session_id.write().await.insert(user_id, new_id);
-        let _ = save_active_session_db_async(user_id, new_id).await;
+        self.active_session_id
+            .write()
+            .await
+            .insert(user_id, session.id);
         Some(session)
     }
 
     pub async fn switch_session_by_id(&self, user_id: i64, session_id: usize) -> bool {
-        let sessions = self.get_sessions(user_id).await;
-        if sessions.iter().any(|session| session.id == session_id) {
-            self.active_session_id
-                .write()
-                .await
-                .insert(user_id, session_id);
-            let _ = save_active_session_db_async(user_id, session_id).await;
-            return true;
+        let _ = self.get_sessions(user_id).await;
+        let session_lock = self.session_lock(user_id).await;
+        let _guard = session_lock.lock().await;
+        let exists = self
+            .user_sessions
+            .read()
+            .await
+            .get(&user_id)
+            .is_some_and(|sessions| sessions.iter().any(|session| session.id == session_id));
+        if !exists {
+            return false;
         }
-        false
+        if switch_active_session_db_async(user_id, session_id).await != Some(true) {
+            return false;
+        }
+        self.active_session_id
+            .write()
+            .await
+            .insert(user_id, session_id);
+        true
     }
 
     pub async fn switch_session(&self, user_id: i64, index: usize) -> bool {
@@ -540,66 +623,52 @@ impl AIChatService {
     }
 
     pub async fn remove_session_by_id(&self, user_id: i64, session_id: usize) -> bool {
-        let Some(active_id) = self.get_active_session_id(user_id).await else {
-            return false;
-        };
-        let sessions = self.get_sessions(user_id).await;
-        if !sessions.iter().any(|session| session.id == session_id) {
+        let _ = self.get_sessions(user_id).await;
+        let _ = self.get_active_session_id(user_id).await;
+        let session_lock = self.session_lock(user_id).await;
+        let _guard = session_lock.lock().await;
+        let exists = self
+            .user_sessions
+            .read()
+            .await
+            .get(&user_id)
+            .is_some_and(|sessions| sessions.iter().any(|session| session.id == session_id));
+        if !exists {
             return false;
         }
-        let replacement = if sessions.len() == 1 {
-            let Some(replacement_id) = allocate_session_id_db_async(user_id).await else {
-                warn!(
-                    "Refusing to remove the last session because replacement ID allocation failed"
-                );
-                return false;
-            };
-            let now_str = Local::now().format("%d %b %H:%M").to_string();
-            let replacement = ChatSession {
-                id: replacement_id,
-                name: format!("Session {now_str}"),
-                messages: Vec::new(),
-                created_at: now_str,
-            };
-            if !save_session_metadata_db_async(user_id, replacement.clone()).await {
-                warn!("Refusing to remove the last session because replacement persistence failed");
-                return false;
-            }
-            Some(replacement)
-        } else {
-            None
+        let now_str = Local::now().format("%d %b %H:%M").to_string();
+        let Some(Some(outcome)) = remove_session_transaction_db_async(
+            user_id,
+            session_id,
+            format!("Session {now_str}"),
+            now_str,
+        )
+        .await
+        else {
+            return false;
         };
 
-        let new_active_id = {
+        {
             let mut sessions_map = self.user_sessions.write().await;
-            let Some(list) = sessions_map.get_mut(&user_id) else {
-                return false;
-            };
-            let Some(current_index) = list.iter().position(|session| session.id == session_id)
-            else {
-                return false;
-            };
-            let removed = list.remove(current_index);
-            if let Some(replacement) = replacement.clone() {
-                let replacement_id = replacement.id;
-                list.push(replacement);
-                replacement_id
-            } else if removed.id == active_id || !list.iter().any(|session| session.id == active_id)
-            {
-                let target_index = current_index.min(list.len().saturating_sub(1));
-                list[target_index].id
+            if let Some(list) = sessions_map.get_mut(&user_id) {
+                list.retain(|session| session.id != session_id);
+                if let Some(replacement) = outcome.replacement.clone() {
+                    list.push(replacement);
+                    list.sort_by_key(|session| session.id);
+                }
             } else {
-                active_id
+                // Durable success is authoritative. Evicting an absent cache is
+                // sufficient; reporting failure here would be a false failure
+                // after the destructive transaction already committed.
+                warn!("Durable session removal committed while RAM cache was unavailable; cache will rehydrate");
+                sessions_map.remove(&user_id);
             }
-        };
-
-        let _ = delete_session_db_async(user_id, session_id).await;
-        delete_session_attachments(user_id, session_id).await;
+        }
         self.active_session_id
             .write()
             .await
-            .insert(user_id, new_active_id);
-        let _ = save_active_session_db_async(user_id, new_active_id).await;
+            .insert(user_id, outcome.new_active_id);
+        delete_session_attachments(user_id, session_id).await;
         true
     }
 
@@ -621,18 +690,34 @@ impl AIChatService {
         if name.is_empty() {
             return false;
         }
-        let updated = {
-            let mut sessions_map = self.user_sessions.write().await;
-            let Some(list) = sessions_map.get_mut(&user_id) else {
+        let _ = self.get_sessions(user_id).await;
+        let session_lock = self.session_lock(user_id).await;
+        let _guard = session_lock.lock().await;
+        let mut candidate = {
+            let sessions_map = self.user_sessions.read().await;
+            let Some(session) = sessions_map
+                .get(&user_id)
+                .and_then(|list| list.iter().find(|session| session.id == session_id))
+            else {
                 return false;
             };
-            let Some(session) = list.iter_mut().find(|session| session.id == session_id) else {
-                return false;
-            };
-            session.name = name;
             session.clone()
         };
-        save_session_metadata_db_async(user_id, updated).await
+        candidate.name = name;
+        if !save_session_metadata_db_async(user_id, candidate.clone()).await {
+            return false;
+        }
+        let mut sessions_map = self.user_sessions.write().await;
+        if let Some(session) = sessions_map
+            .get_mut(&user_id)
+            .and_then(|list| list.iter_mut().find(|session| session.id == session_id))
+        {
+            *session = candidate;
+        } else {
+            warn!("Durable session rename committed while RAM cache changed; evicting cache");
+            sessions_map.remove(&user_id);
+        }
+        true
     }
 
     pub async fn rename_session(&self, user_id: i64, index: usize, new_name: &str) -> bool {
@@ -644,24 +729,57 @@ impl AIChatService {
             .await
     }
 
-    pub async fn clear_history(&self, user_id: i64) {
-        let Some(active_id) = self.get_active_session_id(user_id).await else {
-            return;
+    pub async fn clear_history(&self, user_id: i64) -> bool {
+        let Some(_) = self.get_active_session_id(user_id).await else {
+            return false;
         };
-        let cleared = {
-            let mut sessions_map = self.user_sessions.write().await;
-            sessions_map.get_mut(&user_id).and_then(|list| {
-                list.iter_mut()
-                    .find(|session| session.id == active_id)
-                    .map(|session| {
-                        session.messages.clear();
-                        session.clone()
-                    })
-            })
+        let session_lock = self.session_lock(user_id).await;
+        let _guard = session_lock.lock().await;
+        let Some(active_id) = self.active_session_id.read().await.get(&user_id).copied() else {
+            return false;
         };
-        if let Some(session) = cleared {
-            let _ = replace_session_messages_db_async(user_id, session).await;
-            delete_session_attachments(user_id, active_id).await;
+        let mut candidate = {
+            let sessions_map = self.user_sessions.read().await;
+            let Some(session) = sessions_map
+                .get(&user_id)
+                .and_then(|list| list.iter().find(|session| session.id == active_id))
+            else {
+                return false;
+            };
+            session.clone()
+        };
+        let expected_revision = candidate.revision;
+        candidate.revision = candidate.revision.saturating_add(1);
+        candidate.messages.clear();
+        match replace_session_messages_if_revision_db_async(
+            user_id,
+            expected_revision,
+            candidate.clone(),
+        )
+        .await
+        {
+            Some(true) => {
+                let mut sessions_map = self.user_sessions.write().await;
+                if let Some(session) = sessions_map
+                    .get_mut(&user_id)
+                    .and_then(|list| list.iter_mut().find(|session| session.id == active_id))
+                {
+                    *session = candidate;
+                } else {
+                    warn!(
+                        "Durable history clear committed while RAM cache changed; evicting cache"
+                    );
+                    sessions_map.remove(&user_id);
+                }
+                drop(sessions_map);
+                delete_session_attachments(user_id, active_id).await;
+                true
+            }
+            Some(false) => {
+                warn!("Clear history rejected because session revision changed");
+                false
+            }
+            None => false,
         }
     }
 
@@ -726,6 +844,7 @@ impl AIChatService {
                 name: "Storage unavailable".to_string(),
                 messages: Vec::new(),
                 created_at: "-".to_string(),
+                revision: 0,
             });
         let active_model = self.get_user_model(user_id).await;
         let endpoint = self
@@ -860,7 +979,7 @@ impl AIChatService {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
-                    match resp.json::<Value>().await {
+                    match read_bounded_json(resp).await {
                         Ok(data) => {
                             if let Some(text) = data.get("text").and_then(|t| t.as_str()) {
                                 if !text.trim().is_empty() {
@@ -874,7 +993,11 @@ impl AIChatService {
                 } else if status.as_u16() == 404 {
                     (false, Err("ENDPOINT_NOT_SUPPORTED".to_string()))
                 } else {
-                    let err_txt = resp.text().await.unwrap_or_default();
+                    let err_txt = read_bounded_response_bytes(resp, 64 * 1024)
+                        .await
+                        .ok()
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                        .unwrap_or_default();
                     (
                         false,
                         Err(format!(
@@ -938,41 +1061,34 @@ impl AIChatService {
         };
 
         let capability = self.capability_record(&provider.endpoint, &model).await;
-        if let Some(record) = capability.as_ref() {
-            if document_images
-                .as_ref()
-                .is_some_and(|pages| !pages.is_empty())
-                && record.supports_image == Some(false)
-            {
-                return (
-                    None,
-                    format!(
-                        "Endpoint '{}' tidak mendukung vision yang diperlukan untuk membaca PDF scan pada model '{}'.",
-                        provider.name, model
-                    ),
-                    false,
-                );
-            }
-            if video_bytes.is_some() && record.supports_video == Some(false) {
-                return (
-                    None,
-                    format!(
-                        "Endpoint '{}' tidak mendukung input video untuk model '{}'.",
-                        provider.name, model
-                    ),
-                    false,
-                );
-            }
-            if audio_bytes.is_some() && record.supports_audio == Some(false) {
-                return (
-                    None,
-                    format!(
-                        "Endpoint '{}' tidak mendukung input audio untuk model '{}'.",
-                        provider.name, model
-                    ),
-                    false,
-                );
-            }
+        let required_capability = if document_images
+            .as_ref()
+            .is_some_and(|pages| !pages.is_empty())
+            || image_bytes.is_some()
+        {
+            require_verified_capability(capability.as_ref(), "vision/image", |record| {
+                record.supports_image
+            })
+        } else if video_bytes.is_some() {
+            require_verified_capability(capability.as_ref(), "video", |record| {
+                record.supports_video
+            })
+        } else if audio_bytes.is_some() {
+            require_verified_capability(capability.as_ref(), "audio", |record| {
+                record.supports_audio
+            })
+        } else {
+            Ok(())
+        };
+        if let Err(reason) = required_capability {
+            return (
+                None,
+                format!(
+                    "Endpoint '{}' / model '{}' tidak dapat menerima media ini: {reason}.",
+                    provider.name, model
+                ),
+                false,
+            );
         }
 
         let Some(active_sess) = self.get_active_session(user_id).await else {
@@ -983,6 +1099,7 @@ impl AIChatService {
             );
         };
         let request_session_id = active_sess.id;
+        let request_session_revision = active_sess.revision;
 
         let mut clean_prompt = prompt.trim().to_string();
         if let Some(doc) = doc_text {
@@ -1203,7 +1320,7 @@ impl AIChatService {
                 {
                     let status = resp.status();
                     let delay = retry_delay(resp.headers(), attempt);
-                    let _ = resp.bytes().await;
+                    drop(resp);
                     warn!(
                         "Transient provider status {}; retrying attempt {}/{}",
                         status.as_u16(),
@@ -1284,7 +1401,7 @@ impl AIChatService {
 
         if !resp.status().is_success() {
             let status_code = resp.status().as_u16();
-            let _ = resp.text().await;
+            drop(resp);
             error!("AI endpoint returned status {status_code}");
             if let Some(tl) = timeline {
                 tl.fail_current(format!("API status {status_code}")).await;
@@ -1302,11 +1419,13 @@ impl AIChatService {
         let mut accumulated_raw = String::new();
         let mut accumulated_reasoning = String::new();
         let mut has_started_answer = false;
+        let mut streamed_wire_bytes = 0usize;
 
         let mut cancelled = false;
         let mut stream_interrupted = false;
+        let mut stream_bounded = false;
         let mut stream_done = false;
-        while !stream_done {
+        'streaming: while !stream_done {
             let mut next_future = Box::pin(stream.next());
             let next_item = tokio::select! {
                 changed = cancel_rx.changed() => {
@@ -1331,6 +1450,13 @@ impl AIChatService {
                     break;
                 }
             };
+            streamed_wire_bytes = streamed_wire_bytes.saturating_add(bytes.len());
+            if streamed_wire_bytes > MAX_STREAM_WIRE_BYTES {
+                stream_bounded = true;
+                stream_interrupted = true;
+                warn!("AI response exceeded XiaoAI's absolute streamed payload limit");
+                break;
+            }
 
             let events = match decoder.push(&bytes) {
                 Ok(events) => events,
@@ -1358,7 +1484,16 @@ impl AIChatService {
                         if let Some(reasoning_chunk) =
                             delta.get("reasoning_content").and_then(Value::as_str)
                         {
-                            accumulated_reasoning.push_str(reasoning_chunk);
+                            if !push_bounded(
+                                &mut accumulated_reasoning,
+                                reasoning_chunk,
+                                MAX_STREAM_REASONING_BYTES,
+                            ) {
+                                stream_bounded = true;
+                                stream_interrupted = true;
+                                warn!("AI reasoning exceeded XiaoAI's absolute output limit");
+                                break 'streaming;
+                            }
                         }
 
                         let content_chunk =
@@ -1366,7 +1501,16 @@ impl AIChatService {
                         if content_chunk.is_empty() {
                             continue;
                         }
-                        accumulated_raw.push_str(content_chunk);
+                        if !push_bounded(
+                            &mut accumulated_raw,
+                            content_chunk,
+                            MAX_STREAM_VISIBLE_BYTES,
+                        ) {
+                            stream_bounded = true;
+                            stream_interrupted = true;
+                            warn!("AI answer exceeded XiaoAI's absolute output limit");
+                            break 'streaming;
+                        }
 
                         let visible_partial =
                             if let Some(close_pos) = accumulated_raw.rfind("</think>") {
@@ -1422,13 +1566,20 @@ impl AIChatService {
             thinking_text = Some(accumulated_reasoning.trim().to_string());
             answer_text = accumulated_raw.trim().to_string();
         } else {
-            let think_re = regex::Regex::new(r"(?s)<think>(.*?)</think>").unwrap();
-            if let Some(caps) = think_re.captures(&accumulated_raw) {
-                thinking_text = caps.get(1).map(|m| m.as_str().trim().to_string());
-                answer_text = think_re
-                    .replace_all(&accumulated_raw, "")
-                    .trim()
-                    .to_string();
+            if let Ok(think_re) = regex::Regex::new(r"(?s)<think>(.*?)</think>") {
+                if let Some(caps) = think_re.captures(&accumulated_raw) {
+                    thinking_text = caps.get(1).map(|m| m.as_str().trim().to_string());
+                    answer_text = think_re
+                        .replace_all(&accumulated_raw, "")
+                        .trim()
+                        .to_string();
+                } else if accumulated_raw.contains("<think>") {
+                    let parts: Vec<&str> = accumulated_raw.split("<think>").collect();
+                    let before_think = parts[0].trim();
+                    let inside_think = parts.get(1).copied().unwrap_or("").trim();
+                    thinking_text = (!inside_think.is_empty()).then(|| inside_think.to_string());
+                    answer_text = before_think.to_string();
+                }
             } else if accumulated_raw.contains("<think>") {
                 let parts: Vec<&str> = accumulated_raw.split("<think>").collect();
                 let before_think = parts[0].trim();
@@ -1438,17 +1589,30 @@ impl AIChatService {
             }
         }
 
-        let tag_clean_re = regex::Regex::new(r"(?i)</?think>").unwrap();
-        answer_text = tag_clean_re
-            .replace_all(&answer_text, "")
-            .trim()
-            .to_string();
+        if let Ok(tag_clean_re) = regex::Regex::new(r"(?i)</?think>") {
+            answer_text = tag_clean_re
+                .replace_all(&answer_text, "")
+                .trim()
+                .to_string();
+        } else {
+            answer_text = answer_text.trim().to_string();
+        }
 
         if cancelled {
             if answer_text.trim().is_empty() {
                 answer_text = "⏹️ Generasi dihentikan oleh pengguna.".to_string();
             } else {
                 answer_text.push_str("\n\n_⏹️ Generasi dihentikan oleh pengguna._");
+            }
+        } else if stream_bounded {
+            if answer_text.trim().is_empty() {
+                answer_text =
+                    "⚠️ Respons provider melewati batas ukuran aman XiaoAI dan dihentikan."
+                        .to_string();
+            } else {
+                answer_text.push_str(
+                    "\n\n_⚠️ Respons dihentikan karena melewati batas ukuran aman XiaoAI._",
+                );
             }
         } else if stream_interrupted {
             if answer_text.trim().is_empty() {
@@ -1462,20 +1626,29 @@ impl AIChatService {
         }
 
         if let Some(tl) = timeline {
-            tl.set_partial_answer(&answer_text).await;
             if cancelled {
+                tl.set_partial_answer(&answer_text).await;
                 tl.fail_current("Stopped by user".to_string()).await;
                 tl.stop_ticker();
             } else if stream_interrupted {
-                tl.fail_current("Provider stream interrupted".to_string())
-                    .await;
+                tl.set_partial_answer(&answer_text).await;
+                tl.fail_current(if stream_bounded {
+                    "Provider output exceeded safety limit".to_string()
+                } else {
+                    "Provider stream interrupted".to_string()
+                })
+                .await;
                 tl.sync_draft(true).await;
             } else {
                 if !has_started_answer {
                     tl.add_action("Writing", Some(ProgressActivity::Writing))
                         .await;
-                    tl.sync_draft(true).await;
                 }
+                // Do not force a second canonical draft repaint at completion.
+                // The caller immediately sends exactly one permanent final Rich
+                // Message from the canonical AST. The last streamed draft may be
+                // slightly behind because of throttling, which is preferable to
+                // a visible draft refresh immediately before the final message.
                 tl.finish_all(ProgressState::Done).await;
             }
         }
@@ -1487,9 +1660,37 @@ impl AIChatService {
             return (thinking_text, answer_text, cancelled);
         }
 
-        // Persist only to the stable session that originated this request. Multimodal
-        // attachments are stored outside SQLite and referenced from the user message so
-        // follow-up turns can rehydrate the original media without bloating the database.
+        // Persist only to the exact session revision that originated this request.
+        // All destructive session mutations share this lock and bump the durable
+        // revision before publishing RAM, so a late pre-clear generation cannot
+        // reappear after /clear or a session replacement.
+        let session_lock = self.session_lock(user_id).await;
+        let _session_guard = session_lock.lock().await;
+        let current_session = {
+            let sessions_map = self.user_sessions.read().await;
+            sessions_map.get(&user_id).and_then(|list| {
+                list.iter()
+                    .find(|session| session.id == request_session_id)
+                    .cloned()
+            })
+        };
+        if !generation_revision_matches(
+            current_session.as_ref(),
+            request_session_id,
+            request_session_revision,
+        ) {
+            warn!(
+                "Discarding late AI result for deleted or stale session {request_session_id} revision {request_session_revision}"
+            );
+            return (thinking_text, answer_text, cancelled);
+        }
+        let Some(mut candidate_session) = current_session else {
+            return (thinking_text, answer_text, cancelled);
+        };
+
+        // Multimodal attachments are stored outside SQLite and referenced from
+        // the user message. If the SQLite append fails, only the newly created
+        // references are removed; pre-existing session attachments stay intact.
         let mut attachment_refs = Vec::new();
         if let Some(pages) = document_images.as_ref() {
             for (index, page) in pages.iter().enumerate() {
@@ -1558,35 +1759,59 @@ impl AIChatService {
 
         let user_message = ChatMessage {
             role: "user".to_string(),
-            content: encode_user_content(&clean_prompt, attachment_refs),
+            content: encode_user_content(&clean_prompt, attachment_refs.clone()),
         };
         let assistant_message = ChatMessage {
             role: "assistant".to_string(),
             content: Value::String(answer_text.clone()),
         };
-        let appended = [user_message.clone(), assistant_message.clone()];
-        let persisted_session = {
-            let mut sessions_map = self.user_sessions.write().await;
-            sessions_map.get_mut(&user_id).and_then(|list| {
-                list.iter_mut()
-                    .find(|session| session.id == request_session_id)
-                    .map(|session| {
-                        if session.messages.is_empty() && session.name.starts_with("Session ") {
-                            let clean_title = prompt.trim().replace('\n', " ");
-                            let short_title = truncate_chars_with_ellipsis(&clean_title, 32);
-                            if !short_title.is_empty() {
-                                session.name = short_title;
-                            }
-                        }
-                        session.messages.extend(appended.iter().cloned());
-                        session.clone()
+        let appended = vec![user_message, assistant_message];
+        if candidate_session.messages.is_empty() && candidate_session.name.starts_with("Session ") {
+            let clean_title = prompt.trim().replace('\n', " ");
+            let short_title = truncate_chars_with_ellipsis(&clean_title, 32);
+            if !short_title.is_empty() {
+                candidate_session.name = short_title;
+            }
+        }
+        candidate_session.messages.extend(appended.iter().cloned());
+
+        match append_session_messages_db_async(
+            user_id,
+            request_session_revision,
+            candidate_session.clone(),
+            appended,
+        )
+        .await
+        {
+            Some(true) => {
+                let mut sessions_map = self.user_sessions.write().await;
+                if let Some(session) = sessions_map.get_mut(&user_id).and_then(|list| {
+                    list.iter_mut().find(|session| {
+                        session.id == request_session_id
+                            && session.revision == request_session_revision
                     })
-            })
-        };
-        if let Some(session) = persisted_session {
-            let _ = append_session_messages_db_async(user_id, session, appended.to_vec()).await;
-        } else {
-            warn!("Discarding late AI result for deleted session {request_session_id}");
+                }) {
+                    *session = candidate_session;
+                } else {
+                    // The shared session lock makes this unreachable for normal
+                    // in-process mutations. Evict instead of inventing a RAM-only
+                    // canonical state if an external DB writer changed identity.
+                    sessions_map.remove(&user_id);
+                    warn!("Session cache changed after durable append; evicted RAM cache");
+                }
+            }
+            Some(false) => {
+                delete_attachment_refs(user_id, request_session_id, &attachment_refs).await;
+                warn!(
+                    "Discarding AI history append because session {request_session_id} revision changed before commit"
+                );
+            }
+            None => {
+                delete_attachment_refs(user_id, request_session_id, &attachment_refs).await;
+                warn!(
+                    "AI answer was generated but canonical history persistence failed for session {request_session_id}"
+                );
+            }
         }
 
         (thinking_text, answer_text, cancelled)
@@ -1632,7 +1857,7 @@ impl AIChatService {
 
                 if let Ok(resp) = req.send().await {
                     if resp.status().is_success() {
-                        if let Ok(res_json) = resp.json::<Value>().await {
+                        if let Ok(res_json) = read_bounded_json(resp).await {
                             if let Some(data) = res_json.get("data").and_then(|d| d.get(0)) {
                                 if let Some(b64_str) = data.get("b64_json").and_then(|s| s.as_str())
                                 {
@@ -1703,9 +1928,12 @@ impl AIChatService {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
-                    match resp.bytes().await {
-                        Ok(bytes) if bytes.len() > 1000 => {
-                            (true, Some(bytes.to_vec()), "FLUX.1 (Ultra HD)".to_string())
+                    match read_bounded_response_bytes(resp, MAX_GENERATED_IMAGE_BYTES).await {
+                        Ok(bytes)
+                            if bytes.len() > 1000
+                                && validate_generated_image_bytes(&bytes).is_ok() =>
+                        {
+                            (true, Some(bytes), "FLUX.1 (Ultra HD)".to_string())
                         }
                         _ => (
                             false,
@@ -1746,6 +1974,7 @@ mod tests {
             name: format!("Session {id}"),
             messages: Vec::new(),
             created_at: "now".to_string(),
+            revision: 0,
         }
     }
 
@@ -1767,5 +1996,63 @@ mod tests {
         assert_eq!(crate::ai::storage::compute_next_session_id(Some(21), 8), 21);
         assert_eq!(crate::ai::storage::compute_next_session_id(Some(4), 8), 9);
         assert_eq!(crate::ai::storage::compute_next_session_id(None, 8), 9);
+    }
+
+    #[test]
+    fn clear_revision_invalidates_old_generation_and_new_generation_matches() {
+        let mut current = session(11);
+        current.revision = 14;
+        assert!(generation_revision_matches(Some(&current), 11, 14));
+        current.revision += 1;
+        assert!(!generation_revision_matches(Some(&current), 11, 14));
+        assert!(generation_revision_matches(Some(&current), 11, 15));
+    }
+
+    #[test]
+    fn deleted_session_discards_late_generation_and_switch_never_redirects_it() {
+        let origin = session(7);
+        let active_after_switch = session(9);
+        assert!(!generation_revision_matches(None, 7, 0));
+        assert!(!generation_revision_matches(
+            Some(&active_after_switch),
+            7,
+            0
+        ));
+        assert!(generation_revision_matches(Some(&origin), 7, 0));
+    }
+
+    #[test]
+    fn multimodal_unknown_fails_closed() {
+        let mut supported = CapabilityRecord {
+            supports_image: Some(true),
+            ..CapabilityRecord::default()
+        };
+        assert!(
+            require_verified_capability(Some(&supported), "image", |r| r.supports_image).is_ok()
+        );
+
+        supported.supports_image = Some(false);
+        assert!(
+            require_verified_capability(Some(&supported), "image", |r| r.supports_image).is_err()
+        );
+
+        supported.supports_image = None;
+        assert!(
+            require_verified_capability(Some(&supported), "image", |r| r.supports_image).is_err()
+        );
+        assert!(require_verified_capability(None, "image", |r| r.supports_image).is_err());
+    }
+
+    #[test]
+    fn stream_accumulation_has_absolute_bounds() {
+        let mut visible = String::new();
+        assert!(push_bounded(&mut visible, "abc", 3));
+        assert!(!push_bounded(&mut visible, "d", 3));
+        assert_eq!(visible, "abc");
+
+        let mut reasoning = String::new();
+        assert!(push_bounded(&mut reasoning, "🧠", 4));
+        assert!(!push_bounded(&mut reasoning, "x", 4));
+        assert_eq!(reasoning, "🧠");
     }
 }

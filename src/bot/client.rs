@@ -667,40 +667,53 @@ impl TelegramBotClient {
         reply_markup: Option<Value>,
         receiver_user_id: Option<i64>,
     ) -> Result<Value, String> {
-        rich_message.validate()?;
-        let rich_json = serde_json::to_value(rich_message).map_err(|e| e.to_string())?;
-        let mut payload = json!({
-            "chat_id": chat_id,
-            "rich_message": rich_json,
-        });
-        if let Some(ref rm) = reply_markup {
-            payload["reply_markup"] = rm.clone();
-        }
-        if let Some(recv) = receiver_user_id {
-            payload["ephemeral_message_parameters"] =
-                serde_json::to_value(EphemeralMessageParameters {
-                    receiver_user_id: recv,
-                    callback_query_id: Self::current_delivery_context().callback_query_id,
-                    replace_callback_query_message: None,
-                })
-                .unwrap_or(json!({}));
-        }
-        Self::apply_delivery_context(&mut payload, true);
+        let validation = rich_message.validate();
+        if validation.is_ok() {
+            let rich_json = serde_json::to_value(rich_message).map_err(|e| e.to_string())?;
+            let mut payload = json!({
+                "chat_id": chat_id,
+                "rich_message": rich_json,
+            });
+            if let Some(ref rm) = reply_markup {
+                payload["reply_markup"] = rm.clone();
+            }
+            if let Some(recv) = receiver_user_id {
+                payload["ephemeral_message_parameters"] =
+                    serde_json::to_value(EphemeralMessageParameters {
+                        receiver_user_id: recv,
+                        callback_query_id: Self::current_delivery_context().callback_query_id,
+                        replace_callback_query_message: None,
+                    })
+                    .unwrap_or(json!({}));
+            }
+            Self::apply_delivery_context(&mut payload, true);
 
-        let res = self.post_json_raw("sendRichMessage", payload).await?;
-        if res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-            return Ok(res);
+            match self.post_json_raw("sendRichMessage", payload).await {
+                Ok(res) if res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) => {
+                    return Ok(res);
+                }
+                Ok(_) => info!("Telegram rejected Rich Message; degrading to safe HTML."),
+                Err(error) => {
+                    info!("Rich Message request failed ({error}); degrading to safe HTML.")
+                }
+            }
+        } else if let Err(error) = validation {
+            if rich_message.blocks.is_empty() {
+                return Err(error);
+            }
+            // Structural overflow is locally detected before network I/O. Block
+            // ASTs can still be rendered deterministically through safer
+            // representations rather than relying on Telegram rejection.
+            info!("Rich Message validation required degradation: {error}");
         }
 
-        // Fallback rendering to HTML chunks
-        info!("Falling back to HTML rendering for rich message.");
-        let chunks = self.render_blocks_to_html_chunks(&rich_message.blocks, 3800);
-        let mut last_res = json!({ "ok": true });
-        let total = chunks.len();
-
-        for (idx, chunk) in chunks.into_iter().enumerate() {
-            let is_last = idx == total - 1;
-            last_res = self
+        let html_chunks = self.render_blocks_to_html_chunks(&rich_message.blocks, 3800);
+        let total = html_chunks.len();
+        let mut html_last = json!({ "ok": true });
+        let mut html_failed = false;
+        for (idx, chunk) in html_chunks.into_iter().enumerate() {
+            let is_last = idx + 1 == total;
+            match self
                 .send_message(
                     chat_id,
                     &chunk,
@@ -709,10 +722,37 @@ impl TelegramBotClient {
                     receiver_user_id,
                     None,
                 )
-                .await?;
+                .await
+            {
+                Ok(response) => html_last = response,
+                Err(error) => {
+                    info!("HTML fallback failed ({error}); degrading to semantic plain text.");
+                    html_failed = true;
+                    break;
+                }
+            }
+        }
+        if !html_failed {
+            return Ok(html_last);
         }
 
-        Ok(last_res)
+        let plain_chunks = self.render_blocks_to_plain_chunks(&rich_message.blocks, 4000);
+        let total = plain_chunks.len();
+        let mut plain_last = json!({ "ok": true });
+        for (idx, chunk) in plain_chunks.into_iter().enumerate() {
+            let is_last = idx + 1 == total;
+            plain_last = self
+                .send_message(
+                    chat_id,
+                    &chunk,
+                    None,
+                    if is_last { reply_markup.clone() } else { None },
+                    receiver_user_id,
+                    None,
+                )
+                .await?;
+        }
+        Ok(plain_last)
     }
 
     pub async fn set_my_commands(&self, commands: &[BotCommand]) -> Result<Value, String> {
@@ -778,8 +818,7 @@ impl TelegramBotClient {
     ) -> Vec<String> {
         let mut chunks = Vec::new();
         let mut current_text = String::new();
-        let tag_clean_re =
-            regex::Regex::new(r"</?[^>]+>").expect("static HTML tag regex must compile");
+        let tag_clean_re = regex::Regex::new(r"</?[^>]+>").ok();
 
         for block in blocks {
             let b_html = self.render_single_block_html(block);
@@ -796,7 +835,10 @@ impl TelegramBotClient {
                 // Never split raw Telegram HTML in the middle of a tag/entity.
                 // Oversized single blocks degrade to escaped plain text chunks;
                 // correctness is preferable to a parse-mode rejection.
-                let stripped = tag_clean_re.replace_all(&b_html, "").into_owned();
+                let stripped = tag_clean_re
+                    .as_ref()
+                    .map(|regex| regex.replace_all(&b_html, "").into_owned())
+                    .unwrap_or_else(|| b_html.clone());
                 let plain = html_escape::decode_html_entities(&stripped).into_owned();
                 let mut escaped_chunk = String::new();
                 let mut escaped_len = 0usize;
@@ -837,6 +879,126 @@ impl TelegramBotClient {
             vec!["".to_string()]
         } else {
             chunks
+        }
+    }
+
+    pub fn render_blocks_to_plain_chunks(
+        &self,
+        blocks: &[RichBlock],
+        max_chars: usize,
+    ) -> Vec<String> {
+        let mut chunks = Vec::new();
+        let mut current = String::new();
+        for block in blocks {
+            let rendered = self.render_single_block_plain(block);
+            if rendered.trim().is_empty() {
+                continue;
+            }
+            if rendered.chars().count() > max_chars {
+                if !current.trim().is_empty() {
+                    chunks.push(std::mem::take(&mut current));
+                }
+                chunks.extend(self.split_text_chunks(&rendered, max_chars));
+                continue;
+            }
+            if !current.is_empty()
+                && current.chars().count() + rendered.chars().count() + 1 > max_chars
+            {
+                chunks.push(std::mem::take(&mut current));
+            }
+            if !current.is_empty() {
+                current.push('\n');
+            }
+            current.push_str(rendered.trim());
+        }
+        if !current.trim().is_empty() {
+            chunks.push(current);
+        }
+        if chunks.is_empty() {
+            vec![String::new()]
+        } else {
+            chunks
+        }
+    }
+
+    fn render_single_block_plain(&self, block: &RichBlock) -> String {
+        match block {
+            RichBlock::Paragraph { text }
+            | RichBlock::SectionHeading { text, .. }
+            | RichBlock::Thinking { text } => self.rich_value_to_plain(text),
+            RichBlock::Preformatted { text, .. } => text.clone(),
+            RichBlock::List { items } => items
+                .iter()
+                .map(|item| {
+                    let marker = item
+                        .value
+                        .map(|value| format!("{value}."))
+                        .or_else(|| item.kind.as_deref().map(|_| "1.".to_string()))
+                        .unwrap_or_else(|| "•".to_string());
+                    let body = item
+                        .blocks
+                        .iter()
+                        .map(|value| self.rich_value_to_plain(value))
+                        .collect::<Vec<_>>()
+                        .join("");
+                    format!("{marker} {body}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            RichBlock::BlockQuotation { blocks } => blocks
+                .iter()
+                .map(|value| self.rich_value_to_plain(value))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            RichBlock::ExpandableBlockQuotation { text, credit } => {
+                let mut output = self.rich_value_to_plain(text);
+                if let Some(credit) = credit {
+                    let credit = self.rich_value_to_plain(credit);
+                    if !credit.is_empty() {
+                        output.push_str("\n— ");
+                        output.push_str(&credit);
+                    }
+                }
+                output
+            }
+            RichBlock::Divider {} => "────────────────────────".to_string(),
+            RichBlock::MathematicalExpression { expression } => expression.clone(),
+            RichBlock::Table {
+                cells, has_header, ..
+            } => self.render_table_to_ascii(cells, *has_header),
+            RichBlock::Buttons { buttons, .. } => buttons
+                .iter()
+                .map(|button| self.rich_value_to_plain(&button.text))
+                .collect::<Vec<_>>()
+                .join(" | "),
+            RichBlock::Document { document, caption } => {
+                let label = document
+                    .get("media")
+                    .and_then(Value::as_str)
+                    .unwrap_or("document");
+                let caption = caption
+                    .as_ref()
+                    .map(|value| self.rich_value_to_plain(value))
+                    .unwrap_or_default();
+                if caption.is_empty() {
+                    format!("Document: {label}")
+                } else {
+                    format!("Document: {label}\n{caption}")
+                }
+            }
+            RichBlock::Details {
+                summary, blocks, ..
+            } => {
+                let body = blocks
+                    .iter()
+                    .map(|value| self.rich_value_to_plain(value))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("{}\n{}", self.rich_value_to_plain(summary), body)
+                    .trim()
+                    .to_string()
+            }
+            RichBlock::Anchor { .. } => String::new(),
         }
     }
 
@@ -1057,14 +1219,17 @@ impl TelegramBotClient {
             return String::new();
         }
 
-        let tag_clean_re = regex::Regex::new(r"</?[^>]+>").unwrap();
+        let tag_clean_re = regex::Regex::new(r"</?[^>]+>").ok();
         let mut norm_rows: Vec<Vec<(String, String)>> = Vec::new();
         for r in rows {
             let mut row_cells: Vec<(String, String)> = r
                 .iter()
                 .map(|c| {
                     let plain = self.rich_value_to_plain(&c.text);
-                    let cleaned = tag_clean_re.replace_all(&plain, "").to_string();
+                    let cleaned = tag_clean_re
+                        .as_ref()
+                        .map(|regex| regex.replace_all(&plain, "").into_owned())
+                        .unwrap_or(plain);
                     let decoded = html_escape::decode_html_entities(&cleaned)
                         .replace(['\n', '\r', '\t'], " ")
                         .to_string();
@@ -1190,5 +1355,23 @@ mod tests {
                 + chunk.matches("&quot;").count()
                 + chunk.matches("&#x27;").count()
         }));
+    }
+
+    #[test]
+    fn semantic_plain_fallback_is_rendered_from_ast_not_raw_markdown() {
+        let client = TelegramBotClient::new("test-token");
+        let source = "### Heading\n\n**bold** and `code`\n\n---\n\n[link](https://example.com)";
+        let blocks = crate::parser::parse_markdown_to_rich_blocks(source);
+        let plain = client
+            .render_blocks_to_plain_chunks(&blocks, 4000)
+            .join("\n");
+        assert!(plain.contains("Heading"));
+        assert!(plain.contains("bold"));
+        assert!(plain.contains("code"));
+        assert!(plain.contains("link"));
+        assert!(!plain.contains("###"));
+        assert!(!plain.contains("**"));
+        assert!(!plain.contains('`'));
+        assert!(!plain.contains("]("));
     }
 }

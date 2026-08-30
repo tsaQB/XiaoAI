@@ -1,9 +1,44 @@
 use chrono::Local;
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::time::Duration;
 use tracing::warn;
 
 use crate::util::truncate_chars;
+
+const MAX_PROVIDER_METADATA_BYTES: usize = 8 * 1024 * 1024;
+
+async fn read_bounded_provider_json(response: reqwest::Response) -> Result<Value, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROVIDER_METADATA_BYTES as u64)
+    {
+        return Err("provider metadata response exceeded XiaoAI limits".to_string());
+    }
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| "provider metadata stream failed".to_string())?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_PROVIDER_METADATA_BYTES {
+            return Err("provider metadata response exceeded XiaoAI limits".to_string());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid provider metadata JSON: {error}"))
+}
+
+async fn read_bounded_provider_text(response: reqwest::Response, max_bytes: usize) -> String {
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(Ok(chunk)) = stream.next().await {
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).unwrap_or_default()
+}
 
 use super::capability::{
     get_model_capabilities_with_meta, model_metadata_key, ModelCapability, ModelMetadata,
@@ -177,50 +212,21 @@ impl AIChatService {
             .or_else(|| store.providers.first().cloned())
     }
 
-    pub async fn set_active_provider(&self, _user_id: i64, provider_id: &str) -> bool {
-        let (snapshot, selected_provider) = {
-            let mut store = self.provider_store.write().await;
-            let Some(provider) = store
-                .providers
-                .iter()
-                .find(|provider| provider.id == provider_id)
-                .cloned()
-            else {
-                return false;
-            };
-            store.active_id = Some(provider_id.to_string());
-            (store.clone(), provider)
-        };
-        if !persist_provider_state(snapshot).await {
-            return false;
-        }
-        if !selected_provider.active_model.is_empty()
-            && self
-                .capability_record(&selected_provider.endpoint, &selected_provider.active_model)
-                .await
-                .is_none()
-        {
-            let _ = self
-                .probe_model_capabilities(&selected_provider, &selected_provider.active_model)
-                .await;
-        }
-        true
-    }
-
     pub async fn update_provider_models(
         &self,
         _user_id: i64,
         provider_id: &str,
         models: Vec<String>,
-    ) {
-        let snapshot = {
-            let mut store = self.provider_store.write().await;
-            let Some(provider) = store
+    ) -> bool {
+        let candidate = {
+            let store = self.provider_store.read().await;
+            let mut candidate = store.clone();
+            let Some(provider) = candidate
                 .providers
                 .iter_mut()
                 .find(|provider| provider.id == provider_id)
             else {
-                return;
+                return false;
             };
             provider.models = models;
             if !provider
@@ -230,9 +236,13 @@ impl AIChatService {
             {
                 provider.active_model = provider.models.first().cloned().unwrap_or_default();
             }
-            store.clone()
+            candidate
         };
-        let _ = persist_provider_state(snapshot).await;
+        if !persist_provider_state(candidate.clone()).await {
+            return false;
+        }
+        *self.provider_store.write().await = candidate;
+        true
     }
 
     pub async fn get_provider_model_by_index(
@@ -257,9 +267,10 @@ impl AIChatService {
         provider_id: &str,
         model_name: &str,
     ) -> bool {
-        let (snapshot, selected_provider) = {
-            let mut store = self.provider_store.write().await;
-            let Some(provider) = store
+        let (candidate, selected_provider) = {
+            let store = self.provider_store.read().await;
+            let mut candidate = store.clone();
+            let Some(provider) = candidate
                 .providers
                 .iter_mut()
                 .find(|provider| provider.id == provider_id)
@@ -273,13 +284,14 @@ impl AIChatService {
             }
             provider.active_model = model_name.to_string();
             let selected_provider = provider.clone();
-            store.active_id = Some(provider_id.to_string());
-            (store.clone(), selected_provider)
+            candidate.active_id = Some(provider_id.to_string());
+            (candidate, selected_provider)
         };
 
-        if !persist_provider_state(snapshot).await {
+        if !persist_provider_state(candidate.clone()).await {
             return false;
         }
+        *self.provider_store.write().await = candidate;
         if self
             .capability_record(&selected_provider.endpoint, model_name)
             .await
@@ -320,7 +332,7 @@ impl AIChatService {
             Err(_) => return CapabilityProbeResponse::Unknown,
         };
         if response.status().is_success() {
-            return match response.json::<Value>().await {
+            return match read_bounded_provider_json(response).await {
                 Ok(body) => CapabilityProbeResponse::Success(body),
                 Err(_) => CapabilityProbeResponse::Unknown,
             };
@@ -473,20 +485,25 @@ impl AIChatService {
             checked_at: Local::now().to_rfc3339(),
         };
 
-        let snapshot = {
-            let mut registry = self.capability_registry.write().await;
-            if let Some(existing) = registry
+        let candidate = {
+            let registry = self.capability_registry.read().await;
+            let mut candidate = registry.clone();
+            if let Some(existing) = candidate
                 .models
                 .iter_mut()
                 .find(|entry| entry.provider_id == provider_id && entry.model == model)
             {
                 *existing = record.clone();
             } else {
-                registry.models.push(record.clone());
+                candidate.models.push(record.clone());
             }
-            registry.clone()
+            candidate
         };
-        let _ = persist_capability_registry(snapshot).await;
+        if persist_capability_registry(candidate.clone()).await {
+            *self.capability_registry.write().await = candidate;
+        } else {
+            warn!("Capability probe result was not published because persistence failed");
+        }
         record
     }
 
@@ -562,7 +579,7 @@ impl AIChatService {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
-                    match resp.json::<Value>().await {
+                    match read_bounded_provider_json(resp).await {
                         Ok(data) => {
                             let mut model_ids = Vec::new();
                             let mut meta_guard = self.model_metadata.write().await;
@@ -622,8 +639,9 @@ impl AIChatService {
                             }
 
                             let provider_id = clean_endpoint.to_string();
-                            let registry_snapshot = {
-                                let mut registry = self.capability_registry.write().await;
+                            let registry_candidate = {
+                                let registry = self.capability_registry.read().await;
+                                let mut candidate = registry.clone();
                                 for model_id in &model_ids {
                                     let meta = meta_guard
                                         .get(&model_metadata_key(clean_endpoint, model_id));
@@ -670,7 +688,7 @@ impl AIChatService {
                                         checked_at: Local::now().to_rfc3339(),
                                     };
                                     if let Some(existing) =
-                                        registry.models.iter_mut().find(|entry| {
+                                        candidate.models.iter_mut().find(|entry| {
                                             entry.provider_id == provider_id
                                                 && entry.model == *model_id
                                         })
@@ -697,13 +715,17 @@ impl AIChatService {
                                             existing.source = record.source;
                                         }
                                     } else {
-                                        registry.models.push(record);
+                                        candidate.models.push(record);
                                     }
                                 }
-                                registry.clone()
+                                candidate
                             };
                             drop(meta_guard);
-                            let _ = persist_capability_registry(registry_snapshot).await;
+                            if persist_capability_registry(registry_candidate.clone()).await {
+                                *self.capability_registry.write().await = registry_candidate;
+                            } else {
+                                warn!("Provider model capability metadata was not published because persistence failed");
+                            }
 
                             if !model_ids.is_empty() {
                                 (true, Ok(model_ids))
@@ -721,7 +743,7 @@ impl AIChatService {
                 } else if status.as_u16() == 404 {
                     (false, Err(format!("HTTP 404 Not Found: Path /models tidak ditemukan di {clean_endpoint}. Pastikan format endpoint URL benar (misal: https://api.openai.com/v1).")))
                 } else {
-                    let err_text = resp.text().await.unwrap_or_default();
+                    let err_text = read_bounded_provider_text(resp, 64 * 1024).await;
                     (
                         false,
                         Err(format!(
@@ -755,12 +777,6 @@ impl AIChatService {
             .map(|provider| provider.active_model)
             .filter(|model| !model.is_empty())
             .unwrap_or_else(|| "gpt-4o".to_string())
-    }
-
-    pub async fn set_user_model(&self, user_id: i64, model: &str) {
-        if let Some(provider) = self.get_active_provider(user_id).await {
-            let _ = self.set_provider_model(user_id, &provider.id, model).await;
-        }
     }
 
     // ==========================================

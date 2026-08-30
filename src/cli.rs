@@ -447,6 +447,7 @@ pub(crate) async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Opt
         name: clean_alias.clone(),
         endpoint: endpoint.clone(),
         api_key: api_key.clone(),
+        api_key_ref: None,
         models: models.clone(),
         active_model: active_model.clone(),
     };
@@ -454,12 +455,14 @@ pub(crate) async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Opt
     let mut store = load_provider_store();
     store.providers.push(provider.clone());
     store.active_id = Some(provider_id);
-    let _ = save_provider_store(&store);
-    let _ = ai_service.reload_provider_store().await;
-
-    let _ = save_env_kv("AI_ENDPOINT", &endpoint);
-    let _ = save_env_kv("AI_API_KEY", &api_key);
-    let _ = save_env_kv("AI_MODEL", &active_model);
+    if let Err(error) = save_provider_store(&store) {
+        println!("\x1b[1;31m[ERROR] Provider configuration was not saved: {error}\x1b[0m");
+        return None;
+    }
+    if !ai_service.reload_provider_store().await {
+        println!("\x1b[1;31m[ERROR] Provider was committed but runtime reload failed. Restart XiaoAI before continuing.\x1b[0m");
+        return None;
+    }
     let probe = ai_service
         .probe_model_capabilities(&provider, &active_model)
         .await;
@@ -500,15 +503,23 @@ pub(crate) async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Opt
         println!("\x1b[38;5;244mVerifying token with Telegram API...\x1b[0m");
         let temp_bot = TelegramBotClient::new(&user_token);
         match temp_bot.get_me().await {
-            Ok(resp) if resp.ok && resp.result.is_some() => {
-                let bot_info = resp.result.unwrap();
+            Ok(resp) if resp.ok => {
+                let Some(bot_info) = resp.result else {
+                    println!("\x1b[1;31m[FAIL] Telegram returned ok=true without bot information.\x1b[0m");
+                    continue;
+                };
                 let username = bot_info.username.unwrap_or_else(|| "Unknown".to_string());
                 println!(
                     "\x1b[1;32m[OK] Token valid! Connected to @{} ({})\x1b[0m",
                     username, bot_info.first_name
                 );
 
-                let _ = save_token_to_env(&user_token);
+                if let Err(error) = save_token_to_env(&user_token) {
+                    println!(
+                        "\x1b[1;31m[ERROR] Token valid but could not be saved: {error}\x1b[0m"
+                    );
+                    return None;
+                }
                 break (user_token, username);
             }
             Ok(resp) => {
@@ -538,7 +549,10 @@ pub(crate) async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Opt
             _ => println!("\x1b[1;31m[ERROR] Owner User ID harus berupa angka positif.\x1b[0m"),
         }
     };
-    let _ = save_env_kv("OWNER_USER_ID", &owner_user_id.to_string());
+    if let Err(error) = save_env_kv("OWNER_USER_ID", &owner_user_id.to_string()) {
+        println!("\x1b[1;31m[ERROR] Owner ID could not be saved: {error}\x1b[0m");
+        return None;
+    }
 
     println!("\n\x1b[1;36m== Quickstart Setup Complete! ==\x1b[0m");
     println!(
@@ -667,6 +681,7 @@ pub(crate) async fn run_cli_provider_add(ai_service: &AIChatService) {
         name: clean_alias.clone(),
         endpoint: endpoint.clone(),
         api_key: api_key.clone(),
+        api_key_ref: None,
         models: models.clone(),
         active_model: active_model.clone(),
     };
@@ -674,12 +689,14 @@ pub(crate) async fn run_cli_provider_add(ai_service: &AIChatService) {
     let mut store = load_provider_store();
     store.providers.push(provider.clone());
     store.active_id = Some(provider_id);
-    let _ = save_provider_store(&store);
-    let _ = ai_service.reload_provider_store().await;
-
-    let _ = save_env_kv("AI_ENDPOINT", &endpoint);
-    let _ = save_env_kv("AI_API_KEY", &api_key);
-    let _ = save_env_kv("AI_MODEL", &active_model);
+    if let Err(error) = save_provider_store(&store) {
+        println!("\x1b[1;31m[ERROR] Provider configuration was not saved: {error}\x1b[0m");
+        return;
+    }
+    if !ai_service.reload_provider_store().await {
+        println!("\x1b[1;31m[ERROR] Provider was committed but runtime reload failed. Restart XiaoAI before continuing.\x1b[0m");
+        return;
+    }
     let probe = ai_service
         .probe_model_capabilities(&provider, &active_model)
         .await;
@@ -722,19 +739,12 @@ pub(crate) async fn run_cli_provider_remove(_ai_service: &AIChatService) {
     if let Some(idx) = selected {
         let removed = store.providers.remove(idx);
         if store.active_id.as_deref() == Some(removed.id.as_str()) {
-            if let Some(first_p) = store.providers.first() {
-                store.active_id = Some(first_p.id.clone());
-                let _ = save_env_kv("AI_ENDPOINT", &first_p.endpoint);
-                let _ = save_env_kv("AI_API_KEY", &first_p.api_key);
-                let _ = save_env_kv("AI_MODEL", &first_p.active_model);
-            } else {
-                store.active_id = None;
-                let _ = save_env_kv("AI_ENDPOINT", "");
-                let _ = save_env_kv("AI_API_KEY", "");
-                let _ = save_env_kv("AI_MODEL", "");
-            }
+            store.active_id = store.providers.first().map(|provider| provider.id.clone());
         }
-        let _ = save_provider_store(&store);
+        if let Err(error) = save_provider_store(&store) {
+            println!("\n\x1b[1;31m[ERROR] Provider was not removed: {error}\x1b[0m\n");
+            return;
+        }
         println!(
             "\n\x1b[1;32m[OK] Provider '{}' successfully removed.\x1b[0m\n",
             removed.name
@@ -903,10 +913,12 @@ pub(crate) async fn run_cli_provider_menu(ai_service: &AIChatService, action: Op
                 0 => {
                     let mut updated_store = load_provider_store();
                     updated_store.active_id = Some(target_prov.id.clone());
-                    let _ = save_provider_store(&updated_store);
-                    let _ = save_env_kv("AI_ENDPOINT", &target_prov.endpoint);
-                    let _ = save_env_kv("AI_API_KEY", &target_prov.api_key);
-                    let _ = save_env_kv("AI_MODEL", &target_prov.active_model);
+                    if let Err(error) = save_provider_store(&updated_store) {
+                        println!(
+                            "\n\x1b[1;31m[ERROR] Active provider was not changed: {error}\x1b[0m\n"
+                        );
+                        continue;
+                    }
                     println!(
                         "\n\x1b[1;32m[OK] Provider '{}' is now active!\x1b[0m\n",
                         target_prov.name
@@ -945,9 +957,9 @@ pub(crate) async fn run_cli_provider_menu(ai_service: &AIChatService, action: Op
                                 p.active_model = chosen_model.clone();
                                 p.models = models;
                             }
-                            let _ = save_provider_store(&updated_store);
-                            if store.active_id.as_deref() == Some(target_prov.id.as_str()) {
-                                let _ = save_env_kv("AI_MODEL", &chosen_model);
+                            if let Err(error) = save_provider_store(&updated_store) {
+                                println!("\n\x1b[1;31m[ERROR] Model selection was not saved: {error}\x1b[0m\n");
+                                continue;
                             }
                             println!(
                                 "\n\x1b[1;32m[OK] Model for '{}' set to: {}\x1b[0m\n",
@@ -965,19 +977,17 @@ pub(crate) async fn run_cli_provider_menu(ai_service: &AIChatService, action: Op
                     {
                         let removed = updated_store.providers.remove(pos);
                         if updated_store.active_id.as_deref() == Some(removed.id.as_str()) {
-                            if let Some(first_p) = updated_store.providers.first() {
-                                updated_store.active_id = Some(first_p.id.clone());
-                                let _ = save_env_kv("AI_ENDPOINT", &first_p.endpoint);
-                                let _ = save_env_kv("AI_API_KEY", &first_p.api_key);
-                                let _ = save_env_kv("AI_MODEL", &first_p.active_model);
-                            } else {
-                                updated_store.active_id = None;
-                                let _ = save_env_kv("AI_ENDPOINT", "");
-                                let _ = save_env_kv("AI_API_KEY", "");
-                                let _ = save_env_kv("AI_MODEL", "");
-                            }
+                            updated_store.active_id = updated_store
+                                .providers
+                                .first()
+                                .map(|provider| provider.id.clone());
                         }
-                        let _ = save_provider_store(&updated_store);
+                        if let Err(error) = save_provider_store(&updated_store) {
+                            println!(
+                                "\n\x1b[1;31m[ERROR] Provider was not deleted: {error}\x1b[0m\n"
+                            );
+                            continue;
+                        }
                         println!(
                             "\n\x1b[1;32m[OK] Provider '{}' deleted.\x1b[0m\n",
                             removed.name
@@ -1077,7 +1087,10 @@ pub(crate) async fn run_cli_model_picker(ai_service: &AIChatService, initial_fil
             }
         }
     }
-    let _ = save_provider_store(&store);
+    if let Err(error) = save_provider_store(&store) {
+        println!("\x1b[38;5;214m[WARN] Refreshed model catalog was not persisted: {error}\x1b[0m");
+        store = load_provider_store();
+    }
 
     let active_prov_id = store.active_id.clone().unwrap_or_default();
     let current_model = env::var("AI_MODEL").unwrap_or_default();
@@ -1145,11 +1158,11 @@ pub(crate) async fn run_cli_model_picker(ai_service: &AIChatService, initial_fil
                 .find(|p| &p.id == prov_id)
             {
                 p.active_model = chosen_model.clone();
-                let _ = save_env_kv("AI_ENDPOINT", &p.endpoint);
-                let _ = save_env_kv("AI_API_KEY", &p.api_key);
-                let _ = save_env_kv("AI_MODEL", chosen_model);
             }
-            let _ = save_provider_store(&updated_store);
+            if let Err(error) = save_provider_store(&updated_store) {
+                println!("\n\x1b[1;31m[ERROR] Active model was not changed: {error}\x1b[0m\n");
+                return;
+            }
             println!(
                 "\n\x1b[1;32m[SUCCESS] Active model set to: {}\x1b[0m",
                 chosen_model
@@ -1192,13 +1205,16 @@ pub(crate) async fn run_cli_status(ai_service: &AIChatService) {
     } else {
         let bot = TelegramBotClient::new(&token);
         match bot.get_me().await {
-            Ok(resp) if resp.ok && resp.result.is_some() => {
-                let info = resp.result.unwrap();
-                let uname = info.username.unwrap_or_else(|| "Unknown".to_string());
-                println!(
-                    "   \x1b[1;32m[OK]\x1b[0m   BOT_TOKEN: Connected to @{} (ID: {})",
-                    uname, info.id
-                );
+            Ok(resp) if resp.ok => {
+                if let Some(info) = resp.result {
+                    let uname = info.username.unwrap_or_else(|| "Unknown".to_string());
+                    println!(
+                        "   \x1b[1;32m[OK]\x1b[0m   BOT_TOKEN: Connected to @{} (ID: {})",
+                        uname, info.id
+                    );
+                } else {
+                    println!("   \x1b[1;31m[FAIL]\x1b[0m BOT_TOKEN: Telegram returned no bot information");
+                }
             }
             Ok(resp) => {
                 println!(
@@ -1272,18 +1288,21 @@ pub(crate) async fn run_cli_telegram_check() {
     println!("  \x1b[38;5;244mConnecting to Telegram API...\x1b[0m");
     let bot = TelegramBotClient::new(&token);
     match bot.get_me().await {
-        Ok(resp) if resp.ok && resp.result.is_some() => {
-            let info = resp.result.unwrap();
-            let uname = info.username.unwrap_or_else(|| "Unknown".to_string());
-            println!("  \x1b[1;32m[OK]\x1b[0m   Status: Connected & Verified");
-            println!("  \x1b[1;37mBot Name:\x1b[0m {}", info.first_name);
-            println!("  \x1b[1;37mUsername:\x1b[0m \x1b[1;36m@{}\x1b[0m", uname);
-            println!("  \x1b[1;37mBot ID:\x1b[0m   {}", info.id);
-            println!("  \x1b[1;37mBot Link:\x1b[0m https://t.me/{}", uname);
-            if let Some(owner) = get_configured_owner_id() {
-                println!("  \x1b[1;37mOwner ID:\x1b[0m  {}", owner);
+        Ok(resp) if resp.ok => {
+            if let Some(info) = resp.result {
+                let uname = info.username.unwrap_or_else(|| "Unknown".to_string());
+                println!("  \x1b[1;32m[OK]\x1b[0m   Status: Connected & Verified");
+                println!("  \x1b[1;37mBot Name:\x1b[0m {}", info.first_name);
+                println!("  \x1b[1;37mUsername:\x1b[0m \x1b[1;36m@{}\x1b[0m", uname);
+                println!("  \x1b[1;37mBot ID:\x1b[0m   {}", info.id);
+                println!("  \x1b[1;37mBot Link:\x1b[0m https://t.me/{}", uname);
+                if let Some(owner) = get_configured_owner_id() {
+                    println!("  \x1b[1;37mOwner ID:\x1b[0m  {}", owner);
+                } else {
+                    println!("  \x1b[1;31m[FAIL] OWNER_USER_ID belum dikonfigurasi.\x1b[0m");
+                }
             } else {
-                println!("  \x1b[1;31m[FAIL] OWNER_USER_ID belum dikonfigurasi.\x1b[0m");
+                println!("  \x1b[1;31m[FAIL]\x1b[0m Telegram returned no bot information");
             }
         }
         Ok(resp) => {
@@ -1326,8 +1345,11 @@ pub(crate) async fn run_cli_telegram_bind(manual_token: Option<&str>) {
     println!("  \x1b[38;5;244mVerifying token with Telegram API...\x1b[0m");
     let bot = TelegramBotClient::new(&token);
     match bot.get_me().await {
-        Ok(resp) if resp.ok && resp.result.is_some() => {
-            let info = resp.result.unwrap();
+        Ok(resp) if resp.ok => {
+            let Some(info) = resp.result else {
+                println!("  \x1b[1;31m[FAIL] Telegram returned ok=true without bot information.\x1b[0m\n");
+                return;
+            };
             let uname = info.username.unwrap_or_else(|| "Unknown".to_string());
             println!(
                 "  \x1b[1;32m[OK] Token verified! Connected to @{} ({})\x1b[0m",
@@ -1389,8 +1411,11 @@ pub(crate) async fn run_cli_telegram_change() {
     println!("  \x1b[38;5;244mVerifying new token with Telegram API...\x1b[0m");
     let bot = TelegramBotClient::new(&new_token);
     match bot.get_me().await {
-        Ok(resp) if resp.ok && resp.result.is_some() => {
-            let info = resp.result.unwrap();
+        Ok(resp) if resp.ok => {
+            let Some(info) = resp.result else {
+                println!("  \x1b[1;31m[FAIL] Telegram returned ok=true without bot information.\x1b[0m\n");
+                return;
+            };
             let uname = info.username.unwrap_or_else(|| "Unknown".to_string());
             println!(
                 "  \x1b[1;32m[OK] Token valid! Connected to @{} ({})\x1b[0m",
@@ -1478,7 +1503,10 @@ pub(crate) async fn run_cli_telegram_pick(ai_service: &AIChatService) {
             Some(format!("{}::{}", provider_id, model))
         })
         .collect();
-    let _ = save_provider_store(&store);
+    if let Err(error) = save_provider_store(&store) {
+        println!("\n\x1b[1;31m[ERROR] Telegram model whitelist was not saved: {error}\x1b[0m\n");
+        return;
+    }
     if store.telegram_models.is_empty() {
         println!(
             "\n\x1b[1;32m[OK] Telegram model whitelist cleared; all models are visible.\x1b[0m"

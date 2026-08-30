@@ -9,10 +9,10 @@ pub fn parse_inline(input_str: &str) -> Value {
     }
 
     // Clean leaked HTML tags
-    let html_re =
+    let cleaned =
         Regex::new(r"(?i)</?(?:b|i|s|u|code|pre|blockquote|a|tg-spoiler|span|p|div)(?:\s+[^>]*)?>")
-            .unwrap();
-    let cleaned = html_re.replace_all(input_str, "");
+            .map(|regex| regex.replace_all(input_str, "").into_owned())
+            .unwrap_or_else(|_| input_str.to_string());
     let unescaped = html_escape::decode_html_entities(&cleaned).to_string();
 
     let mut out: Vec<Value> = Vec::new();
@@ -175,7 +175,7 @@ pub fn parse_inline(input_str: &str) -> Value {
     if merged.is_empty() {
         Value::String(String::new())
     } else if merged.len() == 1 {
-        merged.into_iter().next().unwrap()
+        merged.pop().unwrap_or_else(|| Value::String(String::new()))
     } else {
         Value::Array(merged)
     }
@@ -352,11 +352,18 @@ fn try_parse_table(
     }
 
     // 3. Plain Underline Table: Header \n ---------------- \n Data
-    let underline_re = Regex::new(r"^-{3,}$").unwrap();
-    if i + 1 < n && underline_re.is_match(lines[i + 1].trim()) {
-        let space_split_re = Regex::new(r"\s{2,}|\t+").unwrap();
+    let underline_re = Regex::new(r"^-{3,}$").ok();
+    let space_split_re = Regex::new(r"\s{2,}|\t+").ok();
+    let underline_match = underline_re
+        .as_ref()
+        .is_some_and(|regex| i + 1 < n && regex.is_match(lines[i + 1].trim()));
+    if underline_match {
         let cols_hdr: Vec<&str> = space_split_re
-            .split(line)
+            .as_ref()
+            .map(|regex| regex.split(line).collect())
+            .unwrap_or_else(|| line.split_whitespace().collect());
+        let cols_hdr: Vec<&str> = cols_hdr
+            .into_iter()
             .map(|c| c.trim())
             .filter(|c| !c.is_empty())
             .collect();
@@ -374,12 +381,19 @@ fn try_parse_table(
                 if curr.is_empty() {
                     break;
                 }
-                if underline_re.is_match(curr) {
+                if underline_re
+                    .as_ref()
+                    .is_some_and(|regex| regex.is_match(curr))
+                {
                     curr_i += 1;
                     continue;
                 }
                 let data_cols: Vec<&str> = space_split_re
-                    .split(curr)
+                    .as_ref()
+                    .map(|regex| regex.split(curr).collect())
+                    .unwrap_or_else(|| curr.split_whitespace().collect());
+                let data_cols: Vec<&str> = data_cols
+                    .into_iter()
                     .map(|c| c.trim())
                     .filter(|c| !c.is_empty())
                     .collect();
@@ -402,16 +416,188 @@ fn try_parse_table(
     (None, false, i)
 }
 
+/// Parse an accumulated streaming Markdown buffer without exposing syntax that
+/// is still provisional. Completed syntax is rendered through the canonical
+/// Rich Message parser; an incomplete tail is reduced to safe semantic text.
+/// This lets a draft converge naturally without a second completion repaint.
+pub fn parse_streaming_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let unstable_at = provisional_markdown_start(text).unwrap_or(text.len());
+    let mut blocks = parse_markdown_to_rich_blocks(&text[..unstable_at]);
+    if unstable_at < text.len() {
+        let provisional = sanitize_provisional_markdown(&text[unstable_at..]);
+        if !provisional.trim().is_empty() {
+            blocks.push(RichBlock::Paragraph {
+                text: Value::String(provisional),
+            });
+        }
+    }
+    blocks
+}
+
+fn provisional_markdown_start(text: &str) -> Option<usize> {
+    let mut openings = Vec::new();
+
+    // Fenced code dominates all inline syntax until the matching fence.
+    let mut fence_open: Option<usize> = None;
+    let mut offset = 0usize;
+    for segment in text.split_inclusive('\n') {
+        let trimmed = segment.trim_start();
+        if trimmed.starts_with("```") {
+            let marker = offset + (segment.len() - trimmed.len());
+            if fence_open.is_some() {
+                fence_open = None;
+            } else {
+                fence_open = Some(marker);
+            }
+        }
+        offset += segment.len();
+    }
+    if let Some(index) = fence_open {
+        openings.push(index);
+    }
+
+    // Inline code and emphasis are deliberately conservative: if a delimiter
+    // is unmatched, the entire construct remains provisional rather than
+    // flashing the raw opener to Telegram.
+    for marker in ["**", "__", "`"] {
+        let mut open: Option<usize> = None;
+        let mut cursor = 0usize;
+        while let Some(relative) = text[cursor..].find(marker) {
+            let index = cursor + relative;
+            if marker == "`" && text[index..].starts_with("```") {
+                cursor = index + 3;
+                continue;
+            }
+            open = if open.is_some() { None } else { Some(index) };
+            cursor = index + marker.len();
+        }
+        if let Some(index) = open {
+            openings.push(index);
+        }
+    }
+
+    // A single underscore used as an emphasis opener is provisional. Limit
+    // detection to word-boundary-ish positions so identifiers such as foo_bar
+    // are not unnecessarily hidden.
+    let mut underscore_open: Option<usize> = None;
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    for (position, (index, ch)) in chars.iter().enumerate() {
+        if *ch != '_' {
+            continue;
+        }
+        let prev = position
+            .checked_sub(1)
+            .and_then(|p| chars.get(p))
+            .map(|(_, c)| *c);
+        let next = chars.get(position + 1).map(|(_, c)| *c);
+        let delimiter_like = prev.is_none_or(|c| c.is_whitespace() || "([{>".contains(c))
+            || next.is_none_or(|c| c.is_whitespace() || ".,!?;:)]}".contains(c));
+        if delimiter_like {
+            underscore_open = if underscore_open.is_some() {
+                None
+            } else {
+                Some(*index)
+            };
+        }
+    }
+    if let Some(index) = underscore_open {
+        openings.push(index);
+    }
+
+    // Line-oriented Markdown markers can themselves arrive split across chunks.
+    // Keep an otherwise marker-only current line provisional until it becomes
+    // a valid heading/divider/list item or ordinary text.
+    let line_start = text.rfind('\n').map_or(0, |index| index + 1);
+    let current_line = &text[line_start..];
+    let leading_ws = current_line.len() - current_line.trim_start().len();
+    let marker_start = line_start + leading_ws;
+    let marker = current_line.trim();
+    let incomplete_heading =
+        !marker.is_empty() && marker.chars().all(|ch| ch == '#') && marker.chars().count() <= 6;
+    let incomplete_divider = matches!(marker, "-" | "--" | "*" | "**" | "_" | "__");
+    let numeric_list_prefix = marker
+        .strip_suffix('.')
+        .or_else(|| marker.strip_suffix(')'));
+    let incomplete_list = marker == "-"
+        || marker == "*"
+        || numeric_list_prefix.is_some_and(|prefix| {
+            !prefix.is_empty() && prefix.chars().all(|ch| ch.is_ascii_digit())
+        });
+    if incomplete_heading || incomplete_divider || incomplete_list {
+        openings.push(marker_start);
+    }
+
+    // Incomplete links: keep from `[` provisional until both `](` and `)` are
+    // available. Nested link destinations are intentionally treated
+    // conservatively rather than attempting a full Markdown grammar here.
+    let mut search = 0usize;
+    while let Some(rel) = text[search..].find('[') {
+        let start = search + rel;
+        let rest = &text[start + 1..];
+        match rest.find("](") {
+            Some(label_end) => {
+                let destination = start + 1 + label_end + 2;
+                if !text[destination..].contains(')') {
+                    openings.push(start);
+                    break;
+                }
+                search = destination + text[destination..].find(')').unwrap_or(0) + 1;
+            }
+            None => {
+                openings.push(start);
+                break;
+            }
+        }
+    }
+
+    openings.into_iter().min()
+}
+
+fn sanitize_provisional_markdown(tail: &str) -> String {
+    let mut safe = tail.replace("```", "").replace("**", "").replace("__", "");
+    safe = safe.replace('`', "");
+
+    // These are static programmer-owned patterns, but draft rendering must not
+    // gain a production panic path if a future edit makes one invalid.
+    if let Ok(re) = Regex::new(r"\[([^\]]*)\]\([^\)]*$") {
+        safe = re.replace_all(&safe, "$1").into_owned();
+    }
+    if let Ok(re) = Regex::new(r"(?m)^\s*#{1,6}\s*") {
+        safe = re.replace_all(&safe, "").into_owned();
+    }
+    if let Ok(re) = Regex::new(r"(?m)^\s*(?:[-*•]|\d+[.)])\s+") {
+        safe = re.replace_all(&safe, "").into_owned();
+    }
+    if let Ok(re) = Regex::new(r"(?m)^\s*(?:-{1,}|\*{3,}|_{3,})\s*$") {
+        safe = re.replace_all(&safe, "").into_owned();
+    }
+
+    // Remove only obvious unmatched edge delimiters; do not blanket-delete
+    // underscores from identifiers or ordinary punctuation.
+    let trimmed = safe
+        .trim_start_matches(['_', '*', '['])
+        .trim_end_matches(['_', '*', '[', ']']);
+    trimmed.to_string()
+}
+
 pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
     if text.trim().is_empty() {
         return Vec::new();
     }
 
     // Strip <think>...</think>
-    let think_re = Regex::new(r"(?s)<think>.*?</think>").unwrap();
-    let cleaned_step1 = think_re.replace_all(text, "");
-    let tag_re = Regex::new(r"(?i)</?think>").unwrap();
-    let cleaned = tag_re.replace_all(&cleaned_step1, "").trim().to_string();
+    let cleaned_step1 = Regex::new(r"(?s)<think>.*?</think>")
+        .map(|regex| regex.replace_all(text, "").into_owned())
+        .unwrap_or_else(|_| text.to_string());
+    let cleaned = Regex::new(r"(?i)</?think>")
+        .map(|regex| regex.replace_all(&cleaned_step1, "").into_owned())
+        .unwrap_or(cleaned_step1)
+        .trim()
+        .to_string();
 
     if cleaned.is_empty() {
         return Vec::new();
@@ -427,10 +613,10 @@ pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
     let mut i = 0;
     let n = lines.len();
 
-    let heading_re = Regex::new(r"^(#{1,6})\s+(.+)$").unwrap();
-    let divider_re = Regex::new(r"^(\-{3,}|\*{3,}|_{3,}|─{3,}|—{2,})$").unwrap();
-    let bullet_re = Regex::new(r"^[-*•]\s+").unwrap();
-    let numbered_re = Regex::new(r"^\d+[\.)]\s+").unwrap();
+    let heading_re = Regex::new(r"^(#{1,6})\s+(.+)$").ok();
+    let divider_re = Regex::new(r"^(\-{3,}|\*{3,}|_{3,}|─{3,}|—{2,})$").ok();
+    let bullet_re = Regex::new(r"^[-*•]\s+").ok();
+    let numbered_re = Regex::new(r"^\d+[\.)]\s+").ok();
 
     while i < n {
         let line = &lines[i];
@@ -541,14 +727,20 @@ pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
         }
 
         // 4. Horizontal Divider (---, ***, ___, ───)
-        if divider_re.is_match(stripped) {
+        if divider_re
+            .as_ref()
+            .is_some_and(|regex| regex.is_match(stripped))
+        {
             blocks.push(RichBlock::Divider {});
             i += 1;
             continue;
         }
 
         // 5. Section Heading (# Heading, ## Subheading, etc.)
-        if let Some(caps) = heading_re.captures(stripped) {
+        if let Some(caps) = heading_re
+            .as_ref()
+            .and_then(|regex| regex.captures(stripped))
+        {
             let level = caps.get(1).map(|m| m.as_str().len()).unwrap_or(1);
             let heading_text = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
             blocks.push(RichBlock::SectionHeading {
@@ -593,8 +785,12 @@ pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
         }
 
         // 8. List Items (- item, * item, 1. item)
-        let is_bullet = bullet_re.is_match(stripped);
-        let is_numbered = numbered_re.is_match(stripped);
+        let is_bullet = bullet_re
+            .as_ref()
+            .is_some_and(|regex| regex.is_match(stripped));
+        let is_numbered = numbered_re
+            .as_ref()
+            .is_some_and(|regex| regex.is_match(stripped));
 
         if is_bullet || is_numbered {
             let mut list_items = Vec::new();
@@ -605,8 +801,17 @@ pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
                 if curr.is_empty() {
                     break;
                 }
-                if is_ordered && numbered_re.is_match(curr) {
-                    let item_text = numbered_re.replace(curr, "").trim().to_string();
+                if is_ordered
+                    && numbered_re
+                        .as_ref()
+                        .is_some_and(|regex| regex.is_match(curr))
+                {
+                    let item_text = numbered_re
+                        .as_ref()
+                        .map(|regex| regex.replace(curr, "").into_owned())
+                        .unwrap_or_else(|| curr.to_string())
+                        .trim()
+                        .to_string();
                     let value = curr
                         .split_once(['.', ')'])
                         .and_then(|(prefix, _)| prefix.parse::<i64>().ok());
@@ -618,8 +823,15 @@ pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
                         value,
                     ));
                     i += 1;
-                } else if !is_ordered && bullet_re.is_match(curr) {
-                    let item_text = bullet_re.replace(curr, "").trim().to_string();
+                } else if !is_ordered
+                    && bullet_re.as_ref().is_some_and(|regex| regex.is_match(curr))
+                {
+                    let item_text = bullet_re
+                        .as_ref()
+                        .map(|regex| regex.replace(curr, "").into_owned())
+                        .unwrap_or_else(|| curr.to_string())
+                        .trim()
+                        .to_string();
                     list_items.push(RichBlockListItem::bullet(vec![json!({
                         "type": "paragraph",
                         "text": parse_inline(&item_text)
@@ -641,11 +853,19 @@ pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
             if s_curr.is_empty()
                 || s_curr.starts_with("```")
                 || s_curr.starts_with("$$")
-                || heading_re.is_match(s_curr)
+                || heading_re
+                    .as_ref()
+                    .is_some_and(|regex| regex.is_match(s_curr))
                 || s_curr.starts_with('>')
-                || bullet_re.is_match(s_curr)
-                || numbered_re.is_match(s_curr)
-                || divider_re.is_match(s_curr)
+                || bullet_re
+                    .as_ref()
+                    .is_some_and(|regex| regex.is_match(s_curr))
+                || numbered_re
+                    .as_ref()
+                    .is_some_and(|regex| regex.is_match(s_curr))
+                || divider_re
+                    .as_ref()
+                    .is_some_and(|regex| regex.is_match(s_curr))
                 || try_parse_table(&lines, i).0.is_some()
             {
                 break;
@@ -705,5 +925,73 @@ mod tests {
         let serialized = serde_json::to_string(&value).unwrap();
         assert!(serialized.contains("世界"));
         assert!(serialized.contains("😊"));
+    }
+
+    #[test]
+    fn streaming_markdown_never_exposes_provisional_serialization_markers() {
+        let cases = [
+            "Ini **gaya gravitasi** selesai",
+            "Ini _italic_ selesai",
+            "Gunakan `kode` sekarang",
+            "```rust\nfn main() {}\n```",
+            "### Heading tumbuh",
+            "---",
+            "[OpenAI](https://example.com/path)",
+            "1. pertama\n2. kedua",
+            "- satu\n- dua",
+            "Emoji 😊 世界 **tebal**",
+        ];
+
+        for source in cases {
+            let mut boundaries: Vec<usize> =
+                source.char_indices().map(|(index, _)| index).collect();
+            boundaries.push(source.len());
+            boundaries.sort_unstable();
+            boundaries.dedup();
+            for end in boundaries.into_iter().filter(|end| *end > 0) {
+                let prefix = &source[..end];
+                let blocks = parse_streaming_markdown_to_rich_blocks(prefix);
+                let wire = serde_json::to_string(&blocks).unwrap();
+                assert!(
+                    !wire.contains("**"),
+                    "bold marker leaked for {prefix:?}: {wire}"
+                );
+                assert!(
+                    !wire.contains("__"),
+                    "emphasis marker leaked for {prefix:?}: {wire}"
+                );
+                assert!(
+                    !wire.contains("```"),
+                    "fence marker leaked for {prefix:?}: {wire}"
+                );
+                assert!(
+                    !wire.contains("]("),
+                    "link serialization leaked for {prefix:?}: {wire}"
+                );
+                if prefix.trim().chars().all(|ch| ch == '#') {
+                    assert!(
+                        !wire.contains('#'),
+                        "heading marker leaked for {prefix:?}: {wire}"
+                    );
+                }
+                if matches!(prefix.trim(), "-" | "--") {
+                    assert!(
+                        !wire.contains(prefix.trim()),
+                        "divider marker leaked for {prefix:?}: {wire}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completed_streaming_markdown_converges_to_canonical_parser() {
+        let source = "## Judul\n\n**tebal** dan _miring_\n\n---\n\n1. satu\n2. dua";
+        let streaming = parse_streaming_markdown_to_rich_blocks(source);
+        let canonical = parse_markdown_to_rich_blocks(source);
+        assert_eq!(
+            serde_json::to_value(streaming).unwrap(),
+            serde_json::to_value(canonical).unwrap()
+        );
     }
 }

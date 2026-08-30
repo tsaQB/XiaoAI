@@ -1,0 +1,6 @@
+* @tsaQB
+/.github/ @tsaQB
+/.github/workflows/ @tsaQB
+/Cargo.toml @tsaQB
+/Cargo.lock @tsaQB
+/src/ @tsaQB

@@ -425,6 +425,92 @@ pub struct InputRichMessage {
     pub skip_entity_detection: Option<bool>,
 }
 
+pub const RICH_MESSAGE_MAX_TEXT_CHARS: usize = 32_768;
+pub const RICH_MESSAGE_MAX_BLOCKS: usize = 500;
+pub const RICH_MESSAGE_MAX_NESTING: usize = 16;
+pub const RICH_MESSAGE_MAX_MEDIA: usize = 50;
+pub const RICH_MESSAGE_MAX_TABLE_COLUMNS: usize = 20;
+pub const RICH_MESSAGE_MAX_BUTTONS_PER_ROW: usize = 8;
+
+#[derive(Default)]
+struct RichMessageStats {
+    text_chars: usize,
+    blocks: usize,
+    max_depth: usize,
+}
+
+fn value_text_chars(value: &Value) -> usize {
+    match value {
+        Value::String(text) => text.chars().count(),
+        Value::Array(values) => values.iter().map(value_text_chars).sum(),
+        Value::Object(object) => object
+            .iter()
+            .filter(|(key, _)| {
+                !matches!(
+                    key.as_str(),
+                    "type"
+                        | "url"
+                        | "callback_data"
+                        | "web_app"
+                        | "style"
+                        | "align"
+                        | "valign"
+                        | "language"
+                        | "name"
+                        | "document"
+                )
+            })
+            .map(|(_, value)| value_text_chars(value))
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn is_nested_block_type(kind: &str) -> bool {
+    matches!(
+        kind,
+        "paragraph"
+            | "heading"
+            | "pre"
+            | "list"
+            | "blockquote"
+            | "expandable_blockquote"
+            | "divider"
+            | "mathematical_expression"
+            | "table"
+            | "buttons"
+            | "document"
+            | "details"
+            | "anchor"
+            | "thinking"
+    )
+}
+
+fn collect_nested_value_stats(value: &Value, depth: usize, stats: &mut RichMessageStats) {
+    match value {
+        Value::Array(values) => {
+            for child in values {
+                collect_nested_value_stats(child, depth, stats);
+            }
+        }
+        Value::Object(object) => {
+            let is_block = object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(is_nested_block_type);
+            let child_depth = if is_block { depth + 1 } else { depth };
+            if is_block {
+                stats.blocks += 1;
+                stats.max_depth = stats.max_depth.max(child_depth);
+            }
+            for child in object.values() {
+                collect_nested_value_stats(child, child_depth, stats);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl InputRichMessage {
     pub fn new(blocks: Vec<RichBlock>) -> Self {
         Self {
@@ -447,12 +533,129 @@ impl InputRichMessage {
             ));
         }
 
+        if self
+            .media
+            .as_ref()
+            .is_some_and(|media| media.len() > RICH_MESSAGE_MAX_MEDIA)
+        {
+            return Err(format!(
+                "Rich Message media count exceeds Telegram limit of {RICH_MESSAGE_MAX_MEDIA}"
+            ));
+        }
+
+        let mut stats = RichMessageStats::default();
+        if let Some(html) = &self.html {
+            stats.text_chars = html.chars().count();
+        } else if let Some(markdown) = &self.markdown {
+            stats.text_chars = markdown.chars().count();
+        }
+
         for block in &self.blocks {
-            if let RichBlock::Buttons { buttons, .. } = block {
-                for button in buttons {
-                    button.validate()?;
+            stats.blocks += 1;
+            stats.max_depth = stats.max_depth.max(1);
+            match block {
+                RichBlock::Paragraph { text }
+                | RichBlock::SectionHeading { text, .. }
+                | RichBlock::Thinking { text } => {
+                    stats.text_chars += value_text_chars(text);
+                    collect_nested_value_stats(text, 1, &mut stats);
+                }
+                RichBlock::Preformatted { text, .. } => stats.text_chars += text.chars().count(),
+                RichBlock::List { items } => {
+                    stats.blocks += items.len();
+                    if !items.is_empty() {
+                        stats.max_depth = stats.max_depth.max(2);
+                    }
+                    for item in items {
+                        for value in &item.blocks {
+                            stats.text_chars += value_text_chars(value);
+                            collect_nested_value_stats(value, 2, &mut stats);
+                        }
+                    }
+                }
+                RichBlock::BlockQuotation { blocks } => {
+                    for value in blocks {
+                        stats.text_chars += value_text_chars(value);
+                        collect_nested_value_stats(value, 1, &mut stats);
+                    }
+                }
+                RichBlock::ExpandableBlockQuotation { text, credit } => {
+                    stats.text_chars += value_text_chars(text);
+                    if let Some(credit) = credit {
+                        stats.text_chars += value_text_chars(credit);
+                    }
+                }
+                RichBlock::Divider {} | RichBlock::Anchor { .. } => {}
+                RichBlock::MathematicalExpression { expression } => {
+                    stats.text_chars += expression.chars().count();
+                }
+                RichBlock::Table { cells, caption, .. } => {
+                    stats.blocks += cells.len();
+                    if !cells.is_empty() {
+                        stats.max_depth = stats.max_depth.max(2);
+                    }
+                    if cells
+                        .iter()
+                        .any(|row| row.len() > RICH_MESSAGE_MAX_TABLE_COLUMNS)
+                    {
+                        return Err(format!(
+                            "Rich Message table exceeds Telegram limit of {RICH_MESSAGE_MAX_TABLE_COLUMNS} columns"
+                        ));
+                    }
+                    for row in cells {
+                        for cell in row {
+                            stats.text_chars += value_text_chars(&cell.text);
+                            collect_nested_value_stats(&cell.text, 2, &mut stats);
+                        }
+                    }
+                    if let Some(caption) = caption {
+                        stats.text_chars += caption.chars().count();
+                    }
+                }
+                RichBlock::Buttons { buttons, .. } => {
+                    if buttons.is_empty() || buttons.len() > RICH_MESSAGE_MAX_BUTTONS_PER_ROW {
+                        return Err(format!(
+                            "Rich Message button row must contain 1-{RICH_MESSAGE_MAX_BUTTONS_PER_ROW} buttons"
+                        ));
+                    }
+                    for button in buttons {
+                        button.validate()?;
+                        stats.text_chars += value_text_chars(&button.text);
+                    }
+                }
+                RichBlock::Document { caption, .. } => {
+                    if let Some(caption) = caption {
+                        stats.text_chars += value_text_chars(caption);
+                    }
+                }
+                RichBlock::Details {
+                    summary, blocks, ..
+                } => {
+                    stats.text_chars += value_text_chars(summary);
+                    for value in blocks {
+                        stats.text_chars += value_text_chars(value);
+                        collect_nested_value_stats(value, 1, &mut stats);
+                    }
                 }
             }
+        }
+
+        if stats.text_chars > RICH_MESSAGE_MAX_TEXT_CHARS {
+            return Err(format!(
+                "Rich Message text exceeds Telegram limit of {RICH_MESSAGE_MAX_TEXT_CHARS} characters"
+            ));
+        }
+        if stats.blocks > RICH_MESSAGE_MAX_BLOCKS {
+            return Err(format!(
+                "Rich Message contains {} blocks; Telegram limit is {RICH_MESSAGE_MAX_BLOCKS}",
+                stats.blocks
+            ));
+        }
+        if stats.max_depth > RICH_MESSAGE_MAX_NESTING {
+            return Err(format!(
+                "Rich Message nesting depth {} exceeds Telegram limit of {RICH_MESSAGE_MAX_NESTING}",
+                stats.max_depth
+            ));
         }
         Ok(())
     }
@@ -731,5 +934,105 @@ mod tests {
         assert_eq!(value["summary"], "More");
         assert!(value["blocks"].is_array());
         assert_eq!(value["is_open"], true);
+    }
+
+    #[test]
+    fn rich_message_text_limit_is_enforced_at_boundary() {
+        let at_limit = InputRichMessage::new(vec![RichBlock::Paragraph {
+            text: Value::String("x".repeat(RICH_MESSAGE_MAX_TEXT_CHARS)),
+        }]);
+        assert!(at_limit.validate().is_ok());
+        let over = InputRichMessage::new(vec![RichBlock::Paragraph {
+            text: Value::String("x".repeat(RICH_MESSAGE_MAX_TEXT_CHARS + 1)),
+        }]);
+        assert!(over.validate().is_err());
+    }
+
+    #[test]
+    fn rich_message_block_limit_is_enforced_at_boundary() {
+        let paragraph = || RichBlock::Paragraph {
+            text: Value::String("x".to_string()),
+        };
+        let at_limit =
+            InputRichMessage::new((0..RICH_MESSAGE_MAX_BLOCKS).map(|_| paragraph()).collect());
+        assert!(at_limit.validate().is_ok());
+        let over =
+            InputRichMessage::new((0..=RICH_MESSAGE_MAX_BLOCKS).map(|_| paragraph()).collect());
+        assert!(over.validate().is_err());
+    }
+
+    #[test]
+    fn rich_message_media_table_and_button_limits_are_local() {
+        let mut message = InputRichMessage::new(vec![RichBlock::Paragraph {
+            text: Value::String("ok".to_string()),
+        }]);
+        message.media = Some(
+            (0..RICH_MESSAGE_MAX_MEDIA)
+                .map(|_| serde_json::json!({}))
+                .collect(),
+        );
+        assert!(message.validate().is_ok());
+        message.media.as_mut().unwrap().push(serde_json::json!({}));
+        assert!(message.validate().is_err());
+
+        let table = |columns: usize| {
+            InputRichMessage::new(vec![RichBlock::Table {
+                cells: vec![(0..columns)
+                    .map(|_| RichBlockTableCell::text_only("x", false, None))
+                    .collect()],
+                has_header: false,
+                is_bordered: true,
+                is_striped: false,
+                is_compact: true,
+                caption: None,
+            }])
+        };
+        assert!(table(RICH_MESSAGE_MAX_TABLE_COLUMNS).validate().is_ok());
+        assert!(table(RICH_MESSAGE_MAX_TABLE_COLUMNS + 1)
+            .validate()
+            .is_err());
+
+        let buttons = |count: usize| {
+            InputRichMessage::new(vec![RichBlock::Buttons {
+                buttons: (0..count)
+                    .map(|index| {
+                        RichMessageButton::callback(format!("b{index}"), format!("c{index}"))
+                    })
+                    .collect(),
+                align: None,
+            }])
+        };
+        assert!(buttons(RICH_MESSAGE_MAX_BUTTONS_PER_ROW).validate().is_ok());
+        assert!(buttons(RICH_MESSAGE_MAX_BUTTONS_PER_ROW + 1)
+            .validate()
+            .is_err());
+    }
+
+    fn nested_details(depth: usize) -> Value {
+        if depth == 0 {
+            return serde_json::json!({"type": "paragraph", "text": "leaf"});
+        }
+        serde_json::json!({
+            "type": "details",
+            "summary": "nested",
+            "blocks": [nested_details(depth - 1)]
+        })
+    }
+
+    #[test]
+    fn rich_message_nesting_limit_is_enforced() {
+        // Top-level Details is depth 1, so fifteen nested block levels reaches 16.
+        let at_limit = InputRichMessage::new(vec![RichBlock::Details {
+            summary: Value::String("root".to_string()),
+            blocks: vec![nested_details(RICH_MESSAGE_MAX_NESTING - 2)],
+            is_open: None,
+        }]);
+        assert!(at_limit.validate().is_ok());
+        let over = InputRichMessage::new(vec![RichBlock::Details {
+            summary: Value::String("root".to_string()),
+            blocks: vec![nested_details(RICH_MESSAGE_MAX_NESTING - 1)],
+            is_open: None,
+        }]);
+        assert!(over.validate().is_err());
     }
 }

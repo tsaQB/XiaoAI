@@ -9,7 +9,7 @@ mod util;
 
 use rand::Rng;
 use regex::Regex;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io;
@@ -148,7 +148,10 @@ fn get_main_menu_keyboard() -> Value {
         true,
         Some("Tanya AI atau pilih menu..."),
     ))
-    .unwrap()
+    .unwrap_or_else(|error| {
+        error!("Failed to serialize main menu keyboard: {error}");
+        json!({})
+    })
 }
 
 fn get_collapsed_menu_keyboard() -> Value {
@@ -255,10 +258,14 @@ async fn build_provider_model_picker(
                 .await
             {
                 if !fetched.is_empty() {
-                    ai_service
+                    if ai_service
                         .update_provider_models(user_id, &prov.id, fetched.clone())
-                        .await;
-                    prov.models = fetched;
+                        .await
+                    {
+                        prov.models = fetched;
+                    } else {
+                        eprintln!("[WARN] Provider model refresh was not persisted; keeping durable catalog");
+                    }
                 }
             }
         }
@@ -842,7 +849,7 @@ fn extract_image_intent_prompt(text: &str) -> Option<String> {
         r"(?i)^(?:gambar(?:nya| ini| itu| tersebut)?|foto(?:nya)?|lukisan(?:nya)?)\s*(?:dong|ya|tolong|pls)?$",
     ];
     for pat in follow_up_patterns {
-        if Regex::new(pat).unwrap().is_match(t) {
+        if Regex::new(pat).is_ok_and(|regex| regex.is_match(t)) {
             return Some("__CONTEXT_FOLLOWUP__".to_string());
         }
     }
@@ -855,14 +862,18 @@ fn extract_image_intent_prompt(text: &str) -> Option<String> {
         r"(?i)^(?:please\s+|can you\s+)?(?:generate|create|make|draw|render)\s+(?:me\s+)?(?:an?\s+|the\s+)?(?:image|picture|photo|illustration|drawing|wallpaper|artwork)\s+(?:of\s+|about\s+)?(.+)$",
     ];
 
-    let clean_re = Regex::new(r"(?i)^(?:tentang|mengenai|berupa|of|about|dong|ya|tolong)\s+")
-        .expect("static image intent cleanup regex must compile");
+    let clean_re = Regex::new(r"(?i)^(?:tentang|mengenai|berupa|of|about|dong|ya|tolong)\s+").ok();
 
     for pat in patterns {
-        if let Some(caps) = Regex::new(pat).unwrap().captures(t) {
+        let Ok(regex) = Regex::new(pat) else {
+            continue;
+        };
+        if let Some(caps) = regex.captures(t) {
             if let Some(extracted_match) = caps.get(1) {
                 let mut extracted = extracted_match.as_str().trim().to_string();
-                extracted = clean_re.replace(&extracted, "").trim().to_string();
+                if let Some(clean_re) = &clean_re {
+                    extracted = clean_re.replace(&extracted, "").trim().to_string();
+                }
 
                 let ext_low = extracted.to_lowercase();
                 if [
@@ -1046,10 +1057,13 @@ async fn handle_image_generation(
         )],
     ]);
 
+    let Some(img_bytes) = img_bytes else {
+        return;
+    };
     let _ = bot
         .send_photo_bytes(
             chat_id,
-            img_bytes.unwrap(),
+            img_bytes,
             Some(&caption_text),
             Some("HTML"),
             serde_json::to_value(img_kb).ok(),
@@ -1157,23 +1171,10 @@ async fn handle_ai_chat(
         )
         .await;
 
-    if res.is_err()
-        || !res
-            .unwrap()
-            .get("ok")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-    {
-        let _ = bot
-            .send_message(
-                chat_id,
-                &answer_text,
-                None,
-                Some(get_collapsed_menu_keyboard()),
-                None,
-                None,
-            )
-            .await;
+    if let Err(error) = res {
+        // send_rich_message already exhausts canonical Rich -> safe HTML ->
+        // semantic plain-text fallback. Never re-send raw model Markdown here.
+        warn!("Unable to deliver final canonical answer: {error}");
     }
 }
 
@@ -1625,17 +1626,23 @@ async fn handle_update(
                     .await
                     .remove(&user_id);
                 let orig_msg_id = ai_service.user_rename_msg_id.write().await.remove(&user_id);
-                ai_service
+                let renamed = ai_service
                     .rename_session_by_id(user_id, target_session_id, &text)
                     .await;
 
+                let rename_notice = if renamed {
+                    format!(
+                        "✅ Session berhasil diubah namanya menjadi: <b>{}</b>",
+                        escape_html(&text)
+                    )
+                } else {
+                    "⚠️ <b>Nama session tidak diubah.</b> Penyimpanan gagal; state lama tetap dipertahankan."
+                        .to_string()
+                };
                 let _ = bot
                     .send_message(
                         chat_id,
-                        &format!(
-                            "✅ Session berhasil diubah namanya menjadi: <b>{}</b>",
-                            escape_html(&text)
-                        ),
+                        &rename_notice,
                         Some("HTML"),
                         Some(get_collapsed_menu_keyboard()),
                         None,
@@ -1869,18 +1876,16 @@ async fn handle_update(
         .contains(&text.as_str())
         {
             let active_idx = ai_service.get_active_session_index(user_id).await;
-            ai_service.remove_session(user_id, active_idx).await;
+            let removed = ai_service.remove_session(user_id, active_idx).await;
             let new_active_idx = ai_service.get_active_session_index(user_id).await;
             let target_page = (new_active_idx / 5) + 1;
+            let notice = if removed {
+                "🗑️ <b>Session berhasil dihapus!</b>"
+            } else {
+                "⚠️ <b>Session tidak dihapus.</b> Penyimpanan gagal; session lama tetap utuh."
+            };
             let _ = bot
-                .send_message(
-                    chat_id,
-                    "🗑️ <b>Session berhasil dihapus!</b>",
-                    Some("HTML"),
-                    None,
-                    None,
-                    None,
-                )
+                .send_message(chat_id, notice, Some("HTML"), None, None, None)
                 .await;
             send_or_update_session_manager(bot, ai_service, chat_id, user_id, None, target_page)
                 .await;
@@ -1926,8 +1931,8 @@ async fn handle_update(
                 )
                 .await;
         } else if let Some(caps) = Regex::new(r"(?i)Hal(?:aman)?\s*([0-9]+)")
-            .unwrap()
-            .captures(&text)
+            .ok()
+            .and_then(|regex| regex.captures(&text))
         {
             if ["Hal", "▶", "◀"].iter().any(|k| text.contains(k)) {
                 let target_page: usize = caps
@@ -1945,8 +1950,8 @@ async fn handle_update(
                 .await;
             }
         } else if let Some(caps) = Regex::new(r"^(?:✅\s*|Session\s*)?([0-9]+)$")
-            .unwrap()
-            .captures(text.trim())
+            .ok()
+            .and_then(|regex| regex.captures(text.trim()))
         {
             if text.trim().chars().all(|c| c.is_ascii_digit())
                 || text.trim().starts_with("✅")
@@ -1959,7 +1964,19 @@ async fn handle_update(
                 let idx = num.saturating_sub(1);
                 let sessions = ai_service.get_sessions(user_id).await;
                 if idx < sessions.len() {
-                    ai_service.switch_session(user_id, idx).await;
+                    if !ai_service.switch_session(user_id, idx).await {
+                        let _ = bot
+                            .send_message(
+                                chat_id,
+                                "❌ Gagal mengganti sesi karena state aktif tidak dapat disimpan.",
+                                None,
+                                None,
+                                None,
+                                None,
+                            )
+                            .await;
+                        return;
+                    }
                     let target_page = (idx / 5) + 1;
                     send_or_update_session_manager(
                         bot,
@@ -2045,11 +2062,22 @@ async fn handle_update(
             }
 
             if let Some(prov) = found_prov {
-                ai_service.set_active_provider(user_id, &prov.id).await;
-                ai_service
+                if !ai_service
                     .set_provider_model(user_id, &prov.id, selected_model)
-                    .await;
-                ai_service.set_user_model(user_id, selected_model).await;
+                    .await
+                {
+                    let _ = bot
+                        .send_message(
+                            chat_id,
+                            "❌ Gagal mengaktifkan model karena konfigurasi tidak dapat disimpan.",
+                            None,
+                            Some(get_main_menu_keyboard()),
+                            None,
+                            None,
+                        )
+                        .await;
+                    return;
+                }
                 let _ = bot
                     .send_message(
                         chat_id,
@@ -2113,11 +2141,16 @@ async fn handle_update(
         } else if text.starts_with("/clear")
             || ["🗑️ Reset Chat", "🗑️ Reset Obrolan"].contains(&text.as_str())
         {
-            ai_service.clear_history(user_id).await;
+            let cleared = ai_service.clear_history(user_id).await;
+            let notice = if cleared {
+                "🧹 <b>Riwayat percakapan session ini berhasil direset!</b> Anda dapat memulai topik obrolan baru."
+            } else {
+                "⚠️ <b>Riwayat tidak direset.</b> Penyimpanan gagal; histori dan attachment lama tetap dipertahankan."
+            };
             let _ = bot
                 .send_message(
                     chat_id,
-                    "🧹 <b>Riwayat percakapan session ini berhasil direset!</b> Anda dapat memulai topik obrolan baru.",
+                    notice,
                     Some("HTML"),
                     Some(get_main_menu_keyboard()),
                     None,
@@ -2296,14 +2329,15 @@ async fn handle_update(
             }
         } else if let Some(idx_str) = cq_data.strip_prefix("session_select:") {
             if let Ok(idx) = idx_str.parse::<usize>() {
-                ai_service.switch_session(user_id, idx).await;
+                let switched = ai_service.switch_session(user_id, idx).await;
                 let target_page = (idx / 5) + 1;
+                let callback_text = if switched {
+                    format!("Beralih ke Session #{} ✅", idx + 1)
+                } else {
+                    "Session tidak berubah karena penyimpanan gagal.".to_string()
+                };
                 let _ = bot
-                    .answer_callback_query(
-                        &cq_id,
-                        Some(&format!("Beralih ke Session #{} ✅", idx + 1)),
-                        false,
-                    )
+                    .answer_callback_query(&cq_id, Some(&callback_text), !switched)
                     .await;
                 send_or_update_session_manager(
                     bot,
@@ -2335,11 +2369,16 @@ async fn handle_update(
                 .await;
         } else if let Some(idx_str) = cq_data.strip_prefix("session_remove:") {
             if let Ok(idx) = idx_str.parse::<usize>() {
-                ai_service.remove_session(user_id, idx).await;
+                let removed = ai_service.remove_session(user_id, idx).await;
                 let new_active = ai_service.get_active_session_index(user_id).await;
                 let target_page = (new_active / 5) + 1;
+                let callback_text = if removed {
+                    "Session berhasil dihapus 🗑️"
+                } else {
+                    "Session tidak dihapus karena penyimpanan gagal."
+                };
                 let _ = bot
-                    .answer_callback_query(&cq_id, Some("Session berhasil dihapus 🗑️"), false)
+                    .answer_callback_query(&cq_id, Some(callback_text), !removed)
                     .await;
                 send_or_update_session_manager(
                     bot,
@@ -2464,11 +2503,19 @@ async fn handle_update(
                     .get_provider_model_by_index(user_id, prov_id, model_idx)
                     .await;
                 if let Some(model_name) = model_name_opt {
-                    ai_service.set_active_provider(user_id, prov_id).await;
-                    ai_service
+                    if !ai_service
                         .set_provider_model(user_id, prov_id, &model_name)
-                        .await;
-                    ai_service.set_user_model(user_id, &model_name).await;
+                        .await
+                    {
+                        let _ = bot
+                            .answer_callback_query(
+                                &cq_id,
+                                Some("Gagal menyimpan model aktif."),
+                                true,
+                            )
+                            .await;
+                        return;
+                    }
                     let _ = bot
                         .answer_callback_query(
                             &cq_id,
@@ -2622,19 +2669,22 @@ async fn handle_update(
                 .await;
             send_or_update_session_manager(bot, ai_service, chat_id, user_id, None, 1).await;
         } else if cq_data == "action_clear" {
-            ai_service.clear_history(user_id).await;
+            let cleared = ai_service.clear_history(user_id).await;
+            let callback_text = if cleared {
+                "Konteks direset! 🧹"
+            } else {
+                "Konteks tidak direset karena penyimpanan gagal."
+            };
             let _ = bot
-                .answer_callback_query(&cq_id, Some("Konteks direset! 🧹"), false)
+                .answer_callback_query(&cq_id, Some(callback_text), !cleared)
                 .await;
+            let notice = if cleared {
+                "🧹 <b>Riwayat memori konteks pada sesi ini berhasil dibersihkan!</b>"
+            } else {
+                "⚠️ <b>Riwayat tetap dipertahankan.</b> Penyimpanan gagal sehingga reset dibatalkan."
+            };
             let _ = bot
-                .send_message(
-                    chat_id,
-                    "🧹 <b>Riwayat memori konteks pada sesi ini berhasil dibersihkan!</b>",
-                    Some("HTML"),
-                    None,
-                    None,
-                    None,
-                )
+                .send_message(chat_id, notice, Some("HTML"), None, None, None)
                 .await;
         } else if cq_data == "action_menu" {
             let _ = bot.answer_callback_query(&cq_id, None, false).await;
@@ -2722,8 +2772,11 @@ async fn main() {
 
     // Test connection
     match bot.get_me().await {
-        Ok(resp) if resp.ok && resp.result.is_some() => {
-            let bot_info = resp.result.unwrap();
+        Ok(resp) if resp.ok => {
+            let Some(bot_info) = resp.result else {
+                error!("Telegram getMe returned ok=true without a result");
+                return;
+            };
             println!(
                 "\n🚀 XiaoAI @{} online menggunakan Telegram Bot API 10.3!",
                 bot_info.username.unwrap_or_default()
@@ -2800,10 +2853,10 @@ async fn main() {
         }
     });
 
-    let interrupted = ai::storage::quarantine_telegram_processing_async().await;
+    let interrupted = ai::storage::recover_telegram_processing_async().await;
     if interrupted > 0 {
         warn!(
-            "{interrupted} Telegram update dikarantina karena daemon berhenti saat processing; replay otomatis dinonaktifkan untuk mencegah side effect ganda"
+            "{interrupted} Telegram update berstatus processing dikembalikan ke pending untuk replay at-least-once; side effect eksternal sebelum crash dapat terulang"
         );
     }
 
@@ -2825,8 +2878,13 @@ async fn main() {
                     "Durable Telegram update {} tidak dapat didecode: {error}",
                     record.update_id
                 );
-                if ai::storage::mark_telegram_processing_async(record.update_id).await {
-                    let _ = ai::storage::mark_telegram_processed_async(record.update_id).await;
+                if ai::storage::mark_telegram_processing_async(record.update_id).await
+                    && !ai::storage::mark_telegram_processed_async(record.update_id).await
+                {
+                    warn!(
+                        "Gagal menandai durable Telegram update {} yang invalid sebagai completed",
+                        record.update_id
+                    );
                 }
             }
         }
