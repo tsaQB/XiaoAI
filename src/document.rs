@@ -359,10 +359,7 @@ fn limit_text(text: String) -> String {
     }
 }
 
-async fn render_scanned_pdf_pages(
-    data: &[u8],
-    page_count: usize,
-) -> Result<Vec<Vec<u8>>, String> {
+async fn render_scanned_pdf_pages(data: &[u8], page_count: usize) -> Result<Vec<Vec<u8>>, String> {
     let suffix: u64 = rand::random();
     let temp_dir = std::env::temp_dir().join(format!("xiao-pdf-{suffix}"));
     let input = temp_dir.join("input.pdf");
@@ -456,7 +453,6 @@ async fn render_scanned_pdf_pages(
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     render_result
 }
-
 
 #[cfg(test)]
 mod tests {
