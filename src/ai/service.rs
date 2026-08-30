@@ -165,7 +165,9 @@ fn validate_generated_image_bytes(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn decode_generated_image_base64(encoded: &str) -> Result<Vec<u8>, ImageGenerationError> {
+pub(super) fn decode_generated_image_base64(
+    encoded: &str,
+) -> Result<Vec<u8>, ImageGenerationError> {
     use base64::Engine;
     let max_encoded_len = MAX_GENERATED_IMAGE_BYTES
         .saturating_mul(4)
@@ -220,7 +222,9 @@ fn signal_generation_cancel(sender: Option<GenerationCancelSender>) -> bool {
         .unwrap_or(false)
 }
 
-async fn download_generated_image(url: &str) -> Result<Vec<u8>, ImageGenerationError> {
+pub(super) async fn download_generated_image(
+    url: &str,
+) -> Result<Vec<u8>, ImageGenerationError> {
     let parsed = parse_generated_image_url(url)?;
     let host = parsed.host_str().ok_or_else(|| {
         ImageGenerationError::new(
