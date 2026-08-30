@@ -1,6 +1,6 @@
 # xiaochat
 
-xiaochat adalah bot Telegram asynchronous berbasis Rust untuk endpoint AI yang kompatibel dengan OpenAI. Branch v0.3.0 menambahkan **role-based multimodal model routing, observable capability discovery, model-aware image generation, dan native Rich command UI Telegram 10.3** di atas hardening session/security 0.2.0.
+xiaochat adalah bot Telegram asynchronous berbasis Rust untuk endpoint AI yang kompatibel dengan OpenAI. xiaochat v0.3.0 menambahkan **role-based multimodal model routing, observable capability discovery, model-aware image generation, dan native Rich command UI Telegram 10.3** di atas hardening session/security 0.2.0.
 
 > XiaoAI tidak mengklaim mengimplementasikan seluruh Telegram Bot API. Client hanya memodelkan method dan update yang dibutuhkan aplikasi.
 
@@ -34,7 +34,7 @@ Jika specialist berbeda provider/model, Xiao mengirim media + pertanyaan saat in
 
 ## Telegram Bot API 10.3 yang Digunakan
 
-XiaoAI 0.2.0 memakai subset 10.3 yang relevan untuk UI/AI flow:
+xiaochat v0.3.0 memakai subset Telegram Bot API 10.3 yang relevan untuk UI/AI flow:
 
 - `can_stop` dan `keep_on_stop` pada streaming draft.
 - update `stopped_message_generation` / `MessageGenerationStopped`.
