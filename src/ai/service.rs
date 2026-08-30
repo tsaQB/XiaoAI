@@ -544,9 +544,9 @@ impl AIChatService {
             return false;
         };
         let sessions = self.get_sessions(user_id).await;
-        let Some(index) = sessions.iter().position(|session| session.id == session_id) else {
+        if !sessions.iter().any(|session| session.id == session_id) {
             return false;
-        };
+        }
         let replacement = if sessions.len() == 1 {
             let Some(replacement_id) = allocate_session_id_db_async(user_id).await else {
                 warn!(
