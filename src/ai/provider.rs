@@ -66,9 +66,7 @@ fn tiny_silent_wav() -> Vec<u8> {
 use super::capability::{
     get_model_capabilities_with_meta, model_metadata_key, ModelCapability, ModelMetadata,
 };
-use super::routing::{
-    ModelRole, ModelRoute, ModelRoutingConfig, ResolvedModelRoute, RouteOrigin,
-};
+use super::routing::{ModelRole, ModelRoute, ModelRoutingConfig, ResolvedModelRoute, RouteOrigin};
 use super::service::AIChatService;
 use super::storage::{
     load_provider_store, persist_capability_registry, persist_model_routing,
@@ -1637,7 +1635,10 @@ mod tests {
     fn specific_route_rejects_missing_provider_and_model() {
         let store = ProviderStore {
             active_id: Some("main".to_string()),
-            providers: vec![provider("main", "main-model"), provider("vision", "vision-v1")],
+            providers: vec![
+                provider("main", "main-model"),
+                provider("vision", "vision-v1"),
+            ],
             telegram_models: Vec::new(),
         };
         let mut routing = ModelRoutingConfig::default();
@@ -1685,7 +1686,11 @@ mod tests {
                 ..original
             }],
         };
-        assert!(!publish_capability_candidate(&mut runtime, candidate, false));
+        assert!(!publish_capability_candidate(
+            &mut runtime,
+            candidate,
+            false
+        ));
         assert_eq!(runtime.models[0].supports_image_input, Some(false));
     }
 
