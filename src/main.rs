@@ -9,7 +9,7 @@ mod util;
 
 use rand::Rng;
 use regex::Regex;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io;
