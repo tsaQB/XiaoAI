@@ -45,7 +45,13 @@ pub fn load_provider_store() -> ProviderStore {
     if p.exists() {
         if let Ok(content) = std::fs::read_to_string(&p) {
             if let Ok(store) = serde_json::from_str::<ProviderStore>(&content) {
-                let _ = save_provider_store(&store);
+                if save_provider_store(&store).is_ok() {
+                    // The legacy JSON contains provider API keys in plaintext.
+                    // Remove it only after the SQLite migration committed.
+                    if let Err(err) = std::fs::remove_file(&p) {
+                        warn!("Failed to remove migrated legacy provider file: {err}");
+                    }
+                }
                 return store;
             }
         }
@@ -130,6 +136,36 @@ pub struct ChatSession {
     pub created_at: String,
 }
 
+#[cfg(unix)]
+fn harden_dir_mode(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o700);
+        if let Err(err) = std::fs::set_permissions(path, permissions) {
+            warn!("Failed to harden XiaoAI data directory permissions: {err}");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn harden_dir_mode(_path: &std::path::Path) {}
+
+#[cfg(unix)]
+fn harden_file_mode(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o600);
+        if let Err(err) = std::fs::set_permissions(path, permissions) {
+            warn!("Failed to harden XiaoAI data file permissions: {err}");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn harden_file_mode(_path: &std::path::Path) {}
+
 fn session_db_path() -> std::path::PathBuf {
     let base = std::env::var("HOME")
         .map(std::path::PathBuf::from)
@@ -140,9 +176,13 @@ fn session_db_path() -> std::path::PathBuf {
 fn open_session_db() -> rusqlite::Result<Connection> {
     let path = session_db_path();
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            warn!("Failed to create XiaoAI data directory: {err}");
+        }
+        harden_dir_mode(parent);
     }
-    let conn = Connection::open(path)?;
+    let conn = Connection::open(&path)?;
+    harden_file_mode(&path);
     conn.execute_batch(
         "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -161,6 +201,13 @@ fn open_session_db() -> rusqlite::Result<Connection> {
             user_id INTEGER PRIMARY KEY, next_session_id INTEGER NOT NULL
         );",
     )?;
+    // WAL/SHM files may be created lazily. The private 0700 parent directory
+    // is the primary boundary; harden sidecars whenever they already exist.
+    if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        harden_file_mode(&parent.join(format!("{name}-wal")));
+        harden_file_mode(&parent.join(format!("{name}-shm")));
+    }
     Ok(conn)
 }
 
