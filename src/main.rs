@@ -3777,7 +3777,7 @@ async fn main() {
         BotCommand::ephemeral("start", "Mulai bot & info provider"),
         BotCommand::ephemeral("model", "Ganti model AI"),
         BotCommand::ephemeral("clear", "Reset riwayat percakapan chat"),
-        BotCommand::ephemeral("cancel", "Batalkan aksi atau generation aktif"),
+        BotCommand::ephemeral("cancel", "Batalkan aksi interaktif aktif"),
         BotCommand::ephemeral("help", "Daftar perintah dan panduan"),
     ];
 
