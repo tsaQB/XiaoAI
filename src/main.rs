@@ -673,9 +673,7 @@ async fn build_start_ui(ai_service: &AIChatService, user_id: i64) -> InputRichMe
             align: Some("center".to_string()),
         },
         RichBlock::Paragraph {
-            text: Value::String(
-                "Addon Models dan provider dikelola melalui Xiao CLI.".to_string(),
-            ),
+            text: Value::String("Addon Models dan provider dikelola melalui Xiao CLI.".to_string()),
         },
     ])
 }
@@ -1380,9 +1378,7 @@ async fn build_context_monitor_ui(ai_service: &AIChatService, user_id: i64) -> I
                 "Main Model".to_string(),
                 specialist_context_policy(role, ai::service::RouteOrigin::MainModel).to_string(),
             ),
-            ai::service::ModelRoute::Disabled => {
-                ("Disabled".to_string(), "Disabled".to_string())
-            }
+            ai::service::ModelRoute::Disabled => ("Disabled".to_string(), "Disabled".to_string()),
             ai::service::ModelRoute::Specific { provider_id, model } => {
                 let provider_name = providers
                     .iter()
