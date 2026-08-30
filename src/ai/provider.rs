@@ -1521,29 +1521,49 @@ impl AIChatService {
             .cloned();
         let mut capability = get_model_capabilities_with_meta(model, metadata.as_ref());
         if let Some(record) = self.capability_record(endpoint, model).await {
-            capability.vision = record.supports_image_input == Some(true);
-            capability.vision_desc = match record.supports_image_input {
-                Some(true) => "✅ Verified by provider metadata/probe".to_string(),
-                Some(false) => "❌ Rejected by provider metadata/probe".to_string(),
-                None => "⚪ Unknown: provider did not prove vision support".to_string(),
+            let vision = Self::effective_capability_state(&record, CapabilityKind::ImageInput);
+            capability.vision = vision == CapabilityState::Supported;
+            capability.vision_desc = match vision {
+                CapabilityState::Supported => {
+                    "✅ Verified by fresh provider metadata/probe".to_string()
+                }
+                CapabilityState::Unsupported => {
+                    "❌ Rejected by fresh provider metadata/probe".to_string()
+                }
+                CapabilityState::Unknown => {
+                    "⚪ Unknown/stale: provider evidence is not currently authoritative"
+                        .to_string()
+                }
             };
-            capability.audio = record.supports_audio_input == Some(true);
-            capability.audio_desc = match record.supports_audio_input {
-                Some(true) => "✅ Published/verified by provider".to_string(),
-                Some(false) => "❌ Provider reports/rejects audio input".to_string(),
-                None => "⚪ Unknown: audio capability not proven".to_string(),
+
+            let audio = Self::effective_capability_state(&record, CapabilityKind::AudioInput);
+            capability.audio = audio == CapabilityState::Supported;
+            capability.audio_desc = match audio {
+                CapabilityState::Supported => "✅ Fresh provider evidence".to_string(),
+                CapabilityState::Unsupported => "❌ Fresh provider rejection".to_string(),
+                CapabilityState::Unknown => {
+                    "⚪ Unknown/stale: audio capability not currently proven".to_string()
+                }
             };
-            capability.video = record.supports_video_input == Some(true);
-            capability.video_desc = match record.supports_video_input {
-                Some(true) => "✅ Published/verified by provider".to_string(),
-                Some(false) => "❌ Provider reports/rejects video input".to_string(),
-                None => "⚪ Unknown: video capability not proven".to_string(),
+
+            let video = Self::effective_capability_state(&record, CapabilityKind::VideoInput);
+            capability.video = video == CapabilityState::Supported;
+            capability.video_desc = match video {
+                CapabilityState::Supported => "✅ Fresh provider evidence".to_string(),
+                CapabilityState::Unsupported => "❌ Fresh provider rejection".to_string(),
+                CapabilityState::Unknown => {
+                    "⚪ Unknown/stale: video capability not currently proven".to_string()
+                }
             };
-            capability.thinking = record.supports_reasoning == Some(true);
-            capability.thinking_desc = match record.supports_reasoning {
-                Some(true) => "✅ Provider metadata/probe indicates reasoning support".to_string(),
-                Some(false) => "❌ Reasoning mode not supported".to_string(),
-                None => "⚪ Unknown: reasoning capability not probed".to_string(),
+
+            let reasoning = Self::effective_capability_state(&record, CapabilityKind::Reasoning);
+            capability.thinking = reasoning == CapabilityState::Supported;
+            capability.thinking_desc = match reasoning {
+                CapabilityState::Supported => "✅ Fresh reasoning evidence".to_string(),
+                CapabilityState::Unsupported => "❌ Reasoning mode not supported".to_string(),
+                CapabilityState::Unknown => {
+                    "⚪ Unknown/stale: reasoning capability not currently proven".to_string()
+                }
             };
         }
         capability.documents = true;
