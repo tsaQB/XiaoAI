@@ -280,6 +280,41 @@ impl RichBlockTableCell {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RichBlockListItem {
+    pub blocks: Vec<Value>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_checkbox: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_checked: Option<bool>,
+}
+
+impl RichBlockListItem {
+    pub fn bullet(blocks: Vec<Value>) -> Self {
+        Self {
+            blocks,
+            kind: None,
+            value: None,
+            has_checkbox: None,
+            is_checked: None,
+        }
+    }
+
+    pub fn ordered(blocks: Vec<Value>, value: Option<i64>) -> Self {
+        Self {
+            blocks,
+            kind: Some("1".to_string()),
+            value,
+            has_checkbox: None,
+            is_checked: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum RichBlock {
     #[serde(rename = "paragraph")]
@@ -300,9 +335,7 @@ pub enum RichBlock {
     },
 
     #[serde(rename = "list")]
-    List {
-        items: Vec<Value>, // each item is {"blocks": [{"type": "paragraph", "text": ...}]}
-    },
+    List { items: Vec<RichBlockListItem> },
 
     #[serde(rename = "blockquote")]
     BlockQuotation {
@@ -365,16 +398,29 @@ pub enum RichBlock {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct InputRichMessage {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<RichBlock>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub html: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub markdown: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub media: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_rtl: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_entity_detection: Option<bool>,
 }
 
 impl InputRichMessage {
     pub fn new(blocks: Vec<RichBlock>) -> Self {
         Self {
             blocks,
+            html: None,
+            markdown: None,
             media: None,
+            is_rtl: None,
+            skip_entity_detection: None,
         }
     }
 }
@@ -383,7 +429,7 @@ impl InputRichMessage {
 // Telegram Updates & Message Payloads
 // ==========================================
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiResponse<T> {
     pub ok: bool,
     pub result: Option<T>,
@@ -391,7 +437,7 @@ pub struct ApiResponse<T> {
     pub error_code: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Update {
     pub update_id: i64,
     pub message: Option<Message>,
@@ -399,19 +445,22 @@ pub struct Update {
     pub stopped_message_generation: Option<MessageGenerationStopped>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageGenerationStopped {
     pub chat: Chat,
     pub message_thread_id: Option<i64>,
     pub draft_id: i64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub message_id: i64,
     pub from: Option<User>,
     pub chat: Chat,
     pub date: i64,
+    pub message_thread_id: Option<i64>,
+    pub receiver_user: Option<User>,
+    pub ephemeral_message_id: Option<i64>,
     pub text: Option<String>,
     pub caption: Option<String>,
     pub photo: Option<Vec<PhotoSize>>,
@@ -425,6 +474,22 @@ pub struct Message {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplyParameters {
+    pub message_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_sending_without_reply: Option<bool>,
+}
+
+impl ReplyParameters {
+    pub fn new(message_id: i64) -> Self {
+        Self {
+            message_id,
+            allow_sending_without_reply: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EphemeralMessageParameters {
     pub receiver_user_id: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -433,7 +498,7 @@ pub struct EphemeralMessageParameters {
     pub replace_callback_query_message: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub id: i64,
     pub is_bot: bool,
@@ -442,7 +507,7 @@ pub struct User {
     pub username: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chat {
     pub id: i64,
     #[serde(rename = "type")]
@@ -453,7 +518,7 @@ pub struct Chat {
     pub last_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhotoSize {
     pub file_id: String,
     pub file_unique_id: String,
@@ -462,7 +527,7 @@ pub struct PhotoSize {
     pub file_size: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
     pub file_id: String,
     pub file_name: Option<String>,
@@ -470,7 +535,7 @@ pub struct Document {
     pub file_size: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Voice {
     pub file_id: String,
     pub duration: i32,
@@ -478,7 +543,7 @@ pub struct Voice {
     pub file_size: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Audio {
     pub file_id: String,
     pub duration: i32,
@@ -489,7 +554,7 @@ pub struct Audio {
     pub file_size: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Video {
     pub file_id: String,
     pub width: i32,
@@ -500,7 +565,7 @@ pub struct Video {
     pub file_size: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoNote {
     pub file_id: String,
     pub length: i32,
@@ -508,7 +573,7 @@ pub struct VideoNote {
     pub file_size: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallbackQuery {
     pub id: String,
     pub from: User,
@@ -517,7 +582,7 @@ pub struct CallbackQuery {
     pub data: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileInfo {
     pub file_id: String,
     pub file_size: Option<i64>,
