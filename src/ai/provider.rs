@@ -524,12 +524,7 @@ fn explicit_capability_rejection(capability: CapabilityKind, body: &str) -> bool
             "structured output",
             "structured outputs",
         ],
-        CapabilityKind::ImageInput => &[
-            "image input",
-            "input image",
-            "image modality",
-            "vision",
-        ],
+        CapabilityKind::ImageInput => &["image input", "input image", "image modality", "vision"],
         CapabilityKind::AudioInput => &[
             "audio input",
             "input audio",
@@ -543,11 +538,7 @@ fn explicit_capability_rejection(capability: CapabilityKind, body: &str) -> bool
             "speech to text",
             "transcribe audio",
         ],
-        CapabilityKind::VideoInput => &[
-            "video input",
-            "input video",
-            "video modality",
-        ],
+        CapabilityKind::VideoInput => &["video input", "input video", "video modality"],
         CapabilityKind::ImageGeneration => &[
             "image generation",
             "images generation",
@@ -914,7 +905,7 @@ impl AIChatService {
         self.run_capability_probe_request(
             provider,
             CapabilityKind::AudioInput,
-                json!({
+            json!({
                 "model": model,
                 "messages": [{
                     "role": "user",
@@ -1328,7 +1319,7 @@ impl AIChatService {
                 .run_capability_probe_request(
                     provider,
                     CapabilityKind::TextChat,
-                json!({
+                    json!({
                         "model": model,
                         "messages": [{"role": "user", "content": "Reply with exactly OK."}],
                         "stream": false,
@@ -1364,7 +1355,7 @@ impl AIChatService {
                 .run_capability_probe_request(
                     provider,
                     CapabilityKind::Tools,
-                json!({
+                    json!({
                         "model": model,
                         "messages": [{
                             "role": "user",
@@ -1419,7 +1410,7 @@ impl AIChatService {
                 .run_capability_probe_request(
                     provider,
                     CapabilityKind::StructuredOutput,
-                json!({
+                    json!({
                         "model": model,
                         "messages": [{
                             "role": "user",
@@ -2524,11 +2515,7 @@ mod tests {
             CapabilityProbeResponse::Rejected
         ));
         assert!(matches!(
-            classify_probe_http_failure(
-                CapabilityKind::AudioInput,
-                400,
-                "unsupported codec"
-            ),
+            classify_probe_http_failure(CapabilityKind::AudioInput, 400, "unsupported codec"),
             CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch)
         ));
         assert!(matches!(
@@ -2608,11 +2595,7 @@ mod tests {
             CapabilityProbeResponse::Unknown(ProbeOutcome::RateLimited)
         ));
         assert!(matches!(
-            classify_probe_http_failure(
-                CapabilityKind::ImageInput,
-                503,
-                "provider unavailable"
-            ),
+            classify_probe_http_failure(CapabilityKind::ImageInput, 503, "provider unavailable"),
             CapabilityProbeResponse::Unknown(ProbeOutcome::ProviderError)
         ));
     }
