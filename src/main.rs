@@ -1194,14 +1194,12 @@ fn delivery_context_for_update(update: &Update) -> TelegramDeliveryContext {
     }
     if let Some(callback) = update.callback_query.as_ref() {
         let message = callback.message.as_deref();
-        let source_ephemeral_message_id =
-            message.and_then(|message| message.ephemeral_message_id);
+        let source_ephemeral_message_id = message.and_then(|message| message.ephemeral_message_id);
         return TelegramDeliveryContext {
             message_thread_id: message.and_then(|message| message.message_thread_id),
             receiver_user_id: source_ephemeral_message_id.map(|_| callback.from.id),
             source_ephemeral_message_id,
-            callback_query_id: source_ephemeral_message_id
-                .map(|_| callback.id.clone()),
+            callback_query_id: source_ephemeral_message_id.map(|_| callback.id.clone()),
         };
     }
     if let Some(stopped) = update.stopped_message_generation.as_ref() {
