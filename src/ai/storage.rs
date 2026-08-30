@@ -1557,13 +1557,6 @@ pub(super) async fn persist_capability_registry(registry: CapabilityRegistry) ->
     }
 }
 
-pub(super) async fn load_app_setting_async(key: &'static str) -> Option<String> {
-    tokio::task::spawn_blocking(move || load_app_setting(key))
-        .await
-        .ok()
-        .flatten()
-}
-
 fn secret_setting_namespace(key: &str) -> Option<&'static str> {
     match key {
         "BOT_TOKEN" => Some("telegram"),
