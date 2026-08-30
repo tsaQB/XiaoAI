@@ -475,7 +475,10 @@ pub struct Message {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplyParameters {
-    pub message_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ephemeral_message_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_sending_without_reply: Option<bool>,
 }
@@ -483,7 +486,16 @@ pub struct ReplyParameters {
 impl ReplyParameters {
     pub fn new(message_id: i64) -> Self {
         Self {
-            message_id,
+            message_id: Some(message_id),
+            ephemeral_message_id: None,
+            allow_sending_without_reply: None,
+        }
+    }
+
+    pub fn ephemeral(ephemeral_message_id: i64) -> Self {
+        Self {
+            message_id: None,
+            ephemeral_message_id: Some(ephemeral_message_id),
             allow_sending_without_reply: None,
         }
     }
