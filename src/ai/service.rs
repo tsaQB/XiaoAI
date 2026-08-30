@@ -22,6 +22,7 @@ use super::http::{is_retryable_status, retry_delay, MAX_PROVIDER_ATTEMPTS};
 use super::stream::{SseDecoder, StreamEvent};
 use crate::timeline::{ExecutionTimeline, ProgressActivity, ProgressState};
 
+use super::capability::model_metadata_key;
 pub use super::capability::{ModelCapability, ModelMetadata};
 
 use super::storage::{
@@ -76,6 +77,14 @@ fn estimate_stored_content_tokens(content: &Value) -> usize {
         Value::String(text) => estimate_text_tokens(text),
         value => estimate_text_tokens(&value.to_string()),
     }
+}
+
+fn provider_url(endpoint: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        endpoint.trim().trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
 }
 
 fn max_output_tokens_for_model(model: &str) -> usize {
@@ -198,7 +207,7 @@ impl AIChatService {
             let allowed = match attachment.kind.as_str() {
                 "image" | "document_page" => capability
                     .and_then(|record| record.supports_image)
-                    .unwrap_or(true),
+                    .unwrap_or(false),
                 "audio" => capability
                     .and_then(|record| record.supports_audio)
                     .unwrap_or(false),
@@ -687,7 +696,7 @@ impl AIChatService {
                 ),
             };
 
-        let stt_url = format!("{}/audio/transcriptions", provider.endpoint);
+        let stt_url = provider_url(&provider.endpoint, "audio/transcriptions");
         let part = match Part::bytes(audio_bytes)
             .file_name(file_name.to_string())
             .mime_str("audio/ogg")
@@ -865,8 +874,17 @@ impl AIChatService {
         let resolved_capability = self
             .resolved_model_capability(&provider.endpoint, &model)
             .await;
-        let max_output_tokens = max_output_tokens_for_model(&model)
+        let metadata_max_completion_tokens = self
+            .model_metadata
+            .read()
+            .await
+            .get(&model_metadata_key(&provider.endpoint, &model))
+            .and_then(|metadata| metadata.max_completion_tokens);
+        let mut max_output_tokens = max_output_tokens_for_model(&model)
             .min(resolved_capability.context_limit.saturating_div(2).max(1));
+        if let Some(limit) = metadata_max_completion_tokens.filter(|limit| *limit > 0) {
+            max_output_tokens = max_output_tokens.min(limit);
+        }
         let max_prompt_tokens = resolved_capability
             .context_limit
             .saturating_sub(max_output_tokens)
@@ -991,13 +1009,17 @@ impl AIChatService {
             }));
         }
 
-        let url = format!("{}/chat/completions", provider.endpoint);
-        let payload = json!({
+        let url = provider_url(&provider.endpoint, "chat/completions");
+        let mut payload = json!({
             "model": model,
             "messages": messages,
             "stream": true,
-            "max_tokens": max_output_tokens,
         });
+        if metadata_max_completion_tokens.is_some() {
+            payload["max_completion_tokens"] = json!(max_output_tokens);
+        } else {
+            payload["max_tokens"] = json!(max_output_tokens);
+        }
 
         let use_auth = !provider.api_key.is_empty()
             && !["none", "-", "no"]
@@ -1168,7 +1190,15 @@ impl AIChatService {
                 }
             };
 
-            for event in decoder.push(&bytes) {
+            let events = match decoder.push(&bytes) {
+                Ok(events) => events,
+                Err(error) => {
+                    stream_interrupted = true;
+                    warn!("AI response SSE decode failed: {error}");
+                    break;
+                }
+            };
+            for event in events {
                 match event {
                     StreamEvent::Done => {
                         stream_done = true;
@@ -1224,13 +1254,21 @@ impl AIChatService {
         }
 
         if !stream_done && !cancelled && !stream_interrupted {
-            for event in decoder.finish() {
-                if matches!(event, StreamEvent::Done) {
-                    stream_done = true;
+            match decoder.finish() {
+                Ok(events) => {
+                    for event in events {
+                        if matches!(event, StreamEvent::Done) {
+                            stream_done = true;
+                        }
+                    }
+                    if !stream_done {
+                        stream_interrupted = true;
+                    }
                 }
-            }
-            if !stream_done {
-                stream_interrupted = true;
+                Err(error) => {
+                    warn!("AI response SSE final decode failed: {error}");
+                    stream_interrupted = true;
+                }
             }
         }
 
@@ -1253,13 +1291,8 @@ impl AIChatService {
                 let parts: Vec<&str> = accumulated_raw.split("<think>").collect();
                 let before_think = parts[0].trim();
                 let inside_think = parts.get(1).copied().unwrap_or("").trim();
-                if !inside_think.is_empty() && before_think.is_empty() {
-                    thinking_text = Some(inside_think.to_string());
-                    answer_text = inside_think.to_string();
-                } else {
-                    thinking_text = Some(inside_think.to_string());
-                    answer_text = before_think.to_string();
-                }
+                thinking_text = (!inside_think.is_empty()).then(|| inside_think.to_string());
+                answer_text = before_think.to_string();
             }
         }
 
@@ -1268,12 +1301,6 @@ impl AIChatService {
             .replace_all(&answer_text, "")
             .trim()
             .to_string();
-
-        if answer_text.is_empty() {
-            if let Some(ref th) = thinking_text {
-                answer_text = tag_clean_re.replace_all(th, "").trim().to_string();
-            }
-        }
 
         if cancelled {
             if answer_text.trim().is_empty() {
@@ -1309,6 +1336,13 @@ impl AIChatService {
                 }
                 tl.finish_all(ProgressState::Done).await;
             }
+        }
+
+        // Cancelled/interrupted output is presentation-only. Do not make a
+        // partial answer canonical history: retry/follow-up context must only
+        // see completed assistant turns.
+        if cancelled || stream_interrupted {
+            return (thinking_text, answer_text, cancelled);
         }
 
         // Persist only to the stable session that originated this request. Multimodal
@@ -1433,7 +1467,7 @@ impl AIChatService {
         // 1. Try Custom Provider /images/generations endpoint
         if let Some(ref p) = provider {
             if !p.endpoint.is_empty() {
-                let gen_url = format!("{}/images/generations", p.endpoint);
+                let gen_url = provider_url(&p.endpoint, "images/generations");
                 let mut req = self
                     .client
                     .post(&gen_url)
