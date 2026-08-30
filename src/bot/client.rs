@@ -697,9 +697,10 @@ impl TelegramBotClient {
                     info!("Rich Message request failed ({error}); degrading to safe HTML.")
                 }
             }
-        } else if rich_message.blocks.is_empty() {
-            return Err(validation.unwrap_err());
-        } else if let Err(error) = &validation {
+        } else if let Err(error) = validation {
+            if rich_message.blocks.is_empty() {
+                return Err(error);
+            }
             // Structural overflow is locally detected before network I/O. Block
             // ASTs can still be rendered deterministically through safer
             // representations rather than relying on Telegram rejection.
