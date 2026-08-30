@@ -63,11 +63,56 @@ fn tiny_silent_wav() -> Vec<u8> {
     wav
 }
 
+const TINY_RED_MP4_BASE64: &str = "AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAMUbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAA+gAAQAAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAj90cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAA+gAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAABAAAAAQAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAPoAAAAAAABAAAAAAG3bWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAABAAAAAQABVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAABYm1pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAASJzdGJsAAAAvnN0c2QAAAAAAAAAAQAAAK5hdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAABAAEABIAAAASAAAAAAAAAABFUxhdmM2MS4xOS4xMDEgbGlieDI2NAAAAAAAAAAAAAAAGP//AAAANGF2Y0MBZAAK/+EAF2dkAAqs2V7ARAAAAwAEAAADAAg8SJZYAQAGaOvjyyLA/fj4AAAAABBwYXNwAAAAAQAAAAEAAAAUYnRydAAAAAAAABZYAAAAAAAAABhzdHRzAAAAAAAAAAEAAAABAABAAAAAABxzdHNjAAAAAAAAAAEAAAABAAAAAQAAAAEAAAAUc3RzegAAAAAAAALLAAAAAQAAABRzdGNvAAAAAAAAAAEAAANEAAAAYXVkdGEAAABZbWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAbWRpcmFwcGwAAAAAAAAAAAAAAAAsaWxzdAAAACSpdG9vAAAAHGRhdGEAAAABAAAAAExhdmY2MS43LjEwMwAAAAhmcmVlAAAC021kYXQAAAKtBgX//6ncRem95tlIt5Ys2CDZI+7veDI2NCAtIGNvcmUgMTY0IHIzMTA4IDMxZTE5ZjkgLSBILjI2NC9NUEVHLTQgQVZDIGNvZGVjIC0gQ29weWxlZnQgMjAwMy0yMDIzIC0gaHR0cDovL3d3dy52aWRlb2xhbi5vcmcveDI2NC5odG1sIC0gb3B0aW9uczogY2FiYWM9MSByZWY9MyBkZWJsb2NrPTE6MDowIGFuYWx5c2U9MHgzOjB4MTEzIG1lPWhleCBzdWJtZT03IHBzeT0xIHBzeV9yZD0xLjAwOjAuMDAgbWl4ZWRfcmVmPTEgbWVfcmFuZ2U9MTYgY2hyb21hX21lPTEgdHJlbGxpcz0xIDh4OGRjdD0xIGNxbT0wIGRlYWR6b25lPTIxLDExIGZhc3RfcHNraXA9MSBjaHJvbWFfcXBfb2Zmc2V0PS0yIHRocmVhZHM9MSBsb29rYWhlYWRfdGhyZWFkcz0xIHNsaWNlZF90aHJlYWRzPTAgbnI9MCBkZWNpbWF0ZT0xIGludGVybGFjZWQ9MCBibHVyYXlfY29tcGF0PTAgY29uc3RyYWluZWRfaW50cmE9MCBiZnJhbWVzPTMgYl9weXJhbWlkPTIgYl9hZGFwdD0xIGJfYmlhcz0wIGRpcmVjdD0xIHdlaWdodGI9MSBvcGVuX2dvcD0wIHdlaWdodHA9MiBrZXlpbnQ9MjUwIGtleWludF9taW49MSBzY2VuZWN1dD00MCBpbnRyYV9yZWZyZXNoPTAgcmNfbG9va2FoZWFkPTQwIHJjPWNyZiBtYnRyZWU9MSBjcmY9MjMuMCBxY29tcD0wLjYwIHFwbWluPTAgcXBtYXg9NjkgcXBzdGVwPTQgaXBfcmF0aW89MS40MCBhcT0xOjEuMDAAgAAAABZliIQAFf/+7M9+BTZo5i/D8UVzjn2B";
+
+fn video_probe_payload(model: &str) -> Value {
+    json!({
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Return only the dominant color visible in this short video as one lowercase English word."
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:video/mp4;base64,{TINY_RED_MP4_BASE64}")
+                    }
+                }
+            ]
+        }],
+        "stream": false,
+        "max_tokens": 8
+    })
+}
+
+async fn validate_image_generation_probe_body(body: &Value) -> bool {
+    let Some(item) = body
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|data| data.first())
+    else {
+        return false;
+    };
+
+    if let Some(encoded) = item.get("b64_json").and_then(Value::as_str) {
+        return decode_generated_image_base64(encoded).is_ok();
+    }
+    if let Some(url) = item.get("url").and_then(Value::as_str) {
+        return download_generated_image(url).await.is_ok();
+    }
+    false
+}
+
 use super::capability::{
     get_model_capabilities_with_meta, model_metadata_key, ModelCapability, ModelMetadata,
 };
 use super::routing::{ModelRole, ModelRoute, ModelRoutingConfig, ResolvedModelRoute, RouteOrigin};
-use super::service::AIChatService;
+use super::service::{
+    decode_generated_image_base64, download_generated_image, AIChatService,
+};
 use super::storage::{
     load_provider_store, persist_capability_registry, persist_model_routing,
     persist_provider_state, CapabilityEvidence, CapabilityEvidenceSource, CapabilityKind,
@@ -843,20 +888,7 @@ impl AIChatService {
         };
         if response.status().is_success() {
             return match read_bounded_provider_json(response).await {
-                Ok(body)
-                    if body
-                        .get("data")
-                        .and_then(Value::as_array)
-                        .and_then(|data| data.first())
-                        .is_some_and(|item| {
-                            item.get("b64_json").and_then(Value::as_str).is_some()
-                                || item
-                                    .get("url")
-                                    .and_then(Value::as_str)
-                                    .and_then(|url| url::Url::parse(url).ok())
-                                    .is_some_and(|url| matches!(url.scheme(), "http" | "https"))
-                        }) =>
-                {
+                Ok(body) if validate_image_generation_probe_body(&body).await => {
                     CapabilityProbeResponse::Success(body)
                 }
                 Ok(_) | Err(_) => CapabilityProbeResponse::Unknown(ProbeOutcome::Inconclusive),
@@ -1180,7 +1212,7 @@ impl AIChatService {
             || modalities.contains("multimodal"))
         .then_some(true);
         let metadata_audio_input = modalities.contains("audio").then_some(true);
-        let video_input = modalities.contains("video").then_some(true);
+        let metadata_video_input = modalities.contains("video").then_some(true);
         let native_file_input =
             (modalities.contains("file") || modalities.contains("document")).then_some(true);
         let image_input = image.or(metadata_image_input);
@@ -1189,17 +1221,19 @@ impl AIChatService {
         observer(ProbeEvent::Started {
             capability: CapabilityKind::VideoInput,
         });
-        if video_input == Some(true) {
-            observer(ProbeEvent::Completed {
-                capability: CapabilityKind::VideoInput,
-                outcome: ProbeOutcome::Supported,
-            });
-        } else {
-            observer(ProbeEvent::Skipped {
-                capability: CapabilityKind::VideoInput,
-                reason: "No verified video metadata and no portable safe active video sample for this provider; remains Unknown.".to_string(),
-            });
-        }
+        observer(ProbeEvent::Progress {
+            capability: CapabilityKind::VideoInput,
+            message: "Probing video input with a tiny bounded red MP4 sample...".to_string(),
+        });
+        let video_probe = self
+            .run_capability_probe_request(provider, video_probe_payload(model))
+            .await;
+        let probed_video_input = validate_color_probe(&video_probe, "red");
+        let video_input = probed_video_input.or(metadata_video_input);
+        observer(ProbeEvent::Completed {
+            capability: CapabilityKind::VideoInput,
+            outcome: video_probe.outcome(probed_video_input),
+        });
         observer(ProbeEvent::Skipped {
             capability: CapabilityKind::ImageGeneration,
             reason: "Active image-generation probe can spend credits and is never run automatically; passive evidence only.".to_string(),
@@ -1254,11 +1288,21 @@ impl AIChatService {
                     transcription_probe.outcome(audio_transcription)
                 )),
             },
+            CapabilityEvidence {
+                capability: CapabilityKind::VideoInput,
+                source: CapabilityEvidenceSource::ActiveProbe,
+                outcome: capability_state(probed_video_input),
+                checked_at: checked_at.clone(),
+                detail: Some(format!(
+                    "tiny red MP4 semantic probe={:?}",
+                    video_probe.outcome(probed_video_input)
+                )),
+            },
         ];
         for (capability, value) in [
             (CapabilityKind::ImageInput, metadata_image_input),
             (CapabilityKind::AudioInput, metadata_audio_input),
-            (CapabilityKind::VideoInput, video_input),
+            (CapabilityKind::VideoInput, metadata_video_input),
             (CapabilityKind::NativeFileInput, native_file_input),
         ] {
             if let Some(value) = value {
@@ -1299,6 +1343,7 @@ impl AIChatService {
                 format!("vision={image:?}"),
                 format!("tools={tools:?}"),
                 format!("structured_output={structured:?}"),
+                format!("video={video_input:?}"),
                 if modalities.is_empty() {
                     "modalities=unknown".to_string()
                 } else {
@@ -1795,6 +1840,45 @@ mod tests {
             ),
             Some(true)
         );
+    }
+
+    #[test]
+    fn video_probe_payload_contains_bounded_mp4_and_selected_model() {
+        let payload = video_probe_payload("video-model");
+        assert_eq!(
+            payload.get("model").and_then(Value::as_str),
+            Some("video-model")
+        );
+        let url = payload
+            .get("messages")
+            .and_then(Value::as_array)
+            .and_then(|messages| messages.first())
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array)
+            .and_then(|content| content.get(1))
+            .and_then(|part| part.get("image_url"))
+            .and_then(|image_url| image_url.get("url"))
+            .and_then(Value::as_str)
+            .unwrap();
+        let encoded = url.strip_prefix("data:video/mp4;base64,").unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+        assert!(bytes.len() < 2 * 1024);
+        assert_eq!(&bytes[4..8], b"ftyp");
+    }
+
+    #[tokio::test]
+    async fn image_generation_probe_requires_valid_image_bytes() {
+        let valid = json!({
+            "data": [{
+                "b64_json": "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAF0lEQVR4nGP8z0AaYCJR/aiGUQ1DSAMAQC4BH2bjRnMAAAAASUVORK5CYII="
+            }]
+        });
+        assert!(validate_image_generation_probe_body(&valid).await);
+
+        let invalid = json!({
+            "data": [{"b64_json": "bm90IGFuIGltYWdl"}]
+        });
+        assert!(!validate_image_generation_probe_body(&invalid).await);
     }
 
     #[test]
