@@ -310,7 +310,7 @@ impl TelegramBotClient {
                 if is_first {
                     if let Some(rep) = reply_to_message_id {
                         payload["reply_parameters"] =
-                serde_json::to_value(ReplyParameters::new(rep)).unwrap_or(json!({}));
+                            serde_json::to_value(ReplyParameters::new(rep)).unwrap_or(json!({}));
                     }
                 }
                 Self::apply_delivery_context(&mut payload, true);
@@ -340,7 +340,7 @@ impl TelegramBotClient {
         }
         if let Some(rep) = reply_to_message_id {
             payload["reply_parameters"] =
-                            serde_json::to_value(ReplyParameters::new(rep)).unwrap_or(json!({}));
+                serde_json::to_value(ReplyParameters::new(rep)).unwrap_or(json!({}));
         }
 
         Self::apply_delivery_context(&mut payload, true);
