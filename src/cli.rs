@@ -1398,7 +1398,9 @@ pub(crate) async fn run_cli_model_addon(ai_service: &AIChatService, args: &[Stri
             );
             match role {
                 ModelRole::ImageGeneration => {
-                    println!("[WARN] This explicit image-generation test can consume provider credits.");
+                    println!(
+                        "[WARN] This explicit image-generation test can consume provider credits."
+                    );
                     match ai_service
                         .probe_image_generation_active_with_observer(role, print_probe_event)
                         .await
