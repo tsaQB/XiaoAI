@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use ai::service::{ImageGenerationErrorKind, ProbeEvent, ProviderConfig};
+use ai::service::{
+    GenerationModelSnapshot, ImageGenerationErrorKind, ProbeEvent, ProviderConfig,
+};
 use ai::AIChatService;
 use bot::client::{TelegramBotClient, TelegramDeliveryContext};
 use bot::models::{
@@ -44,6 +46,7 @@ struct ChatInput<'a> {
     video_bytes: Option<Vec<u8>>,
     video_mime: Option<&'a str>,
     video_duration: Option<i32>,
+    model_snapshot: Option<&'a GenerationModelSnapshot>,
 }
 
 #[derive(Clone, Debug)]
@@ -1799,9 +1802,17 @@ async fn handle_image_generation(
     let width = 1024usize;
     let height = 1024usize;
     let image_started = Instant::now();
+    let model_snapshot = ai_service.generation_model_snapshot().await;
     let mut cancel_rx = ai_service.begin_generation(chat_id, draft_id).await;
     let image_result = ai_service
-        .generate_image(user_id, &clean_prompt, width, height, &mut cancel_rx)
+        .generate_image_with_snapshot(
+            user_id,
+            &clean_prompt,
+            width,
+            height,
+            &model_snapshot,
+            &mut cancel_rx,
+        )
         .await;
     ai_service.end_generation(chat_id, draft_id).await;
     timeline.stop_ticker();
@@ -1978,6 +1989,7 @@ async fn handle_image_generation(
                 video_bytes: None,
                 video_mime: None,
                 video_duration: None,
+                model_snapshot: Some(&model_snapshot),
             },
         )
         .await;
@@ -2007,6 +2019,7 @@ async fn handle_ai_chat(
         video_bytes,
         video_mime,
         video_duration,
+        model_snapshot,
     } = input;
     let generation_lock = ai_service.generation_lock(user_id).await;
     let _generation_guard = generation_lock.lock().await;
@@ -2045,10 +2058,7 @@ async fn handle_ai_chat(
 
     let current_model = ai_service.get_user_model(user_id).await;
 
-    let (_thinking, mut answer_text, _cancelled) = ai_service
-        .generate_response(
-            user_id,
-            ai::service::GenerationInput {
+    let generation_input = ai::service::GenerationInput {
                 prompt: user_prompt,
                 canonical_prompt: None,
                 media_to_main: true,
@@ -2063,10 +2073,16 @@ async fn handle_ai_chat(
                 video_bytes,
                 video_mime,
                 video_duration,
-            },
-            &mut cancel_rx,
-        )
-        .await;
+            };
+    let (_thinking, mut answer_text, _cancelled) = if let Some(snapshot) = model_snapshot {
+        ai_service
+            .generate_response_with_snapshot(user_id, generation_input, snapshot, &mut cancel_rx)
+            .await
+    } else {
+        ai_service
+            .generate_response(user_id, generation_input, &mut cancel_rx)
+            .await
+    };
 
     ai_service.end_generation(chat_id, draft_id).await;
     timeline.stop_ticker();
@@ -2639,6 +2655,7 @@ async fn handle_update(
                     video_bytes: None,
                     video_mime: None,
                     video_duration: None,
+                    model_snapshot: None,
                 },
             )
             .await;
@@ -2670,6 +2687,7 @@ async fn handle_update(
                     video_bytes: Some(v_bytes),
                     video_mime: video_mime.as_deref(),
                     video_duration: Some(video_duration),
+                    model_snapshot: None,
                 },
             )
             .await;
@@ -2922,6 +2940,7 @@ async fn handle_update(
                             video_bytes: None,
                             video_mime: None,
                             video_duration: None,
+                            model_snapshot: None,
                         },
                     )
                     .await;
@@ -3035,6 +3054,7 @@ async fn handle_update(
                         video_bytes: None,
                         video_mime: None,
                         video_duration: None,
+                        model_snapshot: None,
                     },
                 )
                 .await;
@@ -3122,6 +3142,7 @@ async fn handle_update(
                         video_bytes,
                         video_mime: video_mime.as_deref(),
                         video_duration: Some(video_duration),
+                        model_snapshot: None,
                     },
                 )
                 .await;

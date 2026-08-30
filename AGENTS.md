@@ -39,14 +39,14 @@ Run before declaring a change ready:
 9. User generations are serialized so concurrent prompts cannot reorder the same owner's history.
 10. Telegram `stopped_message_generation` must cancel the matching `(chat_id, draft_id)` provider stream.
 11. Binary documents must use explicit bounded extractors. Never reinterpret PDF/DOCX/XLSX bytes as UTF-8; scanned PDFs must use the render-to-vision path.
-12. Multimodal capability is fail-closed: only explicit `Some(true)` authorizes media routing. Unknown/missing records must be probed safely or rejected.
+12. Multimodal capability is fail-closed: runtime media authorization requires effective `Supported` state from fresh, capability-scoped evidence. A raw legacy `Some(true)` field alone never authorizes media. Unknown, missing, or stale evidence must be probed safely or rejected.
 13. Provider API keys and `BOT_TOKEN` must persist through the SecretStore reference abstraction, never as ordinary plaintext config values. Do not claim the local file SecretStore is encrypted or equivalent to an OS keyring.
 14. External image fallback is opt-in only (`IMAGE_FALLBACK_PROVIDER=pollinations`).
 15. Main Model owns canonical history. Different-provider Vision/Video/STT specialists receive only the current media/question and return bounded execution artifacts to Main.
 16. Addon routes are persisted separately from ProviderStore as Main Model / Specific / Disabled. Telegram may edit Main only; addon configuration is CLI-only in v0.3.0.
-17. Capability freshness is per capability. A new text/vision probe must not refresh unrelated image-generation/STT evidence. Unknown or stale evidence remains fail-closed.
+17. Capability freshness is per evidence item and source: UserOverride > ActiveProbe > KnownProviderProfile > ProviderMetadata, with source-specific TTL policy. A new text/vision probe must not refresh unrelated image-generation/STT evidence, and stale metadata never inherits an ActiveProbe TTL. Unknown or stale evidence remains fail-closed.
 18. Image generation must resolve the Image Generation Model, propagate the actual model in provider requests, use bounded configurable timeouts, validate all returned image bytes/URLs, and preserve explicit fallback opt-in.
-19. Provider protocol contracts are strictly OpenAI-compatible: Image Generation uses `POST /images/generations` (or explicit Pollinations fallback), Audio STT uses `POST /audio/transcriptions`, and Chat/Vision/Video/Audio uses `POST /chat/completions` with bounded standard media payload shapes. Protocol mismatch (404/405) produces typed errors and is never silently converted to Unsupported capability.
+19. Provider protocol scope is the Xiao-supported OpenAI-compatible subset: Image Generation uses `POST /images/generations` (or explicit Pollinations fallback), Audio STT uses `POST /audio/transcriptions`, and Chat/Vision/Video/Audio uses `POST /chat/completions` with bounded media payload shapes. Protocol/sample-shape mismatches (including 404/405 and generic HTTP 415) remain Unknown/ProtocolMismatch; only an unambiguous model/modality rejection may become Unsupported.
 
 ## Architecture
 

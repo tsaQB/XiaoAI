@@ -1391,6 +1391,77 @@ impl CapabilityRecord {
         }
     }
 
+    fn evidence_source_ttl(
+        source: CapabilityEvidenceSource,
+    ) -> Option<std::time::Duration> {
+        match source {
+            CapabilityEvidenceSource::ProviderMetadata => {
+                Some(std::time::Duration::from_secs(6 * 60 * 60))
+            }
+            CapabilityEvidenceSource::ActiveProbe => {
+                Some(std::time::Duration::from_secs(7 * 24 * 60 * 60))
+            }
+            CapabilityEvidenceSource::KnownProviderProfile => {
+                Some(std::time::Duration::from_secs(30 * 24 * 60 * 60))
+            }
+            CapabilityEvidenceSource::UserOverride => None,
+        }
+    }
+
+    fn evidence_source_precedence(source: CapabilityEvidenceSource) -> u8 {
+        match source {
+            CapabilityEvidenceSource::ProviderMetadata => 1,
+            CapabilityEvidenceSource::KnownProviderProfile => 2,
+            CapabilityEvidenceSource::ActiveProbe => 3,
+            CapabilityEvidenceSource::UserOverride => 4,
+        }
+    }
+
+    fn evidence_is_fresh(evidence: &CapabilityEvidence) -> bool {
+        let Ok(checked_at) = chrono::DateTime::parse_from_rfc3339(&evidence.checked_at) else {
+            return false;
+        };
+        let age = chrono::Utc::now().signed_duration_since(checked_at.with_timezone(&chrono::Utc));
+        if age.num_seconds() < 0 {
+            return false;
+        }
+        match Self::evidence_source_ttl(evidence.source) {
+            Some(ttl) => age.to_std().is_ok_and(|age| age <= ttl),
+            None => true,
+        }
+    }
+
+    pub fn effective_evidence_for(
+        &self,
+        capability: CapabilityKind,
+    ) -> Option<&CapabilityEvidence> {
+        self.evidence
+            .iter()
+            .filter(|evidence| evidence.capability == capability)
+            .filter(|evidence| Self::evidence_is_fresh(evidence))
+            .max_by(|left, right| {
+                let left_key = (
+                    Self::evidence_source_precedence(left.source),
+                    chrono::DateTime::parse_from_rfc3339(&left.checked_at)
+                        .map(|timestamp| timestamp.timestamp_millis())
+                        .unwrap_or(i64::MIN),
+                );
+                let right_key = (
+                    Self::evidence_source_precedence(right.source),
+                    chrono::DateTime::parse_from_rfc3339(&right.checked_at)
+                        .map(|timestamp| timestamp.timestamp_millis())
+                        .unwrap_or(i64::MIN),
+                );
+                left_key.cmp(&right_key)
+            })
+    }
+
+    pub fn effective_state_for(&self, capability: CapabilityKind) -> CapabilityState {
+        self.effective_evidence_for(capability)
+            .map(|evidence| evidence.outcome)
+            .unwrap_or(CapabilityState::Unknown)
+    }
+
     pub fn freshness_for(
         &self,
         capability: CapabilityKind,
@@ -2108,6 +2179,122 @@ mod tests {
         assert_eq!(
             record.freshness_for(CapabilityKind::AudioTranscription, ttl),
             EvidenceFreshness::Stale
+        );
+    }
+
+    #[test]
+    fn source_aware_freshness_uses_each_evidence_own_ttl() {
+        let now = chrono::Utc::now();
+        let record = CapabilityRecord {
+            evidence: vec![
+                CapabilityEvidence {
+                    capability: CapabilityKind::ImageInput,
+                    source: CapabilityEvidenceSource::ActiveProbe,
+                    outcome: CapabilityState::Unsupported,
+                    checked_at: (now - chrono::Duration::days(8)).to_rfc3339(),
+                    detail: None,
+                },
+                CapabilityEvidence {
+                    capability: CapabilityKind::ImageInput,
+                    source: CapabilityEvidenceSource::ProviderMetadata,
+                    outcome: CapabilityState::Supported,
+                    checked_at: (now - chrono::Duration::hours(2)).to_rfc3339(),
+                    detail: None,
+                },
+            ],
+            ..CapabilityRecord::default()
+        };
+        assert_eq!(
+            record.effective_state_for(CapabilityKind::ImageInput),
+            CapabilityState::Supported
+        );
+    }
+
+    #[test]
+    fn fresh_active_probe_overrides_fresh_metadata_deterministically() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let record = CapabilityRecord {
+            evidence: vec![
+                CapabilityEvidence {
+                    capability: CapabilityKind::AudioInput,
+                    source: CapabilityEvidenceSource::ProviderMetadata,
+                    outcome: CapabilityState::Supported,
+                    checked_at: now.clone(),
+                    detail: None,
+                },
+                CapabilityEvidence {
+                    capability: CapabilityKind::AudioInput,
+                    source: CapabilityEvidenceSource::ActiveProbe,
+                    outcome: CapabilityState::Unsupported,
+                    checked_at: now,
+                    detail: None,
+                },
+            ],
+            ..CapabilityRecord::default()
+        };
+        assert_eq!(
+            record.effective_state_for(CapabilityKind::AudioInput),
+            CapabilityState::Unsupported
+        );
+    }
+
+    #[test]
+    fn stale_metadata_does_not_inherit_active_probe_ttl() {
+        let now = chrono::Utc::now();
+        let record = CapabilityRecord {
+            evidence: vec![
+                CapabilityEvidence {
+                    capability: CapabilityKind::VideoInput,
+                    source: CapabilityEvidenceSource::ProviderMetadata,
+                    outcome: CapabilityState::Supported,
+                    checked_at: (now - chrono::Duration::hours(7)).to_rfc3339(),
+                    detail: None,
+                },
+                CapabilityEvidence {
+                    capability: CapabilityKind::VideoInput,
+                    source: CapabilityEvidenceSource::ActiveProbe,
+                    outcome: CapabilityState::Supported,
+                    checked_at: (now - chrono::Duration::days(8)).to_rfc3339(),
+                    detail: None,
+                },
+            ],
+            ..CapabilityRecord::default()
+        };
+        assert_eq!(
+            record.effective_state_for(CapabilityKind::VideoInput),
+            CapabilityState::Unknown
+        );
+    }
+
+    #[test]
+    fn unrelated_fresh_probe_cannot_refresh_other_capability_metadata() {
+        let now = chrono::Utc::now();
+        let record = CapabilityRecord {
+            evidence: vec![
+                CapabilityEvidence {
+                    capability: CapabilityKind::TextChat,
+                    source: CapabilityEvidenceSource::ActiveProbe,
+                    outcome: CapabilityState::Supported,
+                    checked_at: now.to_rfc3339(),
+                    detail: None,
+                },
+                CapabilityEvidence {
+                    capability: CapabilityKind::ImageInput,
+                    source: CapabilityEvidenceSource::ProviderMetadata,
+                    outcome: CapabilityState::Supported,
+                    checked_at: (now - chrono::Duration::hours(7)).to_rfc3339(),
+                    detail: None,
+                },
+            ],
+            ..CapabilityRecord::default()
+        };
+        assert_eq!(
+            record.effective_state_for(CapabilityKind::ImageInput),
+            CapabilityState::Unknown
+        );
+        assert_eq!(
+            record.effective_state_for(CapabilityKind::TextChat),
+            CapabilityState::Supported
         );
     }
 

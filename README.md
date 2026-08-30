@@ -165,12 +165,15 @@ AI_ENDPOINT=https://provider.example/v1
 AI_API_KEY=provider-api-key
 AI_MODEL=model-name
 IMAGE_FALLBACK_PROVIDER=none
+AI_PROVIDER_CONNECT_TIMEOUT_SECS=10
 IMAGE_PROVIDER_CONNECT_TIMEOUT_SECS=10
 IMAGE_GENERATION_TIMEOUT_SECS=120
 IMAGE_DOWNLOAD_TIMEOUT_SECS=30
 ```
 
-`AI_ENDPOINT` dan `AI_API_KEY` bersifat generik untuk endpoint OpenAI-compatible.
+`AI_ENDPOINT` dan `AI_API_KEY` dipakai untuk subset protokol OpenAI-compatible yang didukung XiaoAI (`/chat/completions`, `/audio/transcriptions`, dan `/images/generations`); ini bukan klaim dukungan untuk semua protokol/provider OpenAI-compatible.
+
+`AI_PROVIDER_CONNECT_TIMEOUT_SECS` mengatur connect timeout umum traffic AI. `IMAGE_GENERATION_TIMEOUT_SECS` dan `IMAGE_DOWNLOAD_TIMEOUT_SECS` hanya mengatur operasi image; `IMAGE_PROVIDER_CONNECT_TIMEOUT_SECS` dipertahankan sebagai knob khusus koneksi download image agar konfigurasi lama tetap aman.
 
 ## Build & Validation
 
@@ -215,7 +218,8 @@ chmod +x "$PREFIX/bin/xiao"
 - Telegram intake is durable **at-least-once** processing, not exactly-once. A claimed update keeps its payload until the completed checkpoint; startup returns abandoned `processing` rows to `pending`. Completed tombstones deduplicate Telegram redelivery. A crash after an external side effect but before the completion checkpoint can still repeat that effect, so the documentation intentionally does not claim exactly-once side effects.
 - Provider SSE handling has independent absolute ceilings for visible answer, hidden reasoning, and total streamed wire bytes. Exceeding a ceiling stops consumption and prevents a bounded/truncated turn from becoming ordinary canonical history.
 - Streaming draft rendering separates stable completed Markdown from a provisional tail. Stable content uses the normal Rich Message AST parser; the provisional tail is sanitized so incomplete `**`, backticks, headings, dividers, and links do not flash raw syntax. Completion sends one permanent canonical answer; there is no second full-draft repaint.
-- Permanent output follows `Rich AST → sendRichMessage → safe HTML chunking → semantic plain text rendered from the AST`; raw model Markdown is never the ultimate fallback. Rich Message structural budgets are validated locally before network I/O.
+- Permanent chat/text output follows `Rich AST → sendRichMessage → safe HTML chunking → semantic plain text rendered from the AST`; raw model Markdown is never the ultimate fallback. Rich Message structural budgets are validated locally before network I/O.
+- Successful `/image` delivery intentionally uses a native Telegram photo message with a safe HTML caption and inline buttons. Image status/error/dashboard surfaces may use Rich Message blocks; image success is not claimed to be a Rich Message AST body.
 - Provider retry policy covers transient connect/timeout, HTTP 408/429/502/503/504, and honors `Retry-After`. Mid-stream interruption is preserved as a partial result rather than retried blindly.
 - Media is still encoded as base64 when an OpenAI-compatible JSON payload requires it, but downloads/persistence are bounded and owner generations are serialized, preventing unbounded concurrent generation growth.
 - Context sizing remains an estimate because tokenizer behavior differs by provider, but history selection is context-budget-aware and reserves output/system headroom.

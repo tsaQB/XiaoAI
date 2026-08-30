@@ -42,27 +42,6 @@ async fn read_bounded_provider_text(response: reqwest::Response, max_bytes: usiz
     String::from_utf8(bytes).unwrap_or_default()
 }
 
-fn tiny_silent_wav() -> Vec<u8> {
-    const SAMPLE_RATE: u32 = 8_000;
-    const SAMPLES: usize = 2_000;
-    let data_len = (SAMPLES * 2) as u32;
-    let mut wav = Vec::with_capacity(44 + data_len as usize);
-    wav.extend_from_slice(b"RIFF");
-    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
-    wav.extend_from_slice(b"WAVEfmt ");
-    wav.extend_from_slice(&16u32.to_le_bytes());
-    wav.extend_from_slice(&1u16.to_le_bytes());
-    wav.extend_from_slice(&1u16.to_le_bytes());
-    wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
-    wav.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes());
-    wav.extend_from_slice(&2u16.to_le_bytes());
-    wav.extend_from_slice(&16u16.to_le_bytes());
-    wav.extend_from_slice(b"data");
-    wav.extend_from_slice(&data_len.to_le_bytes());
-    wav.resize(44 + data_len as usize, 0);
-    wav
-}
-
 const RED_PNG_BASE64: &str =
     "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAF0lEQVR4nGP8z0AaYCJR/aiGUQ1DSAMAQC4BH2bjRnMAAAAASUVORK5CYII=";
 const BLUE_PNG_BASE64: &str =
@@ -123,13 +102,16 @@ async fn validate_image_generation_probe_body(body: &Value) -> bool {
 use super::capability::{
     get_model_capabilities_with_meta, model_metadata_key, ModelCapability, ModelMetadata,
 };
-use super::routing::{ModelRole, ModelRoute, ModelRoutingConfig, ResolvedModelRoute, RouteOrigin};
+use super::routing::{
+    GenerationModelSnapshot, ModelRole, ModelRoute, ModelRoutingConfig, ResolvedModelRoute,
+    RouteOrigin,
+};
 use super::service::{decode_generated_image_base64, download_generated_image, AIChatService};
 use super::storage::{
     load_provider_store, persist_capability_registry, persist_model_routing,
     persist_provider_state, CapabilityEvidence, CapabilityEvidenceSource, CapabilityKind,
-    CapabilityRecord, CapabilityRegistry, CapabilityState, EvidenceFreshness, ProbeEvent,
-    ProbeOutcome, ProviderConfig, ProviderStore,
+    CapabilityRecord, CapabilityRegistry, CapabilityState, ProbeEvent, ProbeOutcome, ProviderConfig,
+    ProviderStore,
 };
 
 #[derive(Debug)]
@@ -282,6 +264,18 @@ fn validate_transcription_probe(response: &CapabilityProbeResponse) -> Option<bo
             } else {
                 None
             }
+        }
+    }
+}
+
+fn validate_native_audio_probe(response: &CapabilityProbeResponse) -> Option<bool> {
+    match response {
+        CapabilityProbeResponse::Rejected => Some(false),
+        CapabilityProbeResponse::Unknown(_) => None,
+        CapabilityProbeResponse::Success(body) => {
+            let text = assistant_text(body)?;
+            let normalized = normalize_transcript(&text);
+            is_expected_probe_transcript(&normalized).then_some(true)
         }
     }
 }
@@ -443,6 +437,33 @@ fn publish_capability_candidate(
     }
 }
 
+fn replace_capability_evidence(
+    record: &mut CapabilityRecord,
+    capability: CapabilityKind,
+    source: CapabilityEvidenceSource,
+    value: Option<bool>,
+    checked_at: &str,
+    detail: Option<String>,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    record
+        .evidence
+        .retain(|evidence| evidence.capability != capability || evidence.source != source);
+    record.evidence.push(CapabilityEvidence {
+        capability,
+        source,
+        outcome: if value {
+            CapabilityState::Supported
+        } else {
+            CapabilityState::Unsupported
+        },
+        checked_at: checked_at.to_string(),
+        detail,
+    });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbePlan {
     FullSafe,
@@ -531,61 +552,22 @@ impl AIChatService {
             .roles_using_provider(provider_id)
     }
 
-    fn capability_ttl(record: &CapabilityRecord, capability: CapabilityKind) -> Duration {
-        if record.evidence.iter().any(|evidence| {
-            evidence.capability == capability
-                && evidence.source == CapabilityEvidenceSource::ActiveProbe
-        }) {
-            Duration::from_secs(7 * 24 * 60 * 60)
-        } else {
-            Duration::from_secs(6 * 60 * 60)
+    pub(crate) async fn generation_model_snapshot(&self) -> GenerationModelSnapshot {
+        let provider_store = self.provider_store.read().await;
+        let routing = self.model_routing.read().await;
+        let capabilities = self.capability_registry.read().await;
+        GenerationModelSnapshot {
+            provider_store: provider_store.clone(),
+            routing: routing.clone(),
+            capabilities: capabilities.clone(),
         }
-    }
-
-    fn capability_is_fresh(record: &CapabilityRecord, capability: CapabilityKind) -> bool {
-        record.freshness_for(capability, Self::capability_ttl(record, capability))
-            == EvidenceFreshness::Fresh
     }
 
     pub(crate) fn effective_capability_state(
         record: &CapabilityRecord,
         capability: CapabilityKind,
     ) -> CapabilityState {
-        if Self::capability_is_fresh(record, capability) {
-            record.state_for(capability)
-        } else {
-            CapabilityState::Unknown
-        }
-    }
-
-    fn required_capability_is_fresh(
-        role: ModelRole,
-        record: &CapabilityRecord,
-        origin: RouteOrigin,
-    ) -> bool {
-        match role {
-            ModelRole::Main => Self::capability_is_fresh(record, CapabilityKind::TextChat),
-            ModelRole::Vision => Self::capability_is_fresh(record, CapabilityKind::ImageInput),
-            ModelRole::Video => Self::capability_is_fresh(record, CapabilityKind::VideoInput),
-            ModelRole::ImageGeneration => {
-                Self::capability_is_fresh(record, CapabilityKind::ImageGeneration)
-            }
-            ModelRole::AudioStt if origin == RouteOrigin::MainModel => {
-                let audio = record.state_for(CapabilityKind::AudioInput);
-                let stt = record.state_for(CapabilityKind::AudioTranscription);
-                (audio == CapabilityState::Supported
-                    && Self::capability_is_fresh(record, CapabilityKind::AudioInput))
-                    || (stt == CapabilityState::Supported
-                        && Self::capability_is_fresh(record, CapabilityKind::AudioTranscription))
-                    || (audio == CapabilityState::Unsupported
-                        && stt == CapabilityState::Unsupported
-                        && Self::capability_is_fresh(record, CapabilityKind::AudioInput)
-                        && Self::capability_is_fresh(record, CapabilityKind::AudioTranscription))
-            }
-            ModelRole::AudioStt => {
-                Self::capability_is_fresh(record, CapabilityKind::AudioTranscription)
-            }
-        }
+        record.effective_state_for(capability)
     }
 
     fn required_capability_state(
@@ -594,48 +576,56 @@ impl AIChatService {
         origin: RouteOrigin,
     ) -> CapabilityState {
         match role {
-            ModelRole::Main => record.state_for(CapabilityKind::TextChat),
-            ModelRole::Vision => record.state_for(CapabilityKind::ImageInput),
-            ModelRole::Video => record.state_for(CapabilityKind::VideoInput),
-            ModelRole::ImageGeneration => record.state_for(CapabilityKind::ImageGeneration),
+            ModelRole::Main => Self::effective_capability_state(record, CapabilityKind::TextChat),
+            ModelRole::Vision => {
+                Self::effective_capability_state(record, CapabilityKind::ImageInput)
+            }
+            ModelRole::Video => {
+                Self::effective_capability_state(record, CapabilityKind::VideoInput)
+            }
+            ModelRole::ImageGeneration => {
+                Self::effective_capability_state(record, CapabilityKind::ImageGeneration)
+            }
             ModelRole::AudioStt if origin == RouteOrigin::MainModel => {
-                if record.state_for(CapabilityKind::AudioInput) == CapabilityState::Supported
-                    || record.state_for(CapabilityKind::AudioTranscription)
-                        == CapabilityState::Supported
-                {
+                let audio =
+                    Self::effective_capability_state(record, CapabilityKind::AudioInput);
+                let stt =
+                    Self::effective_capability_state(record, CapabilityKind::AudioTranscription);
+                if audio == CapabilityState::Supported || stt == CapabilityState::Supported {
                     CapabilityState::Supported
-                } else if record.state_for(CapabilityKind::AudioInput)
-                    == CapabilityState::Unsupported
-                    && record.state_for(CapabilityKind::AudioTranscription)
-                        == CapabilityState::Unsupported
+                } else if audio == CapabilityState::Unsupported
+                    && stt == CapabilityState::Unsupported
                 {
                     CapabilityState::Unsupported
                 } else {
                     CapabilityState::Unknown
                 }
             }
-            ModelRole::AudioStt => record.state_for(CapabilityKind::AudioTranscription),
+            ModelRole::AudioStt => {
+                Self::effective_capability_state(record, CapabilityKind::AudioTranscription)
+            }
         }
     }
 
-    pub async fn resolve_model_route_unchecked(
-        &self,
+    fn resolve_model_route_unchecked_from_snapshot(
+        snapshot: &GenerationModelSnapshot,
         role: ModelRole,
     ) -> Result<ResolvedModelRoute, String> {
-        let store = self.provider_store.read().await.clone();
-        let routing = self.model_routing.read().await.clone();
-        let (provider, model, route_origin) = select_model_route(&store, &routing, role)?;
-
-        let capability = self
-            .capability_record(&provider.endpoint, &model)
-            .await
+        let (provider, model, route_origin) =
+            select_model_route(&snapshot.provider_store, &snapshot.routing, role)?;
+        let provider_id = provider.endpoint.trim_end_matches('/');
+        let capability = snapshot
+            .capabilities
+            .models
+            .iter()
+            .find(|record| record.provider_id == provider_id && record.model == model)
+            .cloned()
             .unwrap_or_else(|| CapabilityRecord {
-                provider_id: provider.endpoint.trim_end_matches('/').to_string(),
+                provider_id: provider_id.to_string(),
                 provider_name: provider.name.clone(),
                 model: model.clone(),
                 ..CapabilityRecord::default()
             });
-
         Ok(ResolvedModelRoute {
             provider,
             model,
@@ -644,22 +634,11 @@ impl AIChatService {
         })
     }
 
-    pub async fn resolve_model_route(&self, role: ModelRole) -> Result<ResolvedModelRoute, String> {
-        let resolved = self.resolve_model_route_unchecked(role).await?;
-        if resolved.capability.checked_at.is_empty()
-            || !Self::required_capability_is_fresh(
-                role,
-                &resolved.capability,
-                resolved.route_origin,
-            )
-        {
-            return Err(format!(
-                "{} capability is Unknown or stale for {} / {}; run a capability probe",
-                role.display_name(),
-                resolved.provider.name,
-                resolved.model
-            ));
-        }
+    pub(crate) fn resolve_model_route_from_snapshot(
+        snapshot: &GenerationModelSnapshot,
+        role: ModelRole,
+    ) -> Result<ResolvedModelRoute, String> {
+        let resolved = Self::resolve_model_route_unchecked_from_snapshot(snapshot, role)?;
         match Self::required_capability_state(role, &resolved.capability, resolved.route_origin) {
             CapabilityState::Supported => Ok(resolved),
             CapabilityState::Unsupported => Err(format!(
@@ -669,12 +648,25 @@ impl AIChatService {
                 resolved.model
             )),
             CapabilityState::Unknown => Err(format!(
-                "{} capability is Unknown for {} / {}; Xiao fails closed",
+                "{} capability is Unknown or stale for {} / {}; run a capability probe",
                 role.display_name(),
                 resolved.provider.name,
                 resolved.model
             )),
         }
+    }
+
+    pub async fn resolve_model_route_unchecked(
+        &self,
+        role: ModelRole,
+    ) -> Result<ResolvedModelRoute, String> {
+        let snapshot = self.generation_model_snapshot().await;
+        Self::resolve_model_route_unchecked_from_snapshot(&snapshot, role)
+    }
+
+    pub async fn resolve_model_route(&self, role: ModelRole) -> Result<ResolvedModelRoute, String> {
+        let snapshot = self.generation_model_snapshot().await;
+        Self::resolve_model_route_from_snapshot(&snapshot, role)
     }
 
     pub async fn update_provider_models(
@@ -759,6 +751,57 @@ impl AIChatService {
         true
     }
 
+
+fn explicit_capability_rejection(body: &str) -> bool {
+    let sample_or_protocol_shape = [
+        "unsupported media type",
+        "unsupported codec",
+        "unsupported file type",
+        "malformed multipart",
+        "invalid input_audio schema",
+        "invalid input audio schema",
+        "invalid content-type",
+        "invalid content type",
+        "unsupported content type",
+    ]
+    .iter()
+    .any(|needle| body.contains(needle));
+    if sample_or_protocol_shape {
+        return false;
+    }
+
+    let rejected = body.contains("does not support")
+        || body.contains("not supported")
+        || body.contains("unsupported");
+    let capability_specific = [
+        "model",
+        "modality",
+        "audio input",
+        "audio transcription",
+        "image input",
+        "image generation",
+        "video input",
+        "vision",
+        "tool",
+        "structured output",
+    ]
+    .iter()
+    .any(|needle| body.contains(needle));
+    rejected && capability_specific
+}
+
+fn classify_probe_http_failure(status: u16, body: &str) -> CapabilityProbeResponse {
+    match status {
+        401 | 403 => CapabilityProbeResponse::Unknown(ProbeOutcome::AuthFailed),
+        429 => CapabilityProbeResponse::Unknown(ProbeOutcome::RateLimited),
+        500..=599 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProviderError),
+        404 | 405 | 415 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch),
+        400 | 422 if explicit_capability_rejection(body) => CapabilityProbeResponse::Rejected,
+        400 | 422 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch),
+        _ => CapabilityProbeResponse::Unknown(ProbeOutcome::Inconclusive),
+    }
+}
+
     async fn run_capability_probe_request(
         &self,
         provider: &ProviderConfig,
@@ -802,23 +845,7 @@ impl AIChatService {
         let body = read_bounded_provider_text(response, 64 * 1024)
             .await
             .to_ascii_lowercase();
-        match status {
-            401 | 403 => CapabilityProbeResponse::Unknown(ProbeOutcome::AuthFailed),
-            429 => CapabilityProbeResponse::Unknown(ProbeOutcome::RateLimited),
-            500..=599 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProviderError),
-            404 | 405 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch),
-            400 | 415 | 422
-                if body.contains("unsupported")
-                    || body.contains("not supported")
-                    || body.contains("does not support")
-                    || body.contains("unsupported content")
-                    || body.contains("unsupported modality") =>
-            {
-                CapabilityProbeResponse::Rejected
-            }
-            400 | 415 | 422 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch),
-            _ => CapabilityProbeResponse::Unknown(ProbeOutcome::Inconclusive),
-        }
+        classify_probe_http_failure(status, &body)
     }
 
     async fn run_audio_input_probe_request(
@@ -826,7 +853,8 @@ impl AIChatService {
         provider: &ProviderConfig,
         model: &str,
     ) -> CapabilityProbeResponse {
-        let encoded = base64::engine::general_purpose::STANDARD.encode(tiny_silent_wav());
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(spoken_probe_audio_bytes());
         self.run_capability_probe_request(
             provider,
             json!({
@@ -834,12 +862,18 @@ impl AIChatService {
                 "messages": [{
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "Reply with exactly OK after processing this short audio sample."},
-                        {"type": "input_audio", "input_audio": {"data": encoded, "format": "wav"}}
+                        {
+                            "type": "text",
+                            "text": "Return only the spoken phrase in this audio. Do not add commentary."
+                        },
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": encoded, "format": "mp3"}
+                        }
                     ]
                 }],
                 "stream": false,
-                "max_tokens": 4
+                "max_tokens": 16
             }),
         )
         .await
@@ -898,22 +932,7 @@ impl AIChatService {
         let body = read_bounded_provider_text(response, 64 * 1024)
             .await
             .to_ascii_lowercase();
-        match status {
-            401 | 403 => CapabilityProbeResponse::Unknown(ProbeOutcome::AuthFailed),
-            429 => CapabilityProbeResponse::Unknown(ProbeOutcome::RateLimited),
-            500..=599 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProviderError),
-            404 | 405 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch),
-            400 | 415 | 422
-                if body.contains("unsupported")
-                    || body.contains("not supported")
-                    || body.contains("does not support")
-                    || body.contains("unsupported modality") =>
-            {
-                CapabilityProbeResponse::Rejected
-            }
-            400 | 415 | 422 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch),
-            _ => CapabilityProbeResponse::Unknown(ProbeOutcome::Inconclusive),
-        }
+        classify_probe_http_failure(status, &body)
     }
 
     async fn run_image_generation_probe_request(
@@ -965,22 +984,7 @@ impl AIChatService {
         let body = read_bounded_provider_text(response, 64 * 1024)
             .await
             .to_ascii_lowercase();
-        match status {
-            401 | 403 => CapabilityProbeResponse::Unknown(ProbeOutcome::AuthFailed),
-            429 => CapabilityProbeResponse::Unknown(ProbeOutcome::RateLimited),
-            500..=599 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProviderError),
-            404 | 405 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch),
-            400 | 415 | 422
-                if body.contains("unsupported")
-                    || body.contains("not supported")
-                    || body.contains("does not support")
-                    || body.contains("unsupported image generation") =>
-            {
-                CapabilityProbeResponse::Rejected
-            }
-            400 | 415 | 422 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch),
-            _ => CapabilityProbeResponse::Unknown(ProbeOutcome::Inconclusive),
-        }
+        classify_probe_http_failure(status, &body)
     }
 
     pub async fn test_model_role(&self, role: ModelRole) -> Result<String, String> {
@@ -1047,7 +1051,7 @@ impl AIChatService {
                     let native = self
                         .run_audio_input_probe_request(&route.provider, &route.model)
                         .await;
-                    let native_validated = validate_text_probe(&native);
+                    let native_validated = validate_native_audio_probe(&native);
                     if native_validated == Some(true) {
                         return Ok(format!(
                             "Audio route {target} passed the native Main audio sample"
@@ -1142,19 +1146,18 @@ impl AIChatService {
         record.provider_id = provider_id.clone();
         record.provider_name = route.provider.name.clone();
         record.model = route.model.clone();
-        record.supports_image_generation = value;
+        if let Some(value) = value {
+            record.supports_image_generation = Some(value);
+        }
         record.checked_at = checked_at.clone();
-        record.evidence.retain(|evidence| {
-            evidence.capability != CapabilityKind::ImageGeneration
-                || evidence.source != CapabilityEvidenceSource::ActiveProbe
-        });
-        record.evidence.push(CapabilityEvidence {
-            capability: CapabilityKind::ImageGeneration,
-            source: CapabilityEvidenceSource::ActiveProbe,
-            outcome: capability_state(value),
-            checked_at,
-            detail: Some(format!("explicit active probe={outcome:?}")),
-        });
+        replace_capability_evidence(
+            &mut record,
+            CapabilityKind::ImageGeneration,
+            CapabilityEvidenceSource::ActiveProbe,
+            value,
+            &checked_at,
+            Some(format!("explicit active probe={outcome:?}")),
+        );
 
         observer(ProbeEvent::Progress {
             capability: CapabilityKind::ImageGeneration,
@@ -1277,17 +1280,17 @@ impl AIChatService {
                 capability: CapabilityKind::TextChat,
                 outcome: text_probe.outcome(text),
             });
-            record.supports_text_chat = text;
-            record
-                .evidence
-                .retain(|e| e.capability != CapabilityKind::TextChat);
-            record.evidence.push(CapabilityEvidence {
-                capability: CapabilityKind::TextChat,
-                source: CapabilityEvidenceSource::ActiveProbe,
-                outcome: capability_state(text),
-                checked_at: checked_at.clone(),
-                detail: Some(format!("probe={:?}", text_probe.outcome(text))),
-            });
+            if let Some(value) = text {
+                record.supports_text_chat = Some(value);
+            }
+            replace_capability_evidence(
+                &mut record,
+                CapabilityKind::TextChat,
+                CapabilityEvidenceSource::ActiveProbe,
+                text,
+                &checked_at,
+                Some(format!("probe={:?}", text_probe.outcome(text))),
+            );
 
             observer(ProbeEvent::Started {
                 capability: CapabilityKind::Tools,
@@ -1331,17 +1334,17 @@ impl AIChatService {
                 capability: CapabilityKind::Tools,
                 outcome: tools_probe.outcome(tools),
             });
-            record.supports_tools = tools;
-            record
-                .evidence
-                .retain(|e| e.capability != CapabilityKind::Tools);
-            record.evidence.push(CapabilityEvidence {
-                capability: CapabilityKind::Tools,
-                source: CapabilityEvidenceSource::ActiveProbe,
-                outcome: capability_state(tools),
-                checked_at: checked_at.clone(),
-                detail: Some(format!("probe={:?}", tools_probe.outcome(tools))),
-            });
+            if let Some(value) = tools {
+                record.supports_tools = Some(value);
+            }
+            replace_capability_evidence(
+                &mut record,
+                CapabilityKind::Tools,
+                CapabilityEvidenceSource::ActiveProbe,
+                tools,
+                &checked_at,
+                Some(format!("probe={:?}", tools_probe.outcome(tools))),
+            );
 
             observer(ProbeEvent::Started {
                 capability: CapabilityKind::StructuredOutput,
@@ -1370,36 +1373,30 @@ impl AIChatService {
                 capability: CapabilityKind::StructuredOutput,
                 outcome: structured_probe.outcome(structured),
             });
-            record.supports_structured_output = structured;
-            record
-                .evidence
-                .retain(|e| e.capability != CapabilityKind::StructuredOutput);
-            record.evidence.push(CapabilityEvidence {
-                capability: CapabilityKind::StructuredOutput,
-                source: CapabilityEvidenceSource::ActiveProbe,
-                outcome: capability_state(structured),
-                checked_at: checked_at.clone(),
-                detail: Some(format!("probe={:?}", structured_probe.outcome(structured))),
-            });
+            if let Some(value) = structured {
+                record.supports_structured_output = Some(value);
+            }
+            replace_capability_evidence(
+                &mut record,
+                CapabilityKind::StructuredOutput,
+                CapabilityEvidenceSource::ActiveProbe,
+                structured,
+                &checked_at,
+                Some(format!("probe={:?}", structured_probe.outcome(structured))),
+            );
 
             let native_file_input =
                 (modalities.contains("file") || modalities.contains("document")).then_some(true);
             if let Some(val) = native_file_input {
                 record.supports_native_file_input = Some(val);
-                record
-                    .evidence
-                    .retain(|e| e.capability != CapabilityKind::NativeFileInput);
-                record.evidence.push(CapabilityEvidence {
-                    capability: CapabilityKind::NativeFileInput,
-                    source: CapabilityEvidenceSource::ProviderMetadata,
-                    outcome: if val {
-                        CapabilityState::Supported
-                    } else {
-                        CapabilityState::Unsupported
-                    },
-                    checked_at: checked_at.clone(),
-                    detail: Some(format!("modalities={modalities}")),
-                });
+                replace_capability_evidence(
+                    &mut record,
+                    CapabilityKind::NativeFileInput,
+                    CapabilityEvidenceSource::ProviderMetadata,
+                    Some(val),
+                    &checked_at,
+                    Some(format!("modalities={modalities}")),
+                );
             }
         }
 
@@ -1448,30 +1445,25 @@ impl AIChatService {
                 || modalities.contains("multimodal"))
             .then_some(true);
             let final_image = image.or(metadata_image_input);
-            record.supports_image_input = final_image;
-            record
-                .evidence
-                .retain(|e| e.capability != CapabilityKind::ImageInput);
-            record.evidence.push(CapabilityEvidence {
-                capability: CapabilityKind::ImageInput,
-                source: CapabilityEvidenceSource::ActiveProbe,
-                outcome: capability_state(image),
-                checked_at: checked_at.clone(),
-                detail: Some("two-image red/blue semantic probe".to_string()),
-            });
-            if let Some(val) = metadata_image_input {
-                record.evidence.push(CapabilityEvidence {
-                    capability: CapabilityKind::ImageInput,
-                    source: CapabilityEvidenceSource::ProviderMetadata,
-                    outcome: if val {
-                        CapabilityState::Supported
-                    } else {
-                        CapabilityState::Unsupported
-                    },
-                    checked_at: checked_at.clone(),
-                    detail: Some(format!("modalities={modalities}")),
-                });
+            if let Some(value) = final_image {
+                record.supports_image_input = Some(value);
             }
+            replace_capability_evidence(
+                &mut record,
+                CapabilityKind::ImageInput,
+                CapabilityEvidenceSource::ActiveProbe,
+                image,
+                &checked_at,
+                Some("two-image red/blue semantic probe".to_string()),
+            );
+            replace_capability_evidence(
+                &mut record,
+                CapabilityKind::ImageInput,
+                CapabilityEvidenceSource::ProviderMetadata,
+                metadata_image_input,
+                &checked_at,
+                Some(format!("modalities={modalities}")),
+            );
         }
 
         if probe_audio {
@@ -1480,44 +1472,39 @@ impl AIChatService {
             });
             observer(ProbeEvent::Progress {
                 capability: CapabilityKind::AudioInput,
-                message: "Probing native Main-compatible audio input with a bounded WAV sample..."
+                message: "Probing native Main-compatible audio input with a deterministic spoken MP3 sample..."
                     .to_string(),
             });
             let audio_input_probe = self.run_audio_input_probe_request(provider, model).await;
-            let probed_audio_input = validate_text_probe(&audio_input_probe);
+            let probed_audio_input = validate_native_audio_probe(&audio_input_probe);
             observer(ProbeEvent::Completed {
                 capability: CapabilityKind::AudioInput,
                 outcome: audio_input_probe.outcome(probed_audio_input),
             });
             let metadata_audio_input = modalities.contains("audio").then_some(true);
             let final_audio_input = probed_audio_input.or(metadata_audio_input);
-            record.supports_audio_input = final_audio_input;
-            record
-                .evidence
-                .retain(|e| e.capability != CapabilityKind::AudioInput);
-            record.evidence.push(CapabilityEvidence {
-                capability: CapabilityKind::AudioInput,
-                source: CapabilityEvidenceSource::ActiveProbe,
-                outcome: capability_state(probed_audio_input),
-                checked_at: checked_at.clone(),
-                detail: Some(format!(
-                    "probe={:?}",
+            if let Some(value) = final_audio_input {
+                record.supports_audio_input = Some(value);
+            }
+            replace_capability_evidence(
+                &mut record,
+                CapabilityKind::AudioInput,
+                CapabilityEvidenceSource::ActiveProbe,
+                probed_audio_input,
+                &checked_at,
+                Some(format!(
+                    "semantic spoken probe={:?}",
                     audio_input_probe.outcome(probed_audio_input)
                 )),
-            });
-            if let Some(val) = metadata_audio_input {
-                record.evidence.push(CapabilityEvidence {
-                    capability: CapabilityKind::AudioInput,
-                    source: CapabilityEvidenceSource::ProviderMetadata,
-                    outcome: if val {
-                        CapabilityState::Supported
-                    } else {
-                        CapabilityState::Unsupported
-                    },
-                    checked_at: checked_at.clone(),
-                    detail: Some(format!("modalities={modalities}")),
-                });
-            }
+            );
+            replace_capability_evidence(
+                &mut record,
+                CapabilityKind::AudioInput,
+                CapabilityEvidenceSource::ProviderMetadata,
+                metadata_audio_input,
+                &checked_at,
+                Some(format!("modalities={modalities}")),
+            );
 
             observer(ProbeEvent::Started {
                 capability: CapabilityKind::AudioTranscription,
@@ -1533,20 +1520,20 @@ impl AIChatService {
                 capability: CapabilityKind::AudioTranscription,
                 outcome: transcription_probe.outcome(audio_transcription),
             });
-            record.supports_audio_transcription = audio_transcription;
-            record
-                .evidence
-                .retain(|e| e.capability != CapabilityKind::AudioTranscription);
-            record.evidence.push(CapabilityEvidence {
-                capability: CapabilityKind::AudioTranscription,
-                source: CapabilityEvidenceSource::ActiveProbe,
-                outcome: capability_state(audio_transcription),
-                checked_at: checked_at.clone(),
-                detail: Some(format!(
-                    "probe={:?}",
+            if let Some(value) = audio_transcription {
+                record.supports_audio_transcription = Some(value);
+            }
+            replace_capability_evidence(
+                &mut record,
+                CapabilityKind::AudioTranscription,
+                CapabilityEvidenceSource::ActiveProbe,
+                audio_transcription,
+                &checked_at,
+                Some(format!(
+                    "semantic spoken transcription probe={:?}",
                     transcription_probe.outcome(audio_transcription)
                 )),
-            });
+            );
         }
 
         if probe_video {
@@ -1567,33 +1554,28 @@ impl AIChatService {
                 capability: CapabilityKind::VideoInput,
                 outcome: video_probe.outcome(probed_video_input),
             });
-            record.supports_video_input = final_video_input;
-            record
-                .evidence
-                .retain(|e| e.capability != CapabilityKind::VideoInput);
-            record.evidence.push(CapabilityEvidence {
-                capability: CapabilityKind::VideoInput,
-                source: CapabilityEvidenceSource::ActiveProbe,
-                outcome: capability_state(probed_video_input),
-                checked_at: checked_at.clone(),
-                detail: Some(format!(
+            if let Some(value) = final_video_input {
+                record.supports_video_input = Some(value);
+            }
+            replace_capability_evidence(
+                &mut record,
+                CapabilityKind::VideoInput,
+                CapabilityEvidenceSource::ActiveProbe,
+                probed_video_input,
+                &checked_at,
+                Some(format!(
                     "tiny red MP4 semantic probe={:?}",
                     video_probe.outcome(probed_video_input)
                 )),
-            });
-            if let Some(val) = metadata_video_input {
-                record.evidence.push(CapabilityEvidence {
-                    capability: CapabilityKind::VideoInput,
-                    source: CapabilityEvidenceSource::ProviderMetadata,
-                    outcome: if val {
-                        CapabilityState::Supported
-                    } else {
-                        CapabilityState::Unsupported
-                    },
-                    checked_at: checked_at.clone(),
-                    detail: Some(format!("modalities={modalities}")),
-                });
-            }
+            );
+            replace_capability_evidence(
+                &mut record,
+                CapabilityKind::VideoInput,
+                CapabilityEvidenceSource::ProviderMetadata,
+                metadata_video_input,
+                &checked_at,
+                Some(format!("modalities={modalities}")),
+            );
         }
 
         if probe_image_gen {
@@ -2346,6 +2328,188 @@ mod tests {
         let server_error = CapabilityProbeResponse::Unknown(ProbeOutcome::ProviderError);
         assert_eq!(validate_transcription_probe(&server_error), None);
         assert_eq!(server_error.outcome(None), ProbeOutcome::ProviderError);
+    }
+
+    #[test]
+    fn semantic_native_audio_probe_requires_spoken_phrase() {
+        let exact = response_with_message(json!({"content":"xiao capability probe"}));
+        assert_eq!(validate_native_audio_probe(&exact), Some(true));
+
+        let normalized =
+            response_with_message(json!({"content":"Xiao capability probe!"}));
+        assert_eq!(validate_native_audio_probe(&normalized), Some(true));
+
+        let minor = response_with_message(json!({"content":"Ciao capability probe"}));
+        assert_eq!(validate_native_audio_probe(&minor), Some(true));
+
+        let ok_only = response_with_message(json!({"content":"OK"}));
+        assert_eq!(validate_native_audio_probe(&ok_only), None);
+
+        let wrong = response_with_message(json!({"content":"hello world"}));
+        assert_eq!(validate_native_audio_probe(&wrong), None);
+
+        let empty = response_with_message(json!({"content":""}));
+        assert_eq!(validate_native_audio_probe(&empty), None);
+
+        let rejected = CapabilityProbeResponse::Rejected;
+        assert_eq!(validate_native_audio_probe(&rejected), Some(false));
+
+        for outcome in [
+            ProbeOutcome::Timeout,
+            ProbeOutcome::NetworkError,
+            ProbeOutcome::RateLimited,
+            ProbeOutcome::ProviderError,
+        ] {
+            let response = CapabilityProbeResponse::Unknown(outcome);
+            assert_eq!(validate_native_audio_probe(&response), None);
+            assert_eq!(response.outcome(None), outcome);
+        }
+    }
+
+    #[test]
+    fn probe_http_semantics_distinguish_protocol_shape_from_capability_rejection() {
+        for status in [404, 405] {
+            assert!(matches!(
+                classify_probe_http_failure(status, "not found"),
+                CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch)
+            ));
+        }
+        assert!(matches!(
+            classify_probe_http_failure(415, "unsupported media type"),
+            CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch)
+        ));
+        assert!(matches!(
+            classify_probe_http_failure(422, "malformed multipart content"),
+            CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch)
+        ));
+        assert!(matches!(
+            classify_probe_http_failure(422, "model does not support audio input"),
+            CapabilityProbeResponse::Rejected
+        ));
+        assert!(matches!(
+            classify_probe_http_failure(429, "rate limit"),
+            CapabilityProbeResponse::Unknown(ProbeOutcome::RateLimited)
+        ));
+        assert!(matches!(
+            classify_probe_http_failure(503, "provider unavailable"),
+            CapabilityProbeResponse::Unknown(ProbeOutcome::ProviderError)
+        ));
+    }
+
+    fn supported_record(provider: &ProviderConfig, model: &str) -> CapabilityRecord {
+        let now = chrono::Utc::now().to_rfc3339();
+        let kinds = [
+            CapabilityKind::TextChat,
+            CapabilityKind::ImageInput,
+            CapabilityKind::AudioInput,
+            CapabilityKind::AudioTranscription,
+            CapabilityKind::VideoInput,
+            CapabilityKind::ImageGeneration,
+        ];
+        CapabilityRecord {
+            provider_id: provider.endpoint.trim_end_matches('/').to_string(),
+            provider_name: provider.name.clone(),
+            model: model.to_string(),
+            evidence: kinds
+                .into_iter()
+                .map(|capability| CapabilityEvidence {
+                    capability,
+                    source: CapabilityEvidenceSource::ActiveProbe,
+                    outcome: CapabilityState::Supported,
+                    checked_at: now.clone(),
+                    detail: None,
+                })
+                .collect(),
+            ..CapabilityRecord::default()
+        }
+    }
+
+    #[test]
+    fn generation_snapshot_keeps_inherited_routes_on_original_main() {
+        let mut live_store = ProviderStore {
+            active_id: Some("main-a".to_string()),
+            providers: vec![provider("main-a", "model-a"), provider("main-b", "model-b")],
+            telegram_models: Vec::new(),
+        };
+        let routing = ModelRoutingConfig::default();
+        let a = live_store.providers[0].clone();
+        let b = live_store.providers[1].clone();
+        let snapshot = GenerationModelSnapshot {
+            provider_store: live_store.clone(),
+            routing,
+            capabilities: CapabilityRegistry {
+                models: vec![
+                    supported_record(&a, "model-a"),
+                    supported_record(&b, "model-b"),
+                ],
+            },
+        };
+
+        let initial_main =
+            AIChatService::resolve_model_route_from_snapshot(&snapshot, ModelRole::Main).unwrap();
+        live_store.active_id = Some("main-b".to_string());
+
+        for role in [ModelRole::Vision, ModelRole::Video, ModelRole::AudioStt] {
+            let inherited =
+                AIChatService::resolve_model_route_from_snapshot(&snapshot, role).unwrap();
+            assert_eq!(inherited.provider.id, "main-a");
+            assert_eq!(inherited.model, "model-a");
+        }
+        let final_main =
+            AIChatService::resolve_model_route_from_snapshot(&snapshot, ModelRole::Main).unwrap();
+        assert_eq!(initial_main.provider.id, "main-a");
+        assert_eq!(final_main.provider.id, "main-a");
+        assert_eq!(live_store.active_id.as_deref(), Some("main-b"));
+    }
+
+    #[test]
+    fn generation_snapshot_keeps_specific_and_disabled_routes_isolated() {
+        let mut live_store = ProviderStore {
+            active_id: Some("main-a".to_string()),
+            providers: vec![
+                provider("main-a", "model-a"),
+                provider("vision-b", "vision-b"),
+                provider("main-c", "model-c"),
+            ],
+            telegram_models: Vec::new(),
+        };
+        let mut routing = ModelRoutingConfig::default();
+        routing
+            .set_route(
+                ModelRole::Vision,
+                ModelRoute::Specific {
+                    provider_id: "vision-b".to_string(),
+                    model: "vision-b".to_string(),
+                },
+            )
+            .unwrap();
+        routing
+            .set_route(ModelRole::Video, ModelRoute::Disabled)
+            .unwrap();
+        let capabilities = live_store
+            .providers
+            .iter()
+            .map(|provider| supported_record(provider, &provider.active_model))
+            .collect();
+        let snapshot = GenerationModelSnapshot {
+            provider_store: live_store.clone(),
+            routing,
+            capabilities: CapabilityRegistry {
+                models: capabilities,
+            },
+        };
+
+        live_store.active_id = Some("main-c".to_string());
+        let vision =
+            AIChatService::resolve_model_route_from_snapshot(&snapshot, ModelRole::Vision).unwrap();
+        assert_eq!(vision.provider.id, "vision-b");
+        assert_eq!(vision.model, "vision-b");
+        assert!(
+            AIChatService::resolve_model_route_from_snapshot(&snapshot, ModelRole::Video).is_err()
+        );
+        let main =
+            AIChatService::resolve_model_route_from_snapshot(&snapshot, ModelRole::Main).unwrap();
+        assert_eq!(main.provider.id, "main-a");
     }
 
     #[test]

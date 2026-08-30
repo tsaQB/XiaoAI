@@ -80,6 +80,13 @@ pub struct ResolvedModelRoute {
     pub route_origin: RouteOrigin,
 }
 
+#[derive(Debug, Clone)]
+pub struct GenerationModelSnapshot {
+    pub(crate) provider_store: crate::ai::storage::ProviderStore,
+    pub(crate) routing: ModelRoutingConfig,
+    pub(crate) capabilities: crate::ai::storage::CapabilityRegistry,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelRoutingConfig {
     pub version: u32,
