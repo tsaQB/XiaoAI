@@ -1741,12 +1741,12 @@ fn build_image_success_caption(
     prompt: &str,
     provider: &str,
     model: &str,
-    width: usize,
-    height: usize,
+    dimensions: (usize, usize),
     elapsed_secs: f64,
     used_external_fallback: bool,
     primary_failure: Option<&str>,
 ) -> String {
+    let (width, height) = dimensions;
     let safe_prompt = bounded_escaped_html(prompt, IMAGE_CAPTION_PROMPT_ESCAPED_CHARS);
     let safe_provider = bounded_escaped_html(provider, IMAGE_CAPTION_PROVIDER_ESCAPED_CHARS);
     let safe_model = bounded_escaped_html(model, IMAGE_CAPTION_MODEL_ESCAPED_CHARS);
@@ -2096,8 +2096,7 @@ async fn handle_image_generation(
         &clean_prompt,
         &generated.provider_name,
         &generated.model,
-        width,
-        height,
+        (width, height),
         elapsed_secs,
         generated.used_external_fallback,
         generated.primary_failure.as_deref(),
@@ -4321,8 +4320,7 @@ mod update_lane_tests {
             &prompt,
             "provider<&>",
             "model<\"x\">&",
-            1024,
-            1024,
+            (1024, 1024),
             12.34,
             true,
             Some("failure <unsafe> & detail"),
