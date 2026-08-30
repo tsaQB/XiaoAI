@@ -467,8 +467,7 @@ pub(crate) async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Opt
         return None;
     }
     println!("\n\x1b[38;5;244mChecking Main Model capabilities...\x1b[0m");
-    if let Some(probe) =
-        run_persisted_capability_probe(ai_service, &provider, &active_model).await
+    if let Some(probe) = run_persisted_capability_probe(ai_service, &provider, &active_model).await
     {
         println!(
             "\x1b[38;5;244mSaved Main capability state: text={:?}, vision={:?}, video={:?}, audio={:?}, stt={:?}, image_gen={:?}\x1b[0m",
@@ -799,8 +798,7 @@ pub(crate) async fn run_cli_provider_add(ai_service: &AIChatService) {
         return;
     }
     println!("  Checking model capabilities...");
-    if let Some(probe) =
-        run_persisted_capability_probe(ai_service, &provider, &active_model).await
+    if let Some(probe) = run_persisted_capability_probe(ai_service, &provider, &active_model).await
     {
         println!(
             "  \x1b[38;5;244mSaved capability probe: vision={:?}, tools={:?}, structured={:?}\x1b[0m",
@@ -1199,7 +1197,9 @@ async fn run_persisted_capability_probe(
     let candidate = ai_service
         .probe_model_capabilities_with_observer(provider, model, print_probe_event)
         .await;
-    let persisted = ai_service.capability_record(&provider.endpoint, model).await;
+    let persisted = ai_service
+        .capability_record(&provider.endpoint, model)
+        .await;
     match persisted {
         Some(record) if record.checked_at == candidate.checked_at => Some(record),
         _ => {
