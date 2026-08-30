@@ -215,9 +215,7 @@ fn history_attachment_authorized(
         "video" => CapabilityKind::VideoInput,
         _ => return false,
     };
-    capability.is_some_and(|record| {
-        record.effective_state_for(kind) == CapabilityState::Supported
-    })
+    capability.is_some_and(|record| record.effective_state_for(kind) == CapabilityState::Supported)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,8 +229,7 @@ fn select_audio_execution_mode(
     inherited_main: bool,
 ) -> Result<AudioExecutionMode, String> {
     let native = capability.effective_state_for(CapabilityKind::AudioInput);
-    let transcription =
-        capability.effective_state_for(CapabilityKind::AudioTranscription);
+    let transcription = capability.effective_state_for(CapabilityKind::AudioTranscription);
     if inherited_main && native == CapabilityState::Supported {
         Ok(AudioExecutionMode::Native)
     } else if transcription == CapabilityState::Supported {
@@ -737,8 +734,7 @@ impl AIChatService {
         let mut parts = Vec::new();
         let mut total_loaded = 0usize;
         for attachment in persisted.attachments {
-            let allowed =
-                history_attachment_authorized(capability, attachment.kind.as_str());
+            let allowed = history_attachment_authorized(capability, attachment.kind.as_str());
             if !allowed {
                 text.push_str(&format!(
                     "\n[Attachment '{}' omitted because current model capability is unsupported/unknown.]",
@@ -1604,15 +1600,12 @@ impl AIChatService {
             specialist.provider.id == main.provider.id && specialist.model == main.model;
 
         if role == ModelRole::AudioStt {
-            let inherited_main =
-                same_as_main && specialist.route_origin == RouteOrigin::MainModel;
-            let audio_mode = match select_audio_execution_mode(
-                &specialist.capability,
-                inherited_main,
-            ) {
-                Ok(mode) => mode,
-                Err(error) => return (None, error, false),
-            };
+            let inherited_main = same_as_main && specialist.route_origin == RouteOrigin::MainModel;
+            let audio_mode =
+                match select_audio_execution_mode(&specialist.capability, inherited_main) {
+                    Ok(mode) => mode,
+                    Err(error) => return (None, error, false),
+                };
 
             if audio_mode == AudioExecutionMode::Native {
                 return self
@@ -1802,17 +1795,9 @@ impl AIChatService {
                 "vision/image",
             )
         } else if media_to_main && video_bytes.is_some() {
-            require_verified_capability(
-                Some(capability),
-                CapabilityKind::VideoInput,
-                "video",
-            )
+            require_verified_capability(Some(capability), CapabilityKind::VideoInput, "video")
         } else if media_to_main && audio_bytes.is_some() {
-            require_verified_capability(
-                Some(capability),
-                CapabilityKind::AudioInput,
-                "audio",
-            )
+            require_verified_capability(Some(capability), CapabilityKind::AudioInput, "audio")
         } else {
             Ok(())
         };
@@ -2579,15 +2564,8 @@ impl AIChatService {
         cancel_rx: &mut watch::Receiver<bool>,
     ) -> Result<GeneratedImage, ImageGenerationError> {
         let snapshot = self.generation_model_snapshot().await;
-        self.generate_image_with_snapshot(
-            user_id,
-            prompt,
-            width,
-            height,
-            &snapshot,
-            cancel_rx,
-        )
-        .await
+        self.generate_image_with_snapshot(user_id, prompt, width, height, &snapshot, cancel_rx)
+            .await
     }
 
     pub(crate) async fn generate_image_with_snapshot(
@@ -2600,13 +2578,10 @@ impl AIChatService {
         cancel_rx: &mut watch::Receiver<bool>,
     ) -> Result<GeneratedImage, ImageGenerationError> {
         let clean_prompt = prompt.trim();
-        let route = Self::resolve_model_route_from_snapshot(
-            snapshot,
-            ModelRole::ImageGeneration,
-        )
-        .map_err(|error| {
-            ImageGenerationError::new(classify_image_route_error(&error), error)
-        })?;
+        let route = Self::resolve_model_route_from_snapshot(snapshot, ModelRole::ImageGeneration)
+            .map_err(|error| {
+                ImageGenerationError::new(classify_image_route_error(&error), error)
+            })?;
 
         let generation_timeout = timeout_from_env(IMAGE_GENERATION_TIMEOUT_ENV, 120);
         let protocol = ImageGenerationProtocol::OpenAiImages;
@@ -2881,21 +2856,22 @@ mod tests {
                 record.supports_audio_input = Some(outcome == CapabilityState::Supported)
             }
             CapabilityKind::AudioTranscription => {
-                record.supports_audio_transcription =
-                    Some(outcome == CapabilityState::Supported)
+                record.supports_audio_transcription = Some(outcome == CapabilityState::Supported)
             }
             CapabilityKind::VideoInput => {
                 record.supports_video_input = Some(outcome == CapabilityState::Supported)
             }
             _ => {}
         }
-        record.evidence.push(crate::ai::storage::CapabilityEvidence {
-            capability: kind,
-            source: crate::ai::storage::CapabilityEvidenceSource::ActiveProbe,
-            outcome,
-            checked_at: (chrono::Utc::now() - age).to_rfc3339(),
-            detail: None,
-        });
+        record
+            .evidence
+            .push(crate::ai::storage::CapabilityEvidence {
+                capability: kind,
+                source: crate::ai::storage::CapabilityEvidenceSource::ActiveProbe,
+                outcome,
+                checked_at: (chrono::Utc::now() - age).to_rfc3339(),
+                detail: None,
+            });
         record
     }
 
@@ -2906,29 +2882,21 @@ mod tests {
             CapabilityState::Supported,
             chrono::Duration::hours(1),
         );
-        assert!(require_verified_capability(
-            Some(&fresh),
-            CapabilityKind::ImageInput,
-            "image",
-        )
-        .is_ok());
+        assert!(
+            require_verified_capability(Some(&fresh), CapabilityKind::ImageInput, "image",).is_ok()
+        );
         assert!(history_attachment_authorized(Some(&fresh), "image"));
-        assert!(history_attachment_authorized(
-            Some(&fresh),
-            "document_page"
-        ));
+        assert!(history_attachment_authorized(Some(&fresh), "document_page"));
 
         let stale = evidence_record(
             CapabilityKind::ImageInput,
             CapabilityState::Supported,
             chrono::Duration::days(8),
         );
-        assert!(require_verified_capability(
-            Some(&stale),
-            CapabilityKind::ImageInput,
-            "image",
-        )
-        .is_err());
+        assert!(
+            require_verified_capability(Some(&stale), CapabilityKind::ImageInput, "image",)
+                .is_err()
+        );
         assert!(!history_attachment_authorized(Some(&stale), "image"));
         assert!(!history_attachment_authorized(
             Some(&stale),
@@ -2940,10 +2908,7 @@ mod tests {
             CapabilityState::Unsupported,
             chrono::Duration::hours(1),
         );
-        assert!(!history_attachment_authorized(
-            Some(&unsupported),
-            "image"
-        ));
+        assert!(!history_attachment_authorized(Some(&unsupported), "image"));
         assert!(!history_attachment_authorized(None, "image"));
     }
 
@@ -2959,14 +2924,8 @@ mod tests {
             CapabilityState::Supported,
             chrono::Duration::days(8),
         );
-        assert!(!history_attachment_authorized(
-            Some(&stale_audio),
-            "audio"
-        ));
-        assert!(!history_attachment_authorized(
-            Some(&stale_video),
-            "video"
-        ));
+        assert!(!history_attachment_authorized(Some(&stale_audio), "audio"));
+        assert!(!history_attachment_authorized(Some(&stale_video), "video"));
     }
 
     #[test]
@@ -2976,8 +2935,7 @@ mod tests {
             stt: (CapabilityState, chrono::Duration),
         ) -> CapabilityRecord {
             let mut record = evidence_record(CapabilityKind::AudioInput, native.0, native.1);
-            let stt_record =
-                evidence_record(CapabilityKind::AudioTranscription, stt.0, stt.1);
+            let stt_record = evidence_record(CapabilityKind::AudioTranscription, stt.0, stt.1);
             record.evidence.extend(stt_record.evidence);
             record.supports_audio_transcription = stt_record.supports_audio_transcription;
             record
@@ -3077,14 +3035,23 @@ mod tests {
 
     #[test]
     fn timeout_configuration_is_scoped_and_safely_bounded() {
-        assert_eq!(AI_PROVIDER_CONNECT_TIMEOUT_ENV, "AI_PROVIDER_CONNECT_TIMEOUT_SECS");
+        assert_eq!(
+            AI_PROVIDER_CONNECT_TIMEOUT_ENV,
+            "AI_PROVIDER_CONNECT_TIMEOUT_SECS"
+        );
         assert_eq!(
             IMAGE_PROVIDER_CONNECT_TIMEOUT_ENV,
             "IMAGE_PROVIDER_CONNECT_TIMEOUT_SECS"
         );
-        assert_eq!(IMAGE_GENERATION_TIMEOUT_ENV, "IMAGE_GENERATION_TIMEOUT_SECS");
+        assert_eq!(
+            IMAGE_GENERATION_TIMEOUT_ENV,
+            "IMAGE_GENERATION_TIMEOUT_SECS"
+        );
         assert_eq!(IMAGE_DOWNLOAD_TIMEOUT_ENV, "IMAGE_DOWNLOAD_TIMEOUT_SECS");
-        assert_ne!(AI_PROVIDER_CONNECT_TIMEOUT_ENV, IMAGE_PROVIDER_CONNECT_TIMEOUT_ENV);
+        assert_ne!(
+            AI_PROVIDER_CONNECT_TIMEOUT_ENV,
+            IMAGE_PROVIDER_CONNECT_TIMEOUT_ENV
+        );
 
         assert_eq!(bounded_timeout_secs(None, 120), 120);
         assert_eq!(bounded_timeout_secs(Some("0"), 120), 120);

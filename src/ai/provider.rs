@@ -110,8 +110,8 @@ use super::service::{decode_generated_image_base64, download_generated_image, AI
 use super::storage::{
     load_provider_store, persist_capability_registry, persist_model_routing,
     persist_provider_state, CapabilityEvidence, CapabilityEvidenceSource, CapabilityKind,
-    CapabilityRecord, CapabilityRegistry, CapabilityState, ProbeEvent, ProbeOutcome, ProviderConfig,
-    ProviderStore,
+    CapabilityRecord, CapabilityRegistry, CapabilityState, ProbeEvent, ProbeOutcome,
+    ProviderConfig, ProviderStore,
 };
 
 #[derive(Debug)]
@@ -462,6 +462,57 @@ pub enum ProbePlan {
     Role(ModelRole),
 }
 
+fn explicit_capability_rejection(body: &str) -> bool {
+    let sample_or_protocol_shape = [
+        "unsupported media type",
+        "unsupported codec",
+        "unsupported file type",
+        "malformed multipart",
+        "invalid input_audio schema",
+        "invalid input audio schema",
+        "invalid content-type",
+        "invalid content type",
+        "unsupported content type",
+    ]
+    .iter()
+    .any(|needle| body.contains(needle));
+    if sample_or_protocol_shape {
+        return false;
+    }
+
+    let rejected = body.contains("does not support")
+        || body.contains("not supported")
+        || body.contains("unsupported");
+    let capability_specific = [
+        "model",
+        "modality",
+        "audio input",
+        "audio transcription",
+        "image input",
+        "image generation",
+        "video input",
+        "vision",
+        "tool",
+        "structured output",
+    ]
+    .iter()
+    .any(|needle| body.contains(needle));
+    rejected && capability_specific
+}
+
+fn classify_probe_http_failure(status: u16, body: &str) -> CapabilityProbeResponse {
+    match status {
+        401 | 403 => CapabilityProbeResponse::Unknown(ProbeOutcome::AuthFailed),
+        429 => CapabilityProbeResponse::Unknown(ProbeOutcome::RateLimited),
+        500..=599 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProviderError),
+        404 | 405 | 415 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch),
+        400 | 422 if explicit_capability_rejection(body) => CapabilityProbeResponse::Rejected,
+        400 | 422 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch),
+        _ => CapabilityProbeResponse::Unknown(ProbeOutcome::Inconclusive),
+    }
+}
+
+
 impl AIChatService {
     pub async fn reload_provider_store(&self) -> bool {
         let store = match tokio::task::spawn_blocking(load_provider_store).await {
@@ -579,8 +630,7 @@ impl AIChatService {
                 Self::effective_capability_state(record, CapabilityKind::ImageGeneration)
             }
             ModelRole::AudioStt if origin == RouteOrigin::MainModel => {
-                let audio =
-                    Self::effective_capability_state(record, CapabilityKind::AudioInput);
+                let audio = Self::effective_capability_state(record, CapabilityKind::AudioInput);
                 let stt =
                     Self::effective_capability_state(record, CapabilityKind::AudioTranscription);
                 if audio == CapabilityState::Supported || stt == CapabilityState::Supported {
@@ -744,56 +794,6 @@ impl AIChatService {
     }
 
 
-fn explicit_capability_rejection(body: &str) -> bool {
-    let sample_or_protocol_shape = [
-        "unsupported media type",
-        "unsupported codec",
-        "unsupported file type",
-        "malformed multipart",
-        "invalid input_audio schema",
-        "invalid input audio schema",
-        "invalid content-type",
-        "invalid content type",
-        "unsupported content type",
-    ]
-    .iter()
-    .any(|needle| body.contains(needle));
-    if sample_or_protocol_shape {
-        return false;
-    }
-
-    let rejected = body.contains("does not support")
-        || body.contains("not supported")
-        || body.contains("unsupported");
-    let capability_specific = [
-        "model",
-        "modality",
-        "audio input",
-        "audio transcription",
-        "image input",
-        "image generation",
-        "video input",
-        "vision",
-        "tool",
-        "structured output",
-    ]
-    .iter()
-    .any(|needle| body.contains(needle));
-    rejected && capability_specific
-}
-
-fn classify_probe_http_failure(status: u16, body: &str) -> CapabilityProbeResponse {
-    match status {
-        401 | 403 => CapabilityProbeResponse::Unknown(ProbeOutcome::AuthFailed),
-        429 => CapabilityProbeResponse::Unknown(ProbeOutcome::RateLimited),
-        500..=599 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProviderError),
-        404 | 405 | 415 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch),
-        400 | 422 if explicit_capability_rejection(body) => CapabilityProbeResponse::Rejected,
-        400 | 422 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch),
-        _ => CapabilityProbeResponse::Unknown(ProbeOutcome::Inconclusive),
-    }
-}
-
     async fn run_capability_probe_request(
         &self,
         provider: &ProviderConfig,
@@ -845,8 +845,7 @@ fn classify_probe_http_failure(status: u16, body: &str) -> CapabilityProbeRespon
         provider: &ProviderConfig,
         model: &str,
     ) -> CapabilityProbeResponse {
-        let encoded =
-            base64::engine::general_purpose::STANDARD.encode(spoken_probe_audio_bytes());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(spoken_probe_audio_bytes());
         self.run_capability_probe_request(
             provider,
             json!({
@@ -2333,8 +2332,7 @@ mod tests {
         let exact = response_with_message(json!({"content":"xiao capability probe"}));
         assert_eq!(validate_native_audio_probe(&exact), Some(true));
 
-        let normalized =
-            response_with_message(json!({"content":"Xiao capability probe!"}));
+        let normalized = response_with_message(json!({"content":"Xiao capability probe!"}));
         assert_eq!(validate_native_audio_probe(&normalized), Some(true));
 
         let minor = response_with_message(json!({"content":"Ciao capability probe"}));

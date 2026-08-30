@@ -1391,9 +1391,7 @@ impl CapabilityRecord {
         }
     }
 
-    fn evidence_source_ttl(
-        source: CapabilityEvidenceSource,
-    ) -> Option<std::time::Duration> {
+    fn evidence_source_ttl(source: CapabilityEvidenceSource) -> Option<std::time::Duration> {
         match source {
             CapabilityEvidenceSource::ProviderMetadata => {
                 Some(std::time::Duration::from_secs(6 * 60 * 60))

@@ -19,9 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use ai::service::{
-    GenerationModelSnapshot, ImageGenerationErrorKind, ProbeEvent, ProviderConfig,
-};
+use ai::service::{GenerationModelSnapshot, ImageGenerationErrorKind, ProbeEvent, ProviderConfig};
 use ai::AIChatService;
 use bot::client::{TelegramBotClient, TelegramDeliveryContext};
 use bot::models::{
@@ -2065,21 +2063,21 @@ async fn handle_ai_chat(
     };
 
     let generation_input = ai::service::GenerationInput {
-                prompt: user_prompt,
-                canonical_prompt: None,
-                media_to_main: true,
-                timeline: Some(&timeline),
-                image_bytes,
-                document_images,
-                mime_type,
-                doc_text,
-                doc_name,
-                audio_bytes,
-                audio_mime,
-                video_bytes,
-                video_mime,
-                video_duration,
-            };
+        prompt: user_prompt,
+        canonical_prompt: None,
+        media_to_main: true,
+        timeline: Some(&timeline),
+        image_bytes,
+        document_images,
+        mime_type,
+        doc_text,
+        doc_name,
+        audio_bytes,
+        audio_mime,
+        video_bytes,
+        video_mime,
+        video_duration,
+    };
     let (_thinking, mut answer_text, _cancelled) = if let Some(snapshot) = model_snapshot {
         ai_service
             .generate_response_with_snapshot(user_id, generation_input, snapshot, &mut cancel_rx)
