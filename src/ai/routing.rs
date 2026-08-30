@@ -49,7 +49,10 @@ impl ModelRole {
 pub enum ModelRoute {
     #[default]
     MainModel,
-    Specific { provider_id: String, model: String },
+    Specific {
+        provider_id: String,
+        model: String,
+    },
     Disabled,
 }
 
