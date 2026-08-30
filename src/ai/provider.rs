@@ -393,7 +393,7 @@ impl AIChatService {
                     "model": model,
                     "messages": [{
                         "role": "user",
-                        "content": "Return exactly this JSON object: {\\"xiao_probe\\":true}"
+                        "content": "Return exactly this JSON object: {\"xiao_probe\":true}"
                     }],
                     "stream": false,
                     "max_tokens": 16,
