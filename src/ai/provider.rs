@@ -212,38 +212,6 @@ impl AIChatService {
             .or_else(|| store.providers.first().cloned())
     }
 
-    pub async fn set_active_provider(&self, _user_id: i64, provider_id: &str) -> bool {
-        let (candidate, selected_provider) = {
-            let store = self.provider_store.read().await;
-            let Some(provider) = store
-                .providers
-                .iter()
-                .find(|provider| provider.id == provider_id)
-                .cloned()
-            else {
-                return false;
-            };
-            let mut candidate = store.clone();
-            candidate.active_id = Some(provider_id.to_string());
-            (candidate, provider)
-        };
-        if !persist_provider_state(candidate.clone()).await {
-            return false;
-        }
-        *self.provider_store.write().await = candidate;
-        if !selected_provider.active_model.is_empty()
-            && self
-                .capability_record(&selected_provider.endpoint, &selected_provider.active_model)
-                .await
-                .is_none()
-        {
-            let _ = self
-                .probe_model_capabilities(&selected_provider, &selected_provider.active_model)
-                .await;
-        }
-        true
-    }
-
     pub async fn update_provider_models(
         &self,
         _user_id: i64,
@@ -809,13 +777,6 @@ impl AIChatService {
             .map(|provider| provider.active_model)
             .filter(|model| !model.is_empty())
             .unwrap_or_else(|| "gpt-4o".to_string())
-    }
-
-    pub async fn set_user_model(&self, user_id: i64, model: &str) -> bool {
-        let Some(provider) = self.get_active_provider(user_id).await else {
-            return false;
-        };
-        self.set_provider_model(user_id, &provider.id, model).await
     }
 
     // ==========================================
