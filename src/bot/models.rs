@@ -11,29 +11,58 @@ use serde_json::Value;
 pub struct InlineKeyboardButton {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub callback_data: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub web_app: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<Value>,
 }
 
 impl InlineKeyboardButton {
     pub fn callback(text: impl Into<String>, callback_data: impl Into<String>) -> Self {
         Self {
             text: text.into(),
+            style: None,
             callback_data: Some(callback_data.into()),
             url: None,
             web_app: None,
+            disabled: None,
         }
+    }
+
+    pub fn callback_styled(
+        text: impl Into<String>,
+        callback_data: impl Into<String>,
+        style: impl Into<String>,
+    ) -> Self {
+        let mut button = Self::callback(text, callback_data);
+        button.style = Some(style.into());
+        button
     }
 
     pub fn url_btn(text: impl Into<String>, url: impl Into<String>) -> Self {
         Self {
             text: text.into(),
+            style: None,
             callback_data: None,
             url: Some(url.into()),
             web_app: None,
+            disabled: None,
+        }
+    }
+
+    pub fn disabled(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: None,
+            callback_data: None,
+            url: None,
+            web_app: None,
+            disabled: Some(serde_json::json!({})),
         }
     }
 }
@@ -41,13 +70,21 @@ impl InlineKeyboardButton {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InlineKeyboardMarkup {
     pub inline_keyboard: Vec<Vec<InlineKeyboardButton>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub force_reply: Option<bool>,
 }
 
 impl InlineKeyboardMarkup {
     pub fn new(rows: Vec<Vec<InlineKeyboardButton>>) -> Self {
         Self {
             inline_keyboard: rows,
+            force_reply: None,
         }
+    }
+
+    pub fn with_force_reply(mut self, force_reply: bool) -> Self {
+        self.force_reply = Some(force_reply);
+        self
     }
 }
 
@@ -86,6 +123,8 @@ pub struct ReplyKeyboardMarkup {
     pub input_field_placeholder: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selective: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub force_reply: Option<bool>,
 }
 
 impl ReplyKeyboardMarkup {
@@ -97,11 +136,7 @@ impl ReplyKeyboardMarkup {
     ) -> Self {
         let keyboard = rows
             .into_iter()
-            .map(|row| {
-                row.into_iter()
-                    .map(|btn| KeyboardButton::new(btn))
-                    .collect()
-            })
+            .map(|row| row.into_iter().map(KeyboardButton::new).collect())
             .collect();
 
         Self {
@@ -111,6 +146,7 @@ impl ReplyKeyboardMarkup {
             one_time_keyboard: Some(false),
             input_field_placeholder: placeholder.map(|s| s.to_string()),
             selective: None,
+            force_reply: None,
         }
     }
 }
@@ -149,8 +185,68 @@ impl BotCommand {
 }
 
 // ==========================================
-// Telegram Bot API 10.2: Rich Message Blocks
+// Telegram Bot API 10.3: Rich Message Blocks
 // ==========================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RichMessageButton {
+    pub text: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_app: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<Value>,
+}
+
+impl RichMessageButton {
+    pub fn callback(text: impl Into<String>, callback_data: impl Into<String>) -> Self {
+        Self {
+            text: Value::String(text.into()),
+            style: None,
+            url: None,
+            callback_data: Some(callback_data.into()),
+            web_app: None,
+            disabled: None,
+        }
+    }
+
+    pub fn callback_styled(
+        text: impl Into<String>,
+        callback_data: impl Into<String>,
+        style: impl Into<String>,
+    ) -> Self {
+        let mut button = Self::callback(text, callback_data);
+        button.style = Some(style.into());
+        button
+    }
+
+    pub fn url(text: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            text: Value::String(text.into()),
+            style: None,
+            url: Some(url.into()),
+            callback_data: None,
+            web_app: None,
+            disabled: None,
+        }
+    }
+
+    pub fn disabled(text: impl Into<String>) -> Self {
+        Self {
+            text: Value::String(text.into()),
+            style: None,
+            url: None,
+            callback_data: None,
+            web_app: None,
+            disabled: Some(serde_json::json!({})),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RichBlockTableCell {
@@ -213,6 +309,13 @@ pub enum RichBlock {
         blocks: Vec<Value>, // [{"type": "paragraph", "text": ...}]
     },
 
+    #[serde(rename = "expandable_blockquote")]
+    ExpandableBlockQuotation {
+        text: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        credit: Option<Value>,
+    },
+
     #[serde(rename = "divider")]
     Divider {},
 
@@ -231,22 +334,33 @@ pub enum RichBlock {
         caption: Option<String>,
     },
 
+    #[serde(rename = "buttons")]
+    Buttons {
+        buttons: Vec<RichMessageButton>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        align: Option<String>,
+    },
+
+    #[serde(rename = "document")]
+    Document {
+        document: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption: Option<Value>,
+    },
+
     #[serde(rename = "details")]
     Details {
-        title: String,
-        content: String,
-        is_open: bool,
+        summary: Value,
+        blocks: Vec<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        is_open: Option<bool>,
     },
 
     #[serde(rename = "anchor")]
     Anchor { name: String },
 
     #[serde(rename = "thinking")]
-    Thinking {
-        text: String,
-        collapsed: bool,
-        expandable: bool,
-    },
+    Thinking { text: Value },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -282,6 +396,14 @@ pub struct Update {
     pub update_id: i64,
     pub message: Option<Message>,
     pub callback_query: Option<CallbackQuery>,
+    pub stopped_message_generation: Option<MessageGenerationStopped>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MessageGenerationStopped {
+    pub chat: Chat,
+    pub message_thread_id: Option<i64>,
+    pub draft_id: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -299,6 +421,16 @@ pub struct Message {
     pub video: Option<Video>,
     pub video_note: Option<VideoNote>,
     pub reply_to_message: Option<Box<Message>>,
+    pub community_chat_joined: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EphemeralMessageParameters {
+    pub receiver_user_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_query_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replace_callback_query_message: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -390,4 +522,72 @@ pub struct FileInfo {
     pub file_id: String,
     pub file_size: Option<i64>,
     pub file_path: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabled_inline_button_serializes_as_empty_object() {
+        let value = serde_json::to_value(InlineKeyboardButton::disabled("Unavailable")).unwrap();
+        assert_eq!(value["disabled"], serde_json::json!({}));
+        assert!(value.get("callback_data").is_none());
+    }
+
+    #[test]
+    fn bot_api_10_3_stop_update_deserializes() {
+        let update: Update = serde_json::from_value(serde_json::json!({
+            "update_id": 42,
+            "stopped_message_generation": {
+                "chat": {"id": 7, "type": "private"},
+                "draft_id": 99
+            }
+        }))
+        .unwrap();
+        let stopped = update.stopped_message_generation.unwrap();
+        assert_eq!(stopped.chat.id, 7);
+        assert_eq!(stopped.draft_id, 99);
+    }
+
+    #[test]
+    fn rich_message_buttons_follow_10_3_shape() {
+        let block = RichBlock::Buttons {
+            buttons: vec![RichMessageButton::callback_styled(
+                "Retry", "retry", "primary",
+            )],
+            align: Some("center".to_string()),
+        };
+        let value = serde_json::to_value(block).unwrap();
+        assert_eq!(value["type"], "buttons");
+        assert_eq!(value["buttons"][0]["callback_data"], "retry");
+        assert_eq!(value["buttons"][0]["style"], "primary");
+    }
+
+    #[test]
+    fn expandable_quote_follows_10_3_shape() {
+        let block = RichBlock::ExpandableBlockQuotation {
+            text: Value::String("detail".to_string()),
+            credit: Some(Value::String("source".to_string())),
+        };
+        let value = serde_json::to_value(block).unwrap();
+        assert_eq!(value["type"], "expandable_blockquote");
+        assert_eq!(value["text"], "detail");
+        assert_eq!(value["credit"], "source");
+        assert!(value.get("blocks").is_none());
+        assert!(value.get("is_open").is_none());
+    }
+
+    #[test]
+    fn details_block_uses_summary_and_blocks() {
+        let block = RichBlock::Details {
+            summary: Value::String("More".to_string()),
+            blocks: vec![serde_json::json!({"type": "paragraph", "text": "Body"})],
+            is_open: Some(true),
+        };
+        let value = serde_json::to_value(block).unwrap();
+        assert_eq!(value["summary"], "More");
+        assert!(value["blocks"].is_array());
+        assert_eq!(value["is_open"], true);
+    }
 }

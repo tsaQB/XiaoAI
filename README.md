@@ -1,119 +1,186 @@
-# XiaoAI
+# XiaoAI 0.2.0
 
-XiaoAI adalah bot Telegram asynchronous berbasis Rust untuk endpoint AI yang kompatibel dengan OpenAI. Aplikasi ini menangani provider/model, session percakapan, streaming timeline, rich message Telegram, gambar, dokumen, audio, dan video dari satu binary.
+XiaoAI adalah bot Telegram asynchronous berbasis Rust untuk endpoint AI yang kompatibel dengan OpenAI. Versi 0.2.0 berfokus pada **session/data-integrity hardening, owner-only security, streaming yang dapat dibatalkan, serta integrasi fitur Telegram Bot API 10.3 yang dipakai XiaoAI**.
 
-## Fitur Saat Ini
+> XiaoAI tidak mengklaim mengimplementasikan seluruh Telegram Bot API. Client hanya memodelkan method dan update yang dibutuhkan aplikasi.
 
-- Rich message Telegram menggunakan `sendRichMessage` dan `editMessageText` dengan `rich_message`; jika endpoint rich message menolak request, XiaoAI memakai fallback HTML/monospace.
-- Parser Markdown membentuk blok heading, paragraf, list, quote, code block, math, divider, dan tabel native Telegram.
-- Session manager menampilkan maksimal lima session per halaman, dengan tombol pilih session, pagination saat diperlukan, `Delete`, `Rename`, `New`, dan `Close`.
-- Menu `context` menunjukkan capability model serta penggunaan konteks dengan progress bar monospace.
-- Provider OpenAI-compatible dikelola dari CLI dan katalog model dapat diambil dari endpoint `/models`.
-- Whitelist model Telegram dikelola dari `xiao model pick`; maksimal 10 model, dibedakan berdasarkan provider/alias, dan hanya daftar tersebut yang muncul pada menu model Telegram.
-- Registry capability model disimpan terpisah di `~/.xiao_model_capabilities.json`; jalankan `xiao model probe` untuk menyegarkan metadata capability dari setiap endpoint.
-- Session dan message history disimpan persisten di `~/.local/share/xiaoai/xiaoai.db` menggunakan SQLite, sehingga konteks tetap tersedia setelah restart.
-- Provider, API key, model aktif, whitelist Telegram, dan capability registry juga disimpan pada database SQLite yang sama. File JSON lama hanya dibaca sekali untuk migrasi kompatibilitas.
-- Pesan suara ditranskripsi melalui endpoint `/audio/transcriptions` bila provider mendukungnya. Gambar dikirim sebagai data URL ke input vision.
-- Video diteruskan sebagai data URL `video/*` ke input `image_url`. Ini hanya bekerja pada endpoint yang secara eksplisit menerima video pada format tersebut; banyak endpoint OpenAI-compatible menolaknya.
-- Pembuatan gambar memakai endpoint/provider yang tersedia pada konfigurasi.
+## Fitur Utama
 
-## Batasan Multimedia
+- Rich Message Telegram dengan AST heading, paragraph, list, quote, code, math, divider, table, buttons, document block, dan expandable quotation.
+- Streaming draft jawaban AI melalui `sendRichMessageDraft`, termasuk partial answer selama provider masih menghasilkan respons.
+- Native generation stop Bot API 10.3 di private chat owner: draft memakai `can_stop`/`keep_on_stop`, lalu update `stopped_message_generation` membatalkan stream provider aktif. Di group, Stop tidak diaktifkan karena event stop tidak membawa identitas user penekan tombol.
+- Native disabled inline button dan Rich Message buttons Bot API 10.3.
+- Session persisten di SQLite dengan stable `session_id`, active-session migration, monotonic ID allocation, delete nyata, dan late-result protection.
+- Update normal diproses oleh bounded ordered queue dan generation owner diserialisasi; native Stop diproses langsung agar cancellation tetap responsif.
+- Provider OpenAI-compatible, discovery model `/models`, STT `/audio/transcriptions`, SSE chat completion, dan image generation.
+- Owner-only authorization melalui `OWNER_USER_ID`; `ALLOWED_CHAT_IDS` hanya mengatur chat tambahan tempat owner boleh menggunakan XiaoAI.
+- Batas download media dan fallback image eksternal yang default-nya nonaktif.
+- Unicode-safe truncation/prefix handling serta HTML escaping untuk data dinamis yang masuk ke `parse_mode=HTML`.
 
-- Capability berdasarkan nama model bersifat indikatif; capability aktual ditentukan oleh endpoint provider.
-- Endpoint yang tidak mendukung `input_audio` akan menolak audio. Gunakan provider dengan STT atau transkripsikan audio terlebih dahulu.
-- Endpoint yang tidak menerima `video/*` dalam `image_url` akan menolak video. Ekstraksi frame/audio dengan FFmpeg sebagai fallback hybrid belum diimplementasikan.
+## Telegram Bot API 10.3 yang Digunakan
 
----
+XiaoAI 0.2.0 memakai subset 10.3 yang relevan untuk UI/AI flow:
 
-## 📁 Struktur Direktori
+- `can_stop` dan `keep_on_stop` pada streaming draft.
+- update `stopped_message_generation` / `MessageGenerationStopped`.
+- `DisabledButton` pada inline keyboard.
+- `force_reply` pada keyboard markup yang dimodelkan XiaoAI.
+- `RichMessageButton`, `RichBlockButtons`, dan style button.
+- `RichBlockExpandableBlockQuotation`.
+- `RichBlockDocument`.
+- `is_compact` pada Rich Table.
+- `EphemeralMessageParameters` pada method yang dipakai client.
+
+## Security & Data Integrity 0.2.0
+
+### Owner wajib
+
+`OWNER_USER_ID` adalah hard invariant. XiaoAI menolak start jika owner belum dikonfigurasi.
+
+```bash
+xiao telegram owner 123456789
+# atau
+xiao setup
+```
+
+Secara default owner hanya dapat menggunakan bot di private chat miliknya. Tambahkan group/chat ID secara eksplisit melalui `ALLOWED_CHAT_IDS` bila diperlukan.
+
+### Session identity
+
+Session tidak lagi menggunakan posisi vector sebagai identitas. `session_id` stabil disimpan di SQLite, ID baru berasal dari persistent high-water counter, session yang dihapus benar-benar dihapus dari DB, dan hasil generation yang selesai terlambat tidak boleh berpindah ke session lain.
+
+### Credential/logging
+
+URL Telegram yang mengandung bot token tidak dicetak pada error log. Hindari menjalankan binary dengan logging HTTP library yang sangat verbose bila log akan dibagikan ke pihak lain.
+
+### External image fallback
+
+Fallback ke layanan image eksternal nonaktif secara default:
+
+```dotenv
+IMAGE_FALLBACK_PROVIDER=none
+```
+
+Untuk opt-in Pollinations:
+
+```dotenv
+IMAGE_FALLBACK_PROVIDER=pollinations
+```
+
+Mengaktifkannya berarti prompt image dapat dikirim ke provider eksternal tersebut bila provider aktif gagal/tidak mendukung image generation.
+
+## Multimedia & Document Boundaries
+
+- Image dikirim sebagai data URL ke input vision bila endpoint mendukungnya.
+- Audio/voice dapat ditranskripsi melalui `/audio/transcriptions` bila provider mendukung STT.
+- Video dapat diteruskan sebagai data URL `video/*` melalui jalur kompatibilitas saat endpoint memang menerima format tersebut.
+- Dokumen text-like (`text/*`, Markdown, JSON, CSV, XML, source code) dibaca sebagai UTF-8 dengan batas ukuran.
+- PDF text-native diekstrak lokal; DOCX dan XLSX diekstrak dari container XML dengan batas entry/worksheet untuk mencegah resource exhaustion.
+- PDF scan/image-only dirender maksimal 6 halaman melalui `pdftoppm` dan dianalisis oleh vision model. Pada Linux, instal `poppler-utils` untuk jalur ini.
+- Attachment image/audio/video dan halaman PDF scan dipersist per-session dengan permission ketat, lalu dapat direhidrasi pada turn berikutnya sesuai capability model dan budget context.
+- Capability memakai state `Supported / Unsupported / Unknown`: `/models` metadata digabung dengan probe aman untuk text, vision, tools, dan structured output. Unknown tidak dipromosikan menjadi dukungan terverifikasi.
+
+## Struktur Direktori
 
 ```text
 XiaoAI/
-├── Cargo.toml            # Manifest & dependensi Rust
+├── Cargo.toml
 ├── src/
-│   ├── main.rs           # Entry point CLI, bot handlers, keyboard dan UI builders
+│   ├── main.rs           # access policy, ordered update router, Telegram UI handlers
+│   ├── cli.rs            # terminal setup/provider/model/Telegram commands
+│   ├── document.rs       # text/PDF/DOCX/XLSX + scanned-PDF render pipeline
+│   ├── attachments.rs    # bounded per-session multimodal persistence
+│   ├── util.rs           # Unicode/HTML safety helpers
 │   ├── bot/
-│   │   ├── mod.rs        # Modul bot Telegram
-│   │   ├── client.rs     # Asynchronous Telegram Bot API 10.2 HTTP Client
-│   │   └── models.rs     # Data models & serialisasi AST Bot API 10.2
+│   │   ├── mod.rs
+│   │   ├── client.rs     # Telegram HTTP client + Bot API 10.3 surface used by XiaoAI
+│   │   └── models.rs     # Telegram/Rich Message serde models
 │   ├── ai/
-│   │   ├── mod.rs        # Modul integrasi AI
-│   │   └── service.rs    # Provider, session, SSE chat, STT dan image generation
-│   ├── parser.rs         # Markdown ke Rich Message AST
-│   └── timeline.rs       # Streaming execution timeline
-├── .env                  # Token bot dan konfigurasi endpoint lokal (jangan commit)
-├── .env.example          # Template environment
-└── README.md             # Dokumentasi lengkap
+│   │   ├── capability.rs # capability heuristics/metadata projection
+│   │   ├── provider.rs   # single-owner provider registry + active probes
+│   │   ├── storage.rs    # SQLite persistence + spawn_blocking boundary
+│   │   ├── stream.rs     # tested SSE state machine
+│   │   ├── http.rs       # retry/backoff policy
+│   │   └── service.rs    # chat/session orchestration, STT, image generation
+│   ├── parser.rs         # Markdown -> Rich Message AST
+│   └── timeline.rs       # Draft streaming state/timeline
+├── .github/workflows/build.yml
+├── .env.example
+└── CHANGELOG.md
 ```
 
----
-
-## 🚀 Perintah CLI `xiao`
+## Perintah CLI
 
 ```bash
-xiao start                               # Run Telegram bot
-xiao setup                               # Quickstart setup wizard
-xiao provider [add] [del] [status]       # Manage AI providers
-xiao telegram [check] [bind] [change]    # Manage Telegram bot token
-xiao model [name]                        # Select/search model dari CLI
-xiao model probe                         # Refresh capability registry dari /models
-xiao model pick                          # Pilih maksimal 10 model untuk Telegram
-xiao model [name] pick                   # Alias untuk membuka model whitelist picker
-xiao status                              # System health check
-xiao help                                # Show this help
+xiao start
+xiao setup
+xiao provider [add] [del] [status]
+xiao telegram [check] [bind] [change]
+xiao telegram owner <telegram_user_id>
+xiao model [name]
+xiao model probe
+xiao model pick
+xiao status
+xiao help
 ```
 
-`xiao model pick` menyimpan whitelist ke `~/.xiao_providers.json` sebagai pasangan provider dan model. Tekan `Space` untuk toggle pilihan, ketik untuk filter, dan `Enter` atau `Esc` untuk menyimpan.
-
----
-
-## 🛠️ Build & Instalasi Global `xiao`
-```bash
-# 1. Kompilasi binary release
-cargo build --release
-
-# 2. Salin binary ke PATH agar bisa dipanggil langsung dari mana saja
-cp target/release/xiao $PREFIX/bin/xiao
-chmod +x $PREFIX/bin/xiao
-```
-
-Setelah disalin ke `$PREFIX/bin/` (atau `/usr/local/bin/`), Anda dapat langsung menjalankan perintah `xiao` dari folder mana pun tanpa path lokal.
-
-## Build Otomatis
-
-Workflow GitHub Actions `.github/workflows/build.yml` membuat artifact release untuk:
-
-- `xiao-linux-arm64-armbian`: Linux ARM64 GNU untuk Armbian/STB ARM64.
-- `xiao-android-arm64`: Android ARM64 untuk Termux.
-
-Workflow berjalan saat push, pull request, atau dapat dijalankan manual dari tab **Actions**. Artifact tersedia pada halaman workflow run yang selesai.
+`xiao model pick` mengelola whitelist model Telegram di SQLite. File JSON legacy hanya digunakan sebagai sumber migrasi kompatibilitas bila masih ditemukan. Environment/.env dapat menjadi bootstrap input, tetapi SQLite adalah runtime source of truth.
 
 ## Konfigurasi Environment
 
-Salin `.env.example` menjadi `.env`, lalu isi:
+Salin `.env.example` menjadi `.env`:
 
 ```dotenv
 BOT_TOKEN=123456:telegram-bot-token
+OWNER_USER_ID=123456789
+ALLOWED_CHAT_IDS=
 AI_ENDPOINT=https://provider.example/v1
 AI_API_KEY=provider-api-key
 AI_MODEL=model-name
+IMAGE_FALLBACK_PROVIDER=none
 ```
 
-`AI_ENDPOINT` dan `AI_API_KEY` bersifat generik untuk semua provider yang kompatibel dengan OpenAI; tidak ada konfigurasi yang dikunci ke provider tertentu.
+`AI_ENDPOINT` dan `AI_API_KEY` bersifat generik untuk endpoint OpenAI-compatible.
 
----
+## Build & Validation
 
-## 💬 Daftar Perintah Bot Telegram
+```bash
+cargo fmt --all -- --check
+cargo check --locked
+cargo test --locked
+cargo clippy --locked --all-targets --all-features
+cargo build --release --locked
+```
 
-| Perintah / Aksi | Deskripsi |
-| :--- | :--- |
-| *Kirim Pesan / File* | Mengobrol dengan AI, gambar, dokumen, audio, atau video sesuai dukungan endpoint |
-| `/start` | Membuka menu sambutan & status model aktif |
-| `/menu` | Menampilkan menu navigasi utama interaktif |
-| `/model` | Mengganti model dari whitelist yang dikonfigurasi dengan `xiao model pick` |
-| `/image` | Menghasilkan gambar AI dari prompt teks |
-| `/context` | Monitor kapasitas token memori & kapabilitas model |
-| `/session` | Membuka Session Manager & tabel sesi aktif |
-| `/new` | Membuat sesi percakapan baru |
-| `/clear` | Mereset memori riwayat sesi saat ini |
-| `/help` | Menampilkan panduan dan daftar seluruh perintah |
+GitHub Actions menjalankan quality gates tersebut sebelum build Linux ARM64 dan Android ARM64. Action pihak ketiga dipin ke commit SHA dan checkout tidak menyimpan credential repository.
+
+Untuk instalasi lokal:
+
+```bash
+cargo build --release --locked
+cp target/release/xiao "$PREFIX/bin/xiao"
+chmod +x "$PREFIX/bin/xiao"
+```
+
+## Perintah Bot Telegram
+
+| Perintah / aksi | Deskripsi |
+| --- | --- |
+| Kirim pesan | Chat dengan model aktif |
+| Kirim image/audio/video/text document | Multimodal sesuai dukungan provider dan batas XiaoAI |
+| `/start` | Menu sambutan dan status model |
+| `/menu` | Menu navigasi |
+| `/model` | Pilih model dari whitelist |
+| `/image` | Generate image |
+| `/context` | Estimasi context dan capability |
+| `/session` | Session manager |
+| `/new` | Session baru |
+| `/clear` | Hapus history session aktif |
+| `/help` | Bantuan |
+
+## Reliability Notes
+
+- Runtime SQLite operations invoked by the bot are routed through `spawn_blocking`; synchronous helpers remain for startup/CLI compatibility only.
+- Provider retry policy covers transient connect/timeout, HTTP 408/429/502/503/504, and honors `Retry-After`. Mid-stream interruption is preserved as a partial result rather than retried blindly.
+- Media is still encoded as base64 when an OpenAI-compatible JSON payload requires it, but downloads/persistence are bounded and normal updates are serialized, preventing unbounded concurrent memory growth.
+- Context sizing remains an estimate because tokenizer behavior differs by provider, but history selection is now context-budget-aware and reserves output/system headroom.

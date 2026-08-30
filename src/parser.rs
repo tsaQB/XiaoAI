@@ -1,9 +1,7 @@
 use regex::Regex;
 use serde_json::{json, Value};
 
-use crate::bot::models::{
-    InputRichMessage, RichBlock, RichBlockTableCell,
-};
+use crate::bot::models::{InputRichMessage, RichBlock, RichBlockTableCell};
 
 pub fn parse_inline(input_str: &str) -> Value {
     if input_str.is_empty() {
@@ -11,7 +9,9 @@ pub fn parse_inline(input_str: &str) -> Value {
     }
 
     // Clean leaked HTML tags
-    let html_re = Regex::new(r"(?i)</?(?:b|i|s|u|code|pre|blockquote|a|tg-spoiler|span|p|div)(?:\s+[^>]*)?>").unwrap();
+    let html_re =
+        Regex::new(r"(?i)</?(?:b|i|s|u|code|pre|blockquote|a|tg-spoiler|span|p|div)(?:\s+[^>]*)?>")
+            .unwrap();
     let cleaned = html_re.replace_all(input_str, "");
     let unescaped = html_escape::decode_html_entities(&cleaned).to_string();
 
@@ -186,10 +186,8 @@ fn is_border_line(line: &str) -> bool {
     if s.is_empty() {
         return true;
     }
-    s.chars().all(|c| {
-        "┌╔┏┬┰├┝┼╂└╚┗┴┸┤┥─━═+-=_ \t┐┘┒┙╗╝┚┖┓┛│|║┃"
-            .contains(c)
-    })
+    s.chars()
+        .all(|c| "┌╔┏┬┰├┝┼╂└╚┗┴┸┤┥─━═+-=_ \t┐┘┒┙╗╝┚┖┓┛│|║┃".contains(c))
 }
 
 fn try_parse_table(
@@ -277,8 +275,13 @@ fn try_parse_table(
 
     // 2. Unicode Box or ASCII Grid Table (┌─┬─┐ or +---+---+)
     let is_unicode_box = line.chars().any(|c| "┌╔┏┬┰├┝┼╂".contains(c))
-        || (line.starts_with('│') && line[1..].contains('│'));
-    let is_ascii_grid = line.starts_with('+') && line[1..].contains('+') && (line.contains('-') || line.contains('='));
+        || line
+            .strip_prefix('│')
+            .is_some_and(|rest| rest.contains('│'));
+    let is_ascii_grid = line
+        .strip_prefix('+')
+        .is_some_and(|rest| rest.contains('+'))
+        && (line.contains('-') || line.contains('='));
 
     if is_unicode_box || is_ascii_grid {
         let mut table_lines = Vec::new();
@@ -289,8 +292,12 @@ fn try_parse_table(
             if curr.is_empty() {
                 break;
             }
-            if curr.chars().any(|c| "┌╔┏┬┰├┝┼╂└╚┗┴┸┤┥│║┃|┐┘┒┙╗╝┚┖┓┛".contains(c))
-                || (curr.starts_with('+') && curr[1..].contains('+'))
+            if curr
+                .chars()
+                .any(|c| "┌╔┏┬┰├┝┼╂└╚┗┴┸┤┥│║┃|┐┘┒┙╗╝┚┖┓┛".contains(c))
+                || curr
+                    .strip_prefix('+')
+                    .is_some_and(|rest| rest.contains('+'))
             {
                 table_lines.push(curr);
                 curr_i += 1;
@@ -410,7 +417,11 @@ pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
         return Vec::new();
     }
 
-    let lines: Vec<String> = cleaned.replace("\r\n", "\n").split('\n').map(|s| s.to_string()).collect();
+    let lines: Vec<String> = cleaned
+        .replace("\r\n", "\n")
+        .split('\n')
+        .map(|s| s.to_string())
+        .collect();
     let mut blocks: Vec<RichBlock> = Vec::new();
 
     let mut i = 0;
@@ -432,9 +443,13 @@ pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
         }
 
         // 2. Fenced Code Block (```lang ... ```)
-        if stripped.starts_with("```") {
-            let lang = stripped[3..].trim();
-            let language = if lang.is_empty() { None } else { Some(lang.to_string()) };
+        if let Some(after_fence) = stripped.strip_prefix("```") {
+            let lang = after_fence.trim();
+            let language = if lang.is_empty() {
+                None
+            } else {
+                Some(lang.to_string())
+            };
             let mut code_lines = Vec::new();
             i += 1;
             while i < n && !lines[i].trim().starts_with("```") {
@@ -459,7 +474,11 @@ pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
             let mut math_lines = Vec::new();
 
             if stripped.ends_with(closing_token) && stripped.len() > (start_len * 2) {
-                math_lines.push(stripped[start_len..stripped.len() - closing_token.len()].trim().to_string());
+                math_lines.push(
+                    stripped[start_len..stripped.len() - closing_token.len()]
+                        .trim()
+                        .to_string(),
+                );
                 i += 1;
             } else {
                 if stripped.len() > start_len {
@@ -473,7 +492,11 @@ pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
                 if i < n && lines[i].trim().ends_with(closing_token) {
                     let end_line = lines[i].trim();
                     if end_line.len() > closing_token.len() {
-                        math_lines.push(end_line[..end_line.len() - closing_token.len()].trim().to_string());
+                        math_lines.push(
+                            end_line[..end_line.len() - closing_token.len()]
+                                .trim()
+                                .to_string(),
+                        );
                     }
                     i += 1;
                 }
@@ -487,17 +510,23 @@ pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
         }
 
         // Standalone LaTeX math formula line (\text{...} or \frac{...})
-        if (stripped.starts_with(r"\text{") || stripped.starts_with(r"\frac") || stripped.starts_with(r"\sqrt"))
-            && (stripped.contains(r"\frac") || stripped.contains('=') || stripped.contains(r"\times"))
+        if (stripped.starts_with(r"\text{")
+            || stripped.starts_with(r"\frac")
+            || stripped.starts_with(r"\sqrt"))
+            && (stripped.contains(r"\frac")
+                || stripped.contains('=')
+                || stripped.contains(r"\times"))
         {
             let mut math_lines = vec![stripped.to_string()];
             i += 1;
             while i < n {
                 let curr_s = lines[i].trim();
                 if curr_s.is_empty()
-                    || ![r"\frac", r"\text", "=", r"\times", r"\sqrt", "^", "_", "+", "-", "{", "}"]
-                        .iter()
-                        .any(|k| curr_s.contains(k))
+                    || ![
+                        r"\frac", r"\text", "=", r"\times", r"\sqrt", "^", "_", "+", "-", "{", "}",
+                    ]
+                    .iter()
+                    .any(|k| curr_s.contains(k))
                 {
                     break;
                 }
@@ -641,4 +670,27 @@ pub fn build_full_rich_message(answer_text: &str, _model_name: Option<&str>) -> 
         });
     }
     InputRichMessage::new(blocks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unicode_box_table_parses_without_byte_boundary_slicing() {
+        let input =
+            "┌──────┬──────┐\n│ Nama │ Ikon │\n├──────┼──────┤\n│ 世界 │ 😊   │\n└──────┴──────┘";
+        let blocks = parse_markdown_to_rich_blocks(input);
+        assert!(blocks
+            .iter()
+            .any(|block| matches!(block, RichBlock::Table { .. })));
+    }
+
+    #[test]
+    fn emoji_and_multibyte_inline_text_survive_parser() {
+        let value = parse_inline("Halo █ 😊 世界 **tebal**");
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(serialized.contains("世界"));
+        assert!(serialized.contains("😊"));
+    }
 }

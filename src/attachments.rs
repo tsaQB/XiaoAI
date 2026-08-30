@@ -1,0 +1,199 @@
+use rand::{distributions::Alphanumeric, Rng};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::path::PathBuf;
+
+const MAX_PERSISTED_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentRef {
+    pub kind: String,
+    pub mime_type: String,
+    pub name: Option<String>,
+    pub file_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedUserContent {
+    pub xiao_content_version: u8,
+    pub text: String,
+    #[serde(default)]
+    pub attachments: Vec<AttachmentRef>,
+}
+
+fn attachment_root() -> PathBuf {
+    let base = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    base.join(".local/share/xiaoai/attachments")
+}
+
+fn session_dir(user_id: i64, session_id: usize) -> PathBuf {
+    attachment_root()
+        .join(user_id.to_string())
+        .join(session_id.to_string())
+}
+
+pub async fn persist_attachment(
+    user_id: i64,
+    session_id: usize,
+    kind: &str,
+    mime_type: &str,
+    name: Option<&str>,
+    bytes: &[u8],
+) -> Result<AttachmentRef, String> {
+    if bytes.is_empty() {
+        return Err("attachment is empty".to_string());
+    }
+    if bytes.len() > MAX_PERSISTED_ATTACHMENT_BYTES {
+        return Err(format!(
+            "attachment exceeds persistence limit ({} bytes)",
+            bytes.len()
+        ));
+    }
+
+    let random: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(20)
+        .map(char::from)
+        .collect();
+    let extension = extension_for_mime(mime_type);
+    let file_name = format!("{random}.{extension}");
+    let dir = session_dir(user_id, session_id);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|err| format!("create attachment directory: {err}"))?;
+    harden_dir_permissions(&dir).await?;
+    let path = dir.join(&file_name);
+    tokio::fs::write(&path, bytes)
+        .await
+        .map_err(|err| format!("persist attachment: {err}"))?;
+    harden_file_permissions(&path).await?;
+
+    Ok(AttachmentRef {
+        kind: kind.to_string(),
+        mime_type: mime_type.to_string(),
+        name: name.map(str::to_string),
+        file_name,
+    })
+}
+
+#[cfg(unix)]
+async fn harden_dir_permissions(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .await
+        .map_err(|err| format!("secure attachment directory: {err}"))
+}
+
+#[cfg(not(unix))]
+async fn harden_dir_permissions(_path: &std::path::Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn harden_file_permissions(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .map_err(|err| format!("secure attachment file: {err}"))
+}
+
+#[cfg(not(unix))]
+async fn harden_file_permissions(_path: &std::path::Path) -> Result<(), String> {
+    Ok(())
+}
+
+pub async fn load_attachment(
+    user_id: i64,
+    session_id: usize,
+    attachment: &AttachmentRef,
+) -> Result<Vec<u8>, String> {
+    if attachment.file_name.contains('/')
+        || attachment.file_name.contains('\\')
+        || attachment.file_name.contains("..")
+    {
+        return Err("invalid attachment filename".to_string());
+    }
+    let path = session_dir(user_id, session_id).join(&attachment.file_name);
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|err| format!("attachment metadata: {err}"))?;
+    if metadata.len() as usize > MAX_PERSISTED_ATTACHMENT_BYTES {
+        return Err("persisted attachment exceeds safety limit".to_string());
+    }
+    tokio::fs::read(path)
+        .await
+        .map_err(|err| format!("read attachment: {err}"))
+}
+
+pub async fn delete_session_attachments(user_id: i64, session_id: usize) {
+    let _ = tokio::fs::remove_dir_all(session_dir(user_id, session_id)).await;
+}
+
+pub fn encode_user_content(text: &str, attachments: Vec<AttachmentRef>) -> Value {
+    if attachments.is_empty() {
+        return Value::String(text.to_string());
+    }
+    serde_json::to_value(PersistedUserContent {
+        xiao_content_version: 1,
+        text: text.to_string(),
+        attachments,
+    })
+    .unwrap_or_else(|_| Value::String(text.to_string()))
+}
+
+pub fn decode_user_content(value: &Value) -> Option<PersistedUserContent> {
+    let parsed: PersistedUserContent = serde_json::from_value(value.clone()).ok()?;
+    (parsed.xiao_content_version == 1).then_some(parsed)
+}
+
+fn extension_for_mime(mime: &str) -> &'static str {
+    match mime.to_ascii_lowercase().as_str() {
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "audio/ogg" | "audio/opus" => "ogg",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/mp4" | "audio/m4a" => "m4a",
+        "video/webm" => "webm",
+        "application/pdf" => "pdf",
+        _ if mime.starts_with("audio/") => "mp3",
+        _ if mime.starts_with("video/") => "mp4",
+        _ => "bin",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persisted_content_round_trips() {
+        let value = encode_user_content(
+            "describe this",
+            vec![AttachmentRef {
+                kind: "image".to_string(),
+                mime_type: "image/png".to_string(),
+                name: Some("x.png".to_string()),
+                file_name: "abc.png".to_string(),
+            }],
+        );
+        let decoded = decode_user_content(&value).unwrap();
+        assert_eq!(decoded.text, "describe this");
+        assert_eq!(decoded.attachments.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejects_path_traversal_names() {
+        let attachment = AttachmentRef {
+            kind: "image".to_string(),
+            mime_type: "image/png".to_string(),
+            name: None,
+            file_name: "../secret".to_string(),
+        };
+        let result = load_attachment(1, 1, &attachment).await;
+        assert!(result.is_err());
+    }
+}

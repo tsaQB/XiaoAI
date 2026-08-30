@@ -9,65 +9,130 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: xiao-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  armbian:
-    name: Linux ARM64 (Armbian)
+  quality:
+    name: Rust quality gates
     runs-on: ubuntu-22.04
+    timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Check
+        run: cargo check --locked
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  security:
+    name: RustSec dependency audit
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.98.0
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Audit dependencies
+        run: cargo audit --deny warnings
+
+  armbian:
+    name: Linux ARM64 (Armbian)
+    needs: [quality, security]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Install ARM64 toolchain
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
 
       - name: Install Rust target
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
+          toolchain: 1.98.0
           targets: aarch64-unknown-linux-gnu
 
       - name: Build
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target aarch64-unknown-linux-gnu
+        run: cargo build --release --locked --target aarch64-unknown-linux-gnu
 
       - name: Upload Armbian binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: xiao-linux-arm64-armbian
           path: target/aarch64-unknown-linux-gnu/release/xiao
+          if-no-files-found: error
 
   android:
     name: Android ARM64
+    needs: [quality, security]
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Setup JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4.8.0
         with:
           distribution: temurin
           java-version: '17'
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3.2.2
 
       - name: Install Android NDK
         run: sdkmanager --install "ndk;26.3.11579264"
 
-      - name: Install Rust and cargo-ndk
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust target
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
+          toolchain: 1.98.0
           targets: aarch64-linux-android
 
       - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked
+        run: cargo install cargo-ndk --version 4.1.2 --locked
 
       - name: Build
-        run: cargo ndk -t arm64-v8a -P 26 build --release
+        run: cargo ndk -t arm64-v8a -P 26 build --release --locked
 
       - name: Upload Android binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: xiao-android-arm64
           path: target/aarch64-linux-android/release/xiao
+          if-no-files-found: error

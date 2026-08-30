@@ -1,51 +1,73 @@
-# XiaoAI - Telegram Bot API 10.2 Showcase & Live Execution Engine (Rust Edition)
+# XiaoAI 0.2.0 — Rust Telegram AI Assistant
 
-This repository is a high-performance, standalone asynchronous Rust application (**XiaoAI**) implementing the full **Telegram Bot API 10.2** specification, rich message AST formatting, streaming execution timelines, and multi-provider AI routing.
+XiaoAI is a standalone asynchronous Rust application using the **Telegram Bot API 10.3 subset required by XiaoAI**, Rich Message AST formatting, cancellable streaming drafts, SQLite sessions, and multi-provider OpenAI-compatible AI routing. Do not describe the client as a full Bot API implementation.
+
+## Required Quality Gates
+
+Run before declaring a change ready:
+
+- `cargo fmt --all -- --check`
+- `cargo check --locked`
+- `cargo test --locked`
+- `cargo clippy --locked --all-targets --all-features`
 
 ## Essential CLI Commands
 
-- `cargo check`: Check code
-- `cargo build --release`: Build release binary
-- `cp target/release/xiao $PREFIX/bin/xiao`: Install binary to PATH
-- `xiao start`: Run Telegram bot
-- `xiao setup`: Quickstart setup wizard
-- `xiao provider [add] [del] [status]`: Manage AI providers
-- `xiao telegram [check] [bind] [change]`: Manage Telegram bot token
-- `xiao model [query]`: Select or search model
-- `xiao status`: System health check
-- `xiao help`: Show this help
+- `xiao start`
+- `xiao setup`
+- `xiao provider [add] [del] [status]`
+- `xiao telegram [check] [bind] [change]`
+- `xiao telegram owner <telegram_user_id>`
+- `xiao model [query]`
+- `xiao model probe`
+- `xiao model pick`
+- `xiao status`
 
-## Architecture & Code Organization
+## Security & Session Invariants
+
+1. `OWNER_USER_ID` is required. Only that Telegram user may operate XiaoAI; `ALLOWED_CHAT_IDS` extends where the owner may use the bot, not who may use it.
+2. Never log a URL that contains `BOT_TOKEN`.
+3. Session identity is the stable SQLite `session_id`, never a vector/list index.
+4. New session IDs must come from the persistent high-water sequence and must not reuse deleted IDs.
+5. Every AI request captures its originating `session_id`; late output must never be written into whichever session is active later.
+6. If the originating session is deleted while generation is running, discard the late persistence write.
+7. User generations are serialized so concurrent prompts cannot reorder the same owner's history.
+8. Telegram `stopped_message_generation` must cancel the matching `(chat_id, draft_id)` provider stream.
+9. Binary documents must use explicit bounded extractors. Never reinterpret PDF/DOCX/XLSX bytes as UTF-8; scanned PDFs must use the render-to-vision path.
+10. External image fallback is opt-in only (`IMAGE_FALLBACK_PROVIDER=pollinations`).
+
+## Architecture
 
 ```text
 src/
-├── main.rs         # Application entry point, update router, interactive wizards, keyboard builders
+├── main.rs         # access policy, ordered update routing, Telegram UI handlers
+├── cli.rs          # terminal setup/provider/model/Telegram commands
+├── document.rs     # bounded PDF/DOCX/XLSX extraction + scanned-PDF rendering
+├── attachments.rs  # per-session multimodal persistence
+├── util.rs         # Unicode-safe truncation and HTML escaping
 ├── bot/
-│   ├── mod.rs      # Bot module exports
-│   ├── client.rs   # TelegramBotClient wrapping reqwest (supports Bot API 10.2 methods + HTML fallback)
-│   └── models.rs   # Strongly-typed serde structures for Bot API 10.2 (InputRichMessage, Keyboards, Updates)
+│   ├── client.rs   # Telegram HTTP client + 10.3 methods used by XiaoAI
+│   └── models.rs   # Telegram/Rich Message serde models
 ├── ai/
-│   ├── mod.rs      # AI module exports
-│   └── service.rs  # AIChatService: OpenAI-compatible SSE streaming, Whisper STT, FLUX.1 image generator, session management
-├── parser.rs       # Markdown to Telegram Bot API 10.2 Rich Message AST Parser (supports tables, code, math, quotes)
-└── timeline.rs     # Live Execution Timeline engine streaming rich drafts with elapsed timer & state machine
+│   ├── provider.rs # single-owner provider state + capability probes
+│   ├── storage.rs  # SQLite persistence / blocking boundary
+│   ├── stream.rs   # SSE state machine
+│   ├── http.rs     # retry/backoff policy
+│   └── service.rs  # chat/session orchestration, STT/image
+├── parser.rs       # Markdown -> Telegram Rich Message AST
+└── timeline.rs     # Cancellable/streaming draft presentation state
 ```
 
-## Non-Obvious Patterns & Gotchas
+## Telegram 10.3 Notes
 
-1. **Auto-Chunking & HTML Fallbacks**:
-   - `TelegramBotClient::send_message` automatically splits texts exceeding 4000 characters cleanly across paragraph breaks (`\n\n`) and lines.
-   - `TelegramBotClient::send_rich_message` tries the native Telegram `sendRichMessage` method first; if unsupported by the client endpoint, it gracefully falls back to chunked rich HTML and rendered Unicode box tables (`<pre>`).
+The currently modeled 10.3 surface includes native generation stop (`can_stop`, `keep_on_stop`, `stopped_message_generation`), disabled buttons, Rich Message buttons, expandable quotations, document blocks, compact tables, `force_reply`, and `EphemeralMessageParameters` where used by the client.
 
-2. **Live Execution Timeline**:
-   - Updates during AI processing are pushed as lightweight drafts via `send_rich_message_draft`.
-   - Rate limiting is enforced natively with a mutex and min-sync interval (1200ms) to prevent Telegram API 429 errors.
-   - The final response replaces the draft using `send_rich_message`.
+Execution/status UI must describe observable application state. Do not infer fake tool execution such as “Searching”, “Testing”, or “Coding” solely from prompt/reasoning keywords.
 
-3. **Markdown AST Parser (`parser.rs`)**:
-   - Bypasses raw markdown transmission. Markdown headings, tables (Markdown, ASCII, Unicode Box), code blocks, math formulas (`$$` or `\[`), blockquotes, and lists are converted into structured `RichBlock` AST objects.
-   - Leaked HTML tags are sanitized before parsing.
+## Persistence Notes
 
-4. **Multi-Session & Provider Engine (`ai/service.rs`)**:
-   - All state is managed thread-safely in-memory using `Arc<RwLock<...>>` structures.
-   - Custom provider discovery calls `/models` on user-specified endpoints to dynamically populate available AI models.
+SQLite is the runtime source of truth for sessions, active session identity, settings, providers/model selections, and migration markers. Legacy JSON/.env values may be imported for compatibility, but documentation and new code should not treat legacy files as the primary persistent state.
+
+## Runtime Boundaries
+
+Bot-time SQLite work must go through the async wrappers in `ai/storage.rs` so blocking `rusqlite` calls do not run on Tokio workers. Provider configuration is single-owner global state; do not reintroduce pseudo-multi-user provider maps. Capability claims must remain tri-state and identify metadata/probe evidence. Normal Telegram updates are processed in order through the bounded worker; only native Stop may bypass it for cancellation.
