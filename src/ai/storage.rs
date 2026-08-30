@@ -559,9 +559,7 @@ pub(crate) async fn enqueue_telegram_update_async(
     .await
 }
 
-pub(crate) async fn pending_telegram_updates_async(
-    limit: usize,
-) -> Vec<TelegramInboxRecord> {
+pub(crate) async fn pending_telegram_updates_async(limit: usize) -> Vec<TelegramInboxRecord> {
     run_db("pending_telegram_updates", move || {
         pending_telegram_updates_db(limit)
     })
@@ -570,9 +568,12 @@ pub(crate) async fn pending_telegram_updates_async(
 }
 
 pub(crate) async fn quarantine_telegram_processing_async() -> usize {
-    run_db("quarantine_telegram_processing", quarantine_telegram_processing_db)
-        .await
-        .unwrap_or_default()
+    run_db(
+        "quarantine_telegram_processing",
+        quarantine_telegram_processing_db,
+    )
+    .await
+    .unwrap_or_default()
 }
 
 pub(crate) async fn mark_telegram_processing_async(update_id: i64) -> bool {
