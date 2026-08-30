@@ -1531,8 +1531,7 @@ impl AIChatService {
                     "❌ Rejected by fresh provider metadata/probe".to_string()
                 }
                 CapabilityState::Unknown => {
-                    "⚪ Unknown/stale: provider evidence is not currently authoritative"
-                        .to_string()
+                    "⚪ Unknown/stale: provider evidence is not currently authoritative".to_string()
                 }
             };
 
