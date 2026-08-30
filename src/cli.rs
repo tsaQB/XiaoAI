@@ -1703,6 +1703,31 @@ pub(crate) async fn run_cli_status(ai_service: &AIChatService) {
         println!("   • Docs:     {}", cap.docs_desc);
         println!("   • CoT:      {}", cap.thinking_desc);
     }
+
+    println!("\n\x1b[1;37m4. MODEL ROUTING\x1b[0m");
+    let providers = ai_service.get_user_providers(0).await;
+    let routing = ai_service.model_routing_config().await;
+    for role in ModelRole::addon_roles() {
+        let route = routing
+            .route(role)
+            .cloned()
+            .unwrap_or(ModelRoute::MainModel);
+        let route_text = addon_route_text(&route, &providers);
+        let health = match ai_service.resolve_model_route(role).await {
+            Ok(resolved) => format!(
+                "Available — {} / {}",
+                resolved.provider.name, resolved.model
+            ),
+            Err(error) => format!("Unavailable — {error}"),
+        };
+        println!(
+            "   • {:<24} {:<36} {}",
+            role.display_name(),
+            route_text,
+            health
+        );
+    }
+    println!("   \x1b[38;5;244mSpecific cross-provider routes are shown explicitly; Xiao never silently reroutes them.\x1b[0m");
     println!();
 }
 
