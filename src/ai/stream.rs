@@ -6,38 +6,53 @@ pub enum StreamEvent {
     Done,
 }
 
+const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Default)]
 pub struct SseDecoder {
-    buffer: String,
+    buffer: Vec<u8>,
     data_lines: Vec<String>,
 }
 
 impl SseDecoder {
-    pub fn push(&mut self, bytes: &[u8]) -> Vec<StreamEvent> {
-        self.buffer.push_str(&String::from_utf8_lossy(bytes));
+    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<StreamEvent>, String> {
+        self.buffer.extend_from_slice(bytes);
         let mut events = Vec::new();
 
-        while let Some(newline_pos) = self.buffer.find('\n') {
-            let mut line = self.buffer[..newline_pos].to_string();
-            self.buffer.drain(..=newline_pos);
-            if line.ends_with('\r') {
-                line.pop();
+        while let Some(newline_pos) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            if newline_pos > MAX_SSE_LINE_BYTES {
+                return Err("provider SSE line exceeded 1 MiB".to_string());
             }
+            let mut raw = self.buffer.drain(..=newline_pos).collect::<Vec<_>>();
+            raw.pop();
+            if raw.last() == Some(&b'\r') {
+                raw.pop();
+            }
+            let line = String::from_utf8(raw)
+                .map_err(|_| "provider SSE emitted invalid UTF-8".to_string())?;
             self.process_line(&line, &mut events);
         }
 
-        events
+        if self.buffer.len() > MAX_SSE_LINE_BYTES {
+            return Err("provider SSE line exceeded 1 MiB".to_string());
+        }
+
+        Ok(events)
     }
 
-    pub fn finish(&mut self) -> Vec<StreamEvent> {
+    pub fn finish(&mut self) -> Result<Vec<StreamEvent>, String> {
         let mut events = Vec::new();
         if !self.buffer.is_empty() {
-            let line = self.buffer.trim_end_matches('\r').to_string();
-            self.buffer.clear();
+            let mut raw = std::mem::take(&mut self.buffer);
+            if raw.last() == Some(&b'\r') {
+                raw.pop();
+            }
+            let line = String::from_utf8(raw)
+                .map_err(|_| "provider SSE emitted invalid UTF-8".to_string())?;
             self.process_line(&line, &mut events);
         }
         self.flush_event(&mut events);
-        events
+        Ok(events)
     }
 
     fn process_line(&mut self, line: &str, events: &mut Vec<StreamEvent>) {
@@ -78,15 +93,15 @@ mod tests {
     #[test]
     fn accepts_data_without_space_and_crlf() {
         let mut decoder = SseDecoder::default();
-        let events = decoder.push(b"data:{\"x\":1}\r\n\r\n");
+        let events = decoder.push(b"data:{\"x\":1}\r\n\r\n").unwrap();
         assert_eq!(events, vec![StreamEvent::Json(json!({"x": 1}))]);
     }
 
     #[test]
     fn handles_split_chunks_and_done() {
         let mut decoder = SseDecoder::default();
-        assert!(decoder.push(b"data: {\"x\":").is_empty());
-        let events = decoder.push(b"2}\n\ndata: [DONE]\n\n");
+        assert!(decoder.push(b"data: {\"x\":").unwrap().is_empty());
+        let events = decoder.push(b"2}\n\ndata: [DONE]\n\n").unwrap();
         assert_eq!(
             events,
             vec![StreamEvent::Json(json!({"x": 2})), StreamEvent::Done]
@@ -96,7 +111,34 @@ mod tests {
     #[test]
     fn joins_multiline_data_events() {
         let mut decoder = SseDecoder::default();
-        let events = decoder.push(b"data: {\"a\":\ndata: 1}\n\n");
+        let events = decoder
+            .push(b"data: {\"a\":\ndata: 1}\n\n")
+            .unwrap();
         assert_eq!(events, vec![StreamEvent::Json(json!({"a": 1}))]);
+    }
+
+    #[test]
+    fn preserves_multibyte_utf8_across_every_chunk_boundary() {
+        let wire = "data: {\"text\":\"Halo 😀 — 中文 — العربية\"}\r\n\r\n";
+        let expected = StreamEvent::Json(json!({
+            "text": "Halo 😀 — 中文 — العربية"
+        }));
+        for split in 1..wire.len() {
+            let mut decoder = SseDecoder::default();
+            let mut events = decoder.push(&wire.as_bytes()[..split]).unwrap();
+            events.extend(decoder.push(&wire.as_bytes()[split..]).unwrap());
+            assert_eq!(events, vec![expected.clone()], "split at byte {split}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_and_oversized_lines() {
+        let mut invalid = SseDecoder::default();
+        assert!(invalid.push(b"data: \xff\n").is_err());
+
+        let mut oversized = SseDecoder::default();
+        assert!(oversized
+            .push(&vec![b'x'; MAX_SSE_LINE_BYTES + 1])
+            .is_err());
     }
 }
