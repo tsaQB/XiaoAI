@@ -1211,6 +1211,201 @@ fn delivery_context_for_update(update: &Update) -> TelegramDeliveryContext {
     TelegramDeliveryContext::default()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateLane {
+    Control,
+    Generation,
+}
+
+fn command_matches(text: &str, command: &str) -> bool {
+    text == command
+        || text
+            .strip_prefix(command)
+            .is_some_and(|rest| rest.starts_with(' ') || rest.starts_with('@'))
+}
+
+fn is_control_message_text(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    if command_matches(text, "/image") {
+        return false;
+    }
+
+    let commands = [
+        "/start", "/menu", "/new", "/session", "/context", "/model", "/clear", "/help",
+    ];
+    if commands.iter().any(|command| command_matches(text, command)) {
+        return true;
+    }
+
+    if text.chars().all(|character| character.is_ascii_digit())
+        || text.starts_with("✅")
+        || text.starts_with("Session ")
+        || (text.starts_with("Hal") && text.chars().any(|character| character.is_ascii_digit()))
+    {
+        return true;
+    }
+
+    [
+        "📱 Menu",
+        "Menu",
+        "🔙 Menu Utama",
+        "🔙 Kembali ke Menu Utama",
+        "Menu Utama",
+        "Main Menu",
+        "main menu",
+        "Main menu",
+        "ɴᴇᴡ",
+        "➕ ɴᴇᴡ",
+        "➕ New",
+        "New",
+        "new",
+        "➕ Chat Baru",
+        "Chat Baru",
+        "📑 Session",
+        "Session",
+        "session",
+        "📑 Session Manager",
+        "📑 Lihat Daftar Session",
+        "🗑️ Hapus Session",
+        "🗑️ Remove Session",
+        "Delete",
+        "delete",
+        "Delete Session",
+        "✏️ Rename Session",
+        "✏️ Ubah Nama Session",
+        "Rename",
+        "rename",
+        "Rename Session",
+        "ᴄᴏɴᴛᴇxᴛ",
+        "🧠 ᴄᴏɴᴛᴇxᴛ",
+        "🧠 Context",
+        "Context",
+        "context",
+        "🧠 Info Konteks",
+        "Info Konteks",
+        "ᴍᴏᴅᴇʟ",
+        "⚙️ ᴍᴏᴅᴇʟ",
+        "⚙️ Model",
+        "Model",
+        "model",
+        "⚙️ Model AI",
+        "Pilih Model",
+        "🗑️ Reset Chat",
+        "🗑️ Reset Obrolan",
+        "❓ Help",
+        "Help",
+        "help",
+        "Bantuan",
+    ]
+    .contains(&text)
+}
+
+async fn classify_update_lane(ai_service: &AIChatService, update: &Update) -> UpdateLane {
+    if update.stopped_message_generation.is_some() {
+        return UpdateLane::Control;
+    }
+
+    if let Some(callback) = update.callback_query.as_ref() {
+        return if matches!(callback.data.as_deref(), Some("img_new" | "img_regen")) {
+            UpdateLane::Generation
+        } else {
+            UpdateLane::Control
+        };
+    }
+
+    let Some(message) = update.message.as_ref() else {
+        return UpdateLane::Control;
+    };
+
+    if message.photo.is_some()
+        || message.document.is_some()
+        || message.voice.is_some()
+        || message.audio.is_some()
+        || message.video.is_some()
+        || message.video_note.is_some()
+    {
+        return UpdateLane::Generation;
+    }
+
+    let user_id = message
+        .from
+        .as_ref()
+        .map(|user| user.id)
+        .unwrap_or(message.chat.id);
+    let text = message
+        .text
+        .as_deref()
+        .or(message.caption.as_deref())
+        .unwrap_or("")
+        .trim();
+
+    let wizard = ai_service
+        .user_wizard_state
+        .read()
+        .await
+        .get(&user_id)
+        .cloned();
+    if let Some(wizard) = wizard {
+        if ["/cancel", "/batal", "batal", "cancel"].contains(&text) {
+            return UpdateLane::Control;
+        }
+        return if wizard.get("step").map(String::as_str) == Some("awaiting_image_prompt") {
+            UpdateLane::Generation
+        } else {
+            UpdateLane::Control
+        };
+    }
+
+    if ai_service
+        .user_waiting_rename
+        .read()
+        .await
+        .contains_key(&user_id)
+        && !text.starts_with('/')
+    {
+        return UpdateLane::Control;
+    }
+
+    if is_control_message_text(text) {
+        UpdateLane::Control
+    } else {
+        UpdateLane::Generation
+    }
+}
+
+async fn process_durable_update(
+    bot: &TelegramBotClient,
+    ai_service: &AIChatService,
+    user_last_image_prompt: &UserLastImagePrompt,
+    access: &AccessPolicy,
+    update: Update,
+) {
+    let update_id = update.update_id;
+    if !ai::storage::mark_telegram_processing_async(update_id).await {
+        return;
+    }
+
+    let delivery_context = delivery_context_for_update(&update);
+    TelegramBotClient::with_delivery_context(
+        delivery_context,
+        handle_update(
+            bot,
+            ai_service,
+            user_last_image_prompt,
+            access,
+            update,
+        ),
+    )
+    .await;
+
+    if !ai::storage::mark_telegram_processed_async(update_id).await {
+        warn!("Gagal menyelesaikan durable Telegram inbox update {update_id}");
+    }
+}
+
 async fn handle_update(
     bot: &TelegramBotClient,
     ai_service: &AIChatService,
@@ -2571,32 +2766,40 @@ async fn main() {
         info!("Commands berhasil didaftarkan ke Telegram.");
     }
 
-    let (update_tx, mut update_rx) = tokio::sync::mpsc::channel::<Update>(64);
-    let worker_bot = bot.clone();
-    let worker_ai = Arc::clone(&ai_service);
-    let worker_last_image = Arc::clone(&user_last_image_prompt);
-    let worker_access = Arc::clone(&access);
-    let worker_handle = tokio::spawn(async move {
-        while let Some(update) = update_rx.recv().await {
-            let update_id = update.update_id;
-            if !ai::storage::mark_telegram_processing_async(update_id).await {
-                continue;
-            }
-            let delivery_context = delivery_context_for_update(&update);
-            TelegramBotClient::with_delivery_context(
-                delivery_context,
-                handle_update(
-                    &worker_bot,
-                    &worker_ai,
-                    &worker_last_image,
-                    &worker_access,
-                    update,
-                ),
+    let (generation_tx, mut generation_rx) = tokio::sync::mpsc::channel::<Update>(64);
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<Update>(64);
+
+    let generation_bot = bot.clone();
+    let generation_ai = Arc::clone(&ai_service);
+    let generation_last_image = Arc::clone(&user_last_image_prompt);
+    let generation_access = Arc::clone(&access);
+    let generation_worker = tokio::spawn(async move {
+        while let Some(update) = generation_rx.recv().await {
+            process_durable_update(
+                &generation_bot,
+                &generation_ai,
+                &generation_last_image,
+                &generation_access,
+                update,
             )
             .await;
-            if !ai::storage::mark_telegram_processed_async(update_id).await {
-                warn!("Gagal menyelesaikan durable Telegram inbox update {update_id}");
-            }
+        }
+    });
+
+    let control_bot = bot.clone();
+    let control_ai = Arc::clone(&ai_service);
+    let control_last_image = Arc::clone(&user_last_image_prompt);
+    let control_access = Arc::clone(&access);
+    let control_worker = tokio::spawn(async move {
+        while let Some(update) = control_rx.recv().await {
+            process_durable_update(
+                &control_bot,
+                &control_ai,
+                &control_last_image,
+                &control_access,
+                update,
+            )
+            .await;
         }
     });
 
@@ -2610,7 +2813,12 @@ async fn main() {
     for record in ai::storage::pending_telegram_updates_async(500).await {
         match serde_json::from_str::<Update>(&record.payload_json) {
             Ok(update) => {
-                if update_tx.send(update).await.is_err() {
+                let lane = classify_update_lane(&ai_service, &update).await;
+                let send_result = match lane {
+                    UpdateLane::Control => control_tx.send(update).await,
+                    UpdateLane::Generation => generation_tx.send(update).await,
+                };
+                if send_result.is_err() {
                     error!("Update worker stopped while replaying durable inbox");
                     return;
                 }
@@ -2628,7 +2836,7 @@ async fn main() {
     }
 
     let mut offset = ai::storage::load_telegram_offset_async().await;
-    info!("Memulai polling pesan dengan durable bounded ordered update queue...");
+    info!("Memulai polling pesan dengan durable control/generation queues...");
 
     loop {
         tokio::select! {
@@ -2668,30 +2876,26 @@ async fn main() {
                                 }
 
                                 if update.stopped_message_generation.is_some() {
-                                    // Native Stop bypasses the ordered worker so it remains
-                                    // responsive, but it still crosses the same durable claim
-                                    // boundary before any cancellation side effect.
-                                    if ai::storage::mark_telegram_processing_async(update_id).await {
-                                        let delivery_context =
-                                            delivery_context_for_update(&update);
-                                        TelegramBotClient::with_delivery_context(
-                                            delivery_context,
-                                            handle_update(
-                                                &bot,
-                                                &ai_service,
-                                                &user_last_image_prompt,
-                                                &access,
-                                                update,
-                                            ),
-                                        )
-                                        .await;
-                                        let _ =
-                                            ai::storage::mark_telegram_processed_async(update_id)
-                                                .await;
+                                    // Native Stop bypasses both queues so cancellation cannot be
+                                    // blocked by either control work or an active generation.
+                                    process_durable_update(
+                                        &bot,
+                                        &ai_service,
+                                        &user_last_image_prompt,
+                                        &access,
+                                        update,
+                                    )
+                                    .await;
+                                } else {
+                                    let lane = classify_update_lane(&ai_service, &update).await;
+                                    let send_result = match lane {
+                                        UpdateLane::Control => control_tx.send(update).await,
+                                        UpdateLane::Generation => generation_tx.send(update).await,
+                                    };
+                                    if send_result.is_err() {
+                                        error!("Update worker stopped unexpectedly");
+                                        return;
                                     }
-                                } else if update_tx.send(update).await.is_err() {
-                                    error!("Update worker stopped unexpectedly");
-                                    return;
                                 }
                             }
                         }
@@ -2710,10 +2914,50 @@ async fn main() {
     }
 
     ai_service.cancel_all_generations().await;
-    drop(update_tx);
-    match tokio::time::timeout(Duration::from_secs(5), worker_handle).await {
+    drop(control_tx);
+    drop(generation_tx);
+
+    match tokio::time::timeout(Duration::from_secs(5), control_worker).await {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => warn!("Update worker terminated with error: {err}"),
-        Err(_) => warn!("Update worker did not stop within shutdown grace period"),
+        Ok(Err(err)) => warn!("Control worker terminated with error: {err}"),
+        Err(_) => warn!("Control worker did not stop within shutdown grace period"),
+    }
+    match tokio::time::timeout(Duration::from_secs(5), generation_worker).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => warn!("Generation worker terminated with error: {err}"),
+        Err(_) => warn!("Generation worker did not stop within shutdown grace period"),
+    }
+}
+
+#[cfg(test)]
+mod update_lane_tests {
+    use super::*;
+
+    #[test]
+    fn known_controls_do_not_share_generation_lane() {
+        for text in [
+            "/menu",
+            "/session",
+            "/model",
+            "/context",
+            "/help",
+            "📱 Menu",
+            "Session",
+            "Rename Session",
+            "Hal 2",
+        ] {
+            assert!(is_control_message_text(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn generation_prompts_remain_outside_control_lane() {
+        for text in [
+            "Jelaskan orbit satelit",
+            "/image seekor rubah di kota neon",
+            "buatkan gambar pemandangan",
+        ] {
+            assert!(!is_control_message_text(text), "{text}");
+        }
     }
 }
