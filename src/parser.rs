@@ -1,7 +1,9 @@
 use regex::Regex;
 use serde_json::{json, Value};
 
-use crate::bot::models::{InputRichMessage, RichBlock, RichBlockTableCell};
+use crate::bot::models::{
+    InputRichMessage, RichBlock, RichBlockListItem, RichBlockTableCell,
+};
 
 pub fn parse_inline(input_str: &str) -> Value {
     if input_str.is_empty() {
@@ -607,21 +609,23 @@ pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
                 }
                 if is_ordered && numbered_re.is_match(curr) {
                     let item_text = numbered_re.replace(curr, "").trim().to_string();
-                    list_items.push(json!({
-                        "blocks": [{
+                    let value = curr
+                        .split_once(|character: char| character == '.' || character == ')')
+                        .and_then(|(prefix, _)| prefix.parse::<i64>().ok());
+                    list_items.push(RichBlockListItem::ordered(
+                        vec![json!({
                             "type": "paragraph",
                             "text": parse_inline(&item_text)
-                        }]
-                    }));
+                        })],
+                        value,
+                    ));
                     i += 1;
                 } else if !is_ordered && bullet_re.is_match(curr) {
                     let item_text = bullet_re.replace(curr, "").trim().to_string();
-                    list_items.push(json!({
-                        "blocks": [{
-                            "type": "paragraph",
-                            "text": parse_inline(&item_text)
-                        }]
-                    }));
+                    list_items.push(RichBlockListItem::bullet(vec![json!({
+                        "type": "paragraph",
+                        "text": parse_inline(&item_text)
+                    })]));
                     i += 1;
                 } else {
                     break;
@@ -684,6 +688,17 @@ mod tests {
         assert!(blocks
             .iter()
             .any(|block| matches!(block, RichBlock::Table { .. })));
+    }
+
+    #[test]
+    fn ordered_list_preserves_native_ordering_metadata() {
+        let blocks = parse_markdown_to_rich_blocks("5. lima\n6. enam");
+        let RichBlock::List { items } = &blocks[0] else {
+            panic!("expected list");
+        };
+        assert_eq!(items[0].kind.as_deref(), Some("1"));
+        assert_eq!(items[0].value, Some(5));
+        assert_eq!(items[1].value, Some(6));
     }
 
     #[test]
