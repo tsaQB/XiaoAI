@@ -503,15 +503,15 @@ impl AIChatService {
             created_at: now_str,
         };
 
+        if !save_session_metadata_db_async(user_id, session.clone()).await {
+            return None;
+        }
         {
             let mut sessions_map = self.user_sessions.write().await;
             sessions_map
                 .entry(user_id)
                 .or_default()
                 .push(session.clone());
-        }
-        if !save_session_metadata_db_async(user_id, session.clone()).await {
-            return None;
         }
         self.active_session_id.write().await.insert(user_id, new_id);
         let _ = save_active_session_db_async(user_id, new_id).await;
