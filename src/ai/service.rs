@@ -415,16 +415,21 @@ impl AIChatService {
 
         let mut existing = load_sessions_db_async(user_id).await;
         if existing.is_empty() {
+            let Some(session_id) = allocate_session_id_db_async(user_id).await else {
+                warn!("Session initialization deferred because durable ID allocation failed");
+                return Vec::new();
+            };
             let now_str = Local::now().format("%d %b %H:%M").to_string();
             let session = ChatSession {
-                id: allocate_session_id_db_async(user_id)
-                    .await
-                    .expect("persistent session ID allocation failed; refusing to reuse an ID"),
+                id: session_id,
                 name: format!("Session {now_str}"),
                 messages: Vec::new(),
                 created_at: now_str,
             };
-            let _ = save_session_metadata_db_async(user_id, session.clone()).await;
+            if !save_session_metadata_db_async(user_id, session.clone()).await {
+                warn!("Session initialization deferred because metadata persistence failed");
+                return Vec::new();
+            }
             existing.push(session);
         }
         let _ = ensure_session_identity_v2_db_async(user_id, existing.clone()).await;
@@ -435,11 +440,14 @@ impl AIChatService {
         existing
     }
 
-    pub async fn get_active_session_id(&self, user_id: i64) -> usize {
+    pub async fn get_active_session_id(&self, user_id: i64) -> Option<usize> {
         let sessions = self.get_sessions(user_id).await;
+        if sessions.is_empty() {
+            return None;
+        }
         if let Some(id) = self.active_session_id.read().await.get(&user_id).copied() {
             if sessions.iter().any(|session| session.id == id) {
-                return id;
+                return Some(id);
             }
         }
 
@@ -453,34 +461,37 @@ impl AIChatService {
             .await
             .insert(user_id, stored_id);
         let _ = save_active_session_db_async(user_id, stored_id).await;
-        stored_id
+        Some(stored_id)
     }
 
     pub async fn get_active_session_index(&self, user_id: i64) -> usize {
         let sessions = self.get_sessions(user_id).await;
-        let active_id = self.get_active_session_id(user_id).await;
+        let Some(active_id) = self.get_active_session_id(user_id).await else {
+            return 0;
+        };
         sessions
             .iter()
             .position(|session| session.id == active_id)
             .unwrap_or(0)
     }
 
-    pub async fn get_active_session(&self, user_id: i64) -> ChatSession {
+    pub async fn get_active_session(&self, user_id: i64) -> Option<ChatSession> {
         let sessions = self.get_sessions(user_id).await;
-        let active_id = self.get_active_session_id(user_id).await;
+        let active_id = self.get_active_session_id(user_id).await?;
         sessions
             .iter()
             .find(|session| session.id == active_id)
             .cloned()
-            .unwrap_or_else(|| sessions[0].clone())
     }
 
-    pub async fn create_new_session(&self, user_id: i64, custom_name: Option<&str>) -> ChatSession {
+    pub async fn create_new_session(
+        &self,
+        user_id: i64,
+        custom_name: Option<&str>,
+    ) -> Option<ChatSession> {
         let _ = self.get_sessions(user_id).await;
         let now_str = Local::now().format("%d %b %H:%M").to_string();
-        let new_id = allocate_session_id_db_async(user_id)
-            .await
-            .expect("persistent session ID allocation failed; refusing to reuse an ID");
+        let new_id = allocate_session_id_db_async(user_id).await?;
         let name = custom_name
             .map(|value| truncate_chars(value.trim(), 60))
             .filter(|value| !value.is_empty())
@@ -499,10 +510,12 @@ impl AIChatService {
                 .or_default()
                 .push(session.clone());
         }
-        let _ = save_session_metadata_db_async(user_id, session.clone()).await;
+        if !save_session_metadata_db_async(user_id, session.clone()).await {
+            return None;
+        }
         self.active_session_id.write().await.insert(user_id, new_id);
         let _ = save_active_session_db_async(user_id, new_id).await;
-        session
+        Some(session)
     }
 
     pub async fn switch_session_by_id(&self, user_id: i64, session_id: usize) -> bool {
@@ -527,51 +540,58 @@ impl AIChatService {
     }
 
     pub async fn remove_session_by_id(&self, user_id: i64, session_id: usize) -> bool {
-        let active_id = self.get_active_session_id(user_id).await;
-        let (removed_id, mut new_active_id, create_replacement) = {
-            let mut sessions_map = self.user_sessions.write().await;
-            let Some(list) = sessions_map.get_mut(&user_id) else {
-                return false;
-            };
-            let Some(index) = list.iter().position(|session| session.id == session_id) else {
-                return false;
-            };
-            let removed = list.remove(index);
-            let create_replacement = list.is_empty();
-            let new_active_id = if !create_replacement
-                && (removed.id == active_id || !list.iter().any(|session| session.id == active_id))
-            {
-                let target_index = index.min(list.len().saturating_sub(1));
-                list[target_index].id
-            } else {
-                active_id
-            };
-            (removed.id, new_active_id, create_replacement)
+        let Some(active_id) = self.get_active_session_id(user_id).await else {
+            return false;
         };
-
-        let _ = delete_session_db_async(user_id, removed_id).await;
-        delete_session_attachments(user_id, removed_id).await;
-
-        if create_replacement {
+        let sessions = self.get_sessions(user_id).await;
+        let Some(index) = sessions.iter().position(|session| session.id == session_id) else {
+            return false;
+        };
+        let replacement = if sessions.len() == 1 {
+            let Some(replacement_id) = allocate_session_id_db_async(user_id).await else {
+                warn!("Refusing to remove the last session because replacement ID allocation failed");
+                return false;
+            };
             let now_str = Local::now().format("%d %b %H:%M").to_string();
             let replacement = ChatSession {
-                id: allocate_session_id_db_async(user_id)
-                    .await
-                    .expect("persistent session ID allocation failed; refusing to reuse an ID"),
+                id: replacement_id,
                 name: format!("Session {now_str}"),
                 messages: Vec::new(),
                 created_at: now_str,
             };
-            let _ = save_session_metadata_db_async(user_id, replacement.clone()).await;
-            new_active_id = replacement.id;
-            self.user_sessions
-                .write()
-                .await
-                .entry(user_id)
-                .or_default()
-                .push(replacement);
-        }
+            if !save_session_metadata_db_async(user_id, replacement.clone()).await {
+                warn!("Refusing to remove the last session because replacement persistence failed");
+                return false;
+            }
+            Some(replacement)
+        } else {
+            None
+        };
 
+        let new_active_id = {
+            let mut sessions_map = self.user_sessions.write().await;
+            let Some(list) = sessions_map.get_mut(&user_id) else {
+                return false;
+            };
+            let Some(current_index) = list.iter().position(|session| session.id == session_id)
+            else {
+                return false;
+            };
+            let removed = list.remove(current_index);
+            if let Some(replacement) = replacement.clone() {
+                let replacement_id = replacement.id;
+                list.push(replacement);
+                replacement_id
+            } else if removed.id == active_id || !list.iter().any(|session| session.id == active_id) {
+                let target_index = current_index.min(list.len().saturating_sub(1));
+                list[target_index].id
+            } else {
+                active_id
+            }
+        };
+
+        let _ = delete_session_db_async(user_id, session_id).await;
+        delete_session_attachments(user_id, session_id).await;
         self.active_session_id
             .write()
             .await
@@ -622,7 +642,9 @@ impl AIChatService {
     }
 
     pub async fn clear_history(&self, user_id: i64) {
-        let active_id = self.get_active_session_id(user_id).await;
+        let Some(active_id) = self.get_active_session_id(user_id).await else {
+            return;
+        };
         let cleared = {
             let mut sessions_map = self.user_sessions.write().await;
             sessions_map.get_mut(&user_id).and_then(|list| {
@@ -693,7 +715,12 @@ impl AIChatService {
     }
 
     pub async fn get_context_stats(&self, user_id: i64) -> ContextStats {
-        let active_sess = self.get_active_session(user_id).await;
+        let active_sess = self.get_active_session(user_id).await.unwrap_or(ChatSession {
+            id: 0,
+            name: "Storage unavailable".to_string(),
+            messages: Vec::new(),
+            created_at: "-".to_string(),
+        });
         let active_model = self.get_user_model(user_id).await;
         let endpoint = self
             .get_active_provider(user_id)
@@ -942,7 +969,13 @@ impl AIChatService {
             }
         }
 
-        let active_sess = self.get_active_session(user_id).await;
+        let Some(active_sess) = self.get_active_session(user_id).await else {
+            return (
+                None,
+                "Penyimpanan session sedang tidak tersedia. XiaoAI tidak akan membuat ID session sementara yang berisiko dipakai ulang. Coba lagi setelah storage pulih.".to_string(),
+                false,
+            );
+        };
         let request_session_id = active_sess.id;
 
         let mut clean_prompt = prompt.trim().to_string();
