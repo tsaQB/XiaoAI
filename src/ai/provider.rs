@@ -46,9 +46,9 @@ fn validate_text_probe(response: &CapabilityProbeResponse) -> Option<bool> {
     match response {
         CapabilityProbeResponse::Rejected => Some(false),
         CapabilityProbeResponse::Unknown => None,
-        CapabilityProbeResponse::Success(body) => {
-            assistant_text(body).filter(|text| !text.is_empty()).map(|_| true)
-        }
+        CapabilityProbeResponse::Success(body) => assistant_text(body)
+            .filter(|text| !text.is_empty())
+            .map(|_| true),
     }
 }
 
