@@ -309,7 +309,6 @@ impl ExecutionTimeline {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
