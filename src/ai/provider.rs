@@ -63,6 +63,11 @@ fn tiny_silent_wav() -> Vec<u8> {
     wav
 }
 
+const RED_PNG_BASE64: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAF0lEQVR4nGP8z0AaYCJR/aiGUQ1DSAMAQC4BH2bjRnMAAAAASUVORK5CYII=";
+const BLUE_PNG_BASE64: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAGUlEQVR4nGNkYPjPQApgIkn1qIZRDUNKAwA+MAEfWiW9ygAAAABJRU5ErkJggg==";
+
 const TINY_RED_MP4_BASE64: &str = "AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAMUbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAA+gAAQAAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAj90cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAA+gAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAABAAAAAQAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAPoAAAAAAABAAAAAAG3bWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAABAAAAAQABVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAABYm1pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAASJzdGJsAAAAvnN0c2QAAAAAAAAAAQAAAK5hdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAABAAEABIAAAASAAAAAAAAAABFUxhdmM2MS4xOS4xMDEgbGlieDI2NAAAAAAAAAAAAAAAGP//AAAANGF2Y0MBZAAK/+EAF2dkAAqs2V7ARAAAAwAEAAADAAg8SJZYAQAGaOvjyyLA/fj4AAAAABBwYXNwAAAAAQAAAAEAAAAUYnRydAAAAAAAABZYAAAAAAAAABhzdHRzAAAAAAAAAAEAAAABAABAAAAAABxzdHNjAAAAAAAAAAEAAAABAAAAAQAAAAEAAAAUc3RzegAAAAAAAALLAAAAAQAAABRzdGNvAAAAAAAAAAEAAANEAAAAYXVkdGEAAABZbWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAbWRpcmFwcGwAAAAAAAAAAAAAAAAsaWxzdAAAACSpdG9vAAAAHGRhdGEAAAABAAAAAExhdmY2MS43LjEwMwAAAAhmcmVlAAAC021kYXQAAAKtBgX//6ncRem95tlIt5Ys2CDZI+7veDI2NCAtIGNvcmUgMTY0IHIzMTA4IDMxZTE5ZjkgLSBILjI2NC9NUEVHLTQgQVZDIGNvZGVjIC0gQ29weWxlZnQgMjAwMy0yMDIzIC0gaHR0cDovL3d3dy52aWRlb2xhbi5vcmcveDI2NC5odG1sIC0gb3B0aW9uczogY2FiYWM9MSByZWY9MyBkZWJsb2NrPTE6MDowIGFuYWx5c2U9MHgzOjB4MTEzIG1lPWhleCBzdWJtZT03IHBzeT0xIHBzeV9yZD0xLjAwOjAuMDAgbWl4ZWRfcmVmPTEgbWVfcmFuZ2U9MTYgY2hyb21hX21lPTEgdHJlbGxpcz0xIDh4OGRjdD0xIGNxbT0wIGRlYWR6b25lPTIxLDExIGZhc3RfcHNraXA9MSBjaHJvbWFfcXBfb2Zmc2V0PS0yIHRocmVhZHM9MSBsb29rYWhlYWRfdGhyZWFkcz0xIHNsaWNlZF90aHJlYWRzPTAgbnI9MCBkZWNpbWF0ZT0xIGludGVybGFjZWQ9MCBibHVyYXlfY29tcGF0PTAgY29uc3RyYWluZWRfaW50cmE9MCBiZnJhbWVzPTMgYl9weXJhbWlkPTIgYl9hZGFwdD0xIGJfYmlhcz0wIGRpcmVjdD0xIHdlaWdodGI9MSBvcGVuX2dvcD0wIHdlaWdodHA9MiBrZXlpbnQ9MjUwIGtleWludF9taW49MSBzY2VuZWN1dD00MCBpbnRyYV9yZWZyZXNoPTAgcmNfbG9va2FoZWFkPTQwIHJjPWNyZiBtYnRyZWU9MSBjcmY9MjMuMCBxY29tcD0wLjYwIHFwbWluPTAgcXBtYXg9NjkgcXBzdGVwPTQgaXBfcmF0aW89MS40MCBhcT0xOjEuMDAAgAAAABZliIQAFf/+7M9+BTZo5i/D8UVzjn2B";
 
 fn video_probe_payload(model: &str) -> Value {
@@ -914,6 +919,116 @@ impl AIChatService {
         }
     }
 
+    pub async fn test_model_role(&self, role: ModelRole) -> Result<String, String> {
+        if role == ModelRole::Main {
+            return Err("Main Model is not an addon route".to_string());
+        }
+
+        let route = self.resolve_model_route_unchecked(role).await?;
+        let target = format!("{} / {}", route.provider.name, route.model);
+
+        match role {
+            ModelRole::Vision => {
+                let red_probe = self
+                    .run_capability_probe_request(
+                        &route.provider,
+                        vision_probe_payload(&route.model, RED_PNG_BASE64),
+                    )
+                    .await;
+                let blue_probe = self
+                    .run_capability_probe_request(
+                        &route.provider,
+                        vision_probe_payload(&route.model, BLUE_PNG_BASE64),
+                    )
+                    .await;
+                let red = validate_color_probe(&red_probe, "red");
+                let blue = validate_color_probe(&blue_probe, "blue");
+                match combine_vision_probe_results(red, blue) {
+                    Some(true) => Ok(format!(
+                        "Vision route {target} passed red/blue semantic image samples"
+                    )),
+                    Some(false) => Err(format!(
+                        "Vision route {target} rejected or failed a semantic image sample"
+                    )),
+                    None => Err(format!(
+                        "Vision route {target} was inconclusive: red={:?}, blue={:?}",
+                        red_probe.outcome(red),
+                        blue_probe.outcome(blue)
+                    )),
+                }
+            }
+            ModelRole::Video => {
+                let probe = self
+                    .run_capability_probe_request(
+                        &route.provider,
+                        video_probe_payload(&route.model),
+                    )
+                    .await;
+                let validated = validate_color_probe(&probe, "red");
+                match validated {
+                    Some(true) => Ok(format!(
+                        "Video route {target} passed the bounded red-MP4 semantic sample"
+                    )),
+                    Some(false) => Err(format!(
+                        "Video route {target} rejected or failed the semantic video sample"
+                    )),
+                    None => Err(format!(
+                        "Video route {target} was inconclusive: {:?}",
+                        probe.outcome(validated)
+                    )),
+                }
+            }
+            ModelRole::AudioStt => {
+                if route.route_origin == RouteOrigin::MainModel {
+                    let native = self
+                        .run_audio_input_probe_request(&route.provider, &route.model)
+                        .await;
+                    let native_validated = validate_text_probe(&native);
+                    if native_validated == Some(true) {
+                        return Ok(format!(
+                            "Audio route {target} passed the native Main audio sample"
+                        ));
+                    }
+
+                    let transcription = self
+                        .run_transcription_probe_request(&route.provider, &route.model)
+                        .await;
+                    let transcription_validated = validate_endpoint_acceptance(&transcription);
+                    if transcription_validated == Some(true) {
+                        return Ok(format!(
+                            "Audio route {target} passed the transcription sample"
+                        ));
+                    }
+
+                    Err(format!(
+                        "Audio route {target} was not functionally verified: native={:?}, stt={:?}",
+                        native.outcome(native_validated),
+                        transcription.outcome(transcription_validated)
+                    ))
+                } else {
+                    let transcription = self
+                        .run_transcription_probe_request(&route.provider, &route.model)
+                        .await;
+                    let validated = validate_endpoint_acceptance(&transcription);
+                    if validated == Some(true) {
+                        Ok(format!(
+                            "Audio STT route {target} passed the transcription sample"
+                        ))
+                    } else {
+                        Err(format!(
+                            "Audio STT route {target} was not functionally verified: {:?}",
+                            transcription.outcome(validated)
+                        ))
+                    }
+                }
+            }
+            ModelRole::ImageGeneration => Err(
+                "Image Generation uses the explicit credit-consuming image test path".to_string(),
+            ),
+            ModelRole::Main => unreachable!(),
+        }
+    }
+
     pub async fn probe_image_generation_active_with_observer<F>(
         &self,
         role: ModelRole,
@@ -1012,11 +1127,6 @@ impl AIChatService {
     where
         F: FnMut(ProbeEvent),
     {
-        const RED_PNG: &str =
-            "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAF0lEQVR4nGP8z0AaYCJR/aiGUQ1DSAMAQC4BH2bjRnMAAAAASUVORK5CYII=";
-        const BLUE_PNG: &str =
-            "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAGUlEQVR4nGNkYPjPQApgIkn1qIZRDUNKAwA+MAEfWiW9ygAAAABJRU5ErkJggg==";
-
         observer(ProbeEvent::Progress {
             capability: CapabilityKind::TextChat,
             message: "Checking provider metadata...".to_string(),
@@ -1125,14 +1235,14 @@ impl AIChatService {
             message: "Vision 1/2: identifying red image...".to_string(),
         });
         let red_probe = self
-            .run_capability_probe_request(provider, vision_probe_payload(model, RED_PNG))
+            .run_capability_probe_request(provider, vision_probe_payload(model, RED_PNG_BASE64))
             .await;
         observer(ProbeEvent::Progress {
             capability: CapabilityKind::ImageInput,
             message: "Vision 2/2: identifying blue image...".to_string(),
         });
         let blue_probe = self
-            .run_capability_probe_request(provider, vision_probe_payload(model, BLUE_PNG))
+            .run_capability_probe_request(provider, vision_probe_payload(model, BLUE_PNG_BASE64))
             .await;
         let image = combine_vision_probe_results(
             validate_color_probe(&red_probe, "red"),
@@ -1829,6 +1939,13 @@ mod tests {
             ),
             Some(true)
         );
+    }
+
+    #[test]
+    fn functional_test_roles_keep_image_generation_on_explicit_path() {
+        assert_ne!(ModelRole::Vision, ModelRole::ImageGeneration);
+        assert_ne!(ModelRole::Video, ModelRole::ImageGeneration);
+        assert_ne!(ModelRole::AudioStt, ModelRole::ImageGeneration);
     }
 
     #[test]
