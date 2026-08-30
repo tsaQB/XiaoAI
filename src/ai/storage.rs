@@ -1490,29 +1490,6 @@ impl CapabilityRecord {
         }
     }
 
-    pub fn state_for(&self, capability: CapabilityKind) -> CapabilityState {
-        match capability {
-            CapabilityKind::TextChat => self.supports_text_chat,
-            CapabilityKind::ImageInput => self.supports_image_input,
-            CapabilityKind::ImageGeneration => self.supports_image_generation,
-            CapabilityKind::ImageEditing => self.supports_image_editing,
-            CapabilityKind::AudioInput => self.supports_audio_input,
-            CapabilityKind::AudioTranscription => self.supports_audio_transcription,
-            CapabilityKind::VideoInput => self.supports_video_input,
-            CapabilityKind::NativeFileInput => self.supports_native_file_input,
-            CapabilityKind::Tools => self.supports_tools,
-            CapabilityKind::StructuredOutput => self.supports_structured_output,
-            CapabilityKind::Reasoning => self.supports_reasoning,
-        }
-        .map(|supported| {
-            if supported {
-                CapabilityState::Supported
-            } else {
-                CapabilityState::Unsupported
-            }
-        })
-        .unwrap_or(CapabilityState::Unknown)
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
