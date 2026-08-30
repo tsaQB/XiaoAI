@@ -1965,14 +1965,17 @@ async fn handle_update(
                 let sessions = ai_service.get_sessions(user_id).await;
                 if idx < sessions.len() {
                     if !ai_service.switch_session(user_id, idx).await {
-                        bot.send_message_with_context(
-                            chat_id,
-                            "❌ Gagal mengganti sesi karena state aktif tidak dapat disimpan.",
-                            None,
-                            message_context,
-                        )
-                        .await?;
-                        return Ok(());
+                        let _ = bot
+                            .send_message(
+                                chat_id,
+                                "❌ Gagal mengganti sesi karena state aktif tidak dapat disimpan.",
+                                None,
+                                None,
+                                None,
+                                None,
+                            )
+                            .await;
+                        return;
                     }
                     let target_page = (idx / 5) + 1;
                     send_or_update_session_manager(
