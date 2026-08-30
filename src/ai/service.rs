@@ -222,9 +222,7 @@ fn signal_generation_cancel(sender: Option<GenerationCancelSender>) -> bool {
         .unwrap_or(false)
 }
 
-pub(super) async fn download_generated_image(
-    url: &str,
-) -> Result<Vec<u8>, ImageGenerationError> {
+pub(super) async fn download_generated_image(url: &str) -> Result<Vec<u8>, ImageGenerationError> {
     let parsed = parse_generated_image_url(url)?;
     let host = parsed.host_str().ok_or_else(|| {
         ImageGenerationError::new(
@@ -1143,8 +1141,8 @@ impl AIChatService {
             .iter()
             .map(|message| estimate_stored_content_tokens(&message.content))
             .sum();
-        let mut output_reserve_tokens = max_output_tokens_for_model(&active_model)
-            .min(limit_tokens.saturating_div(2).max(1));
+        let mut output_reserve_tokens =
+            max_output_tokens_for_model(&active_model).min(limit_tokens.saturating_div(2).max(1));
         if let Some(metadata_limit) = self
             .model_metadata
             .read()
