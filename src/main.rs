@@ -15,7 +15,7 @@ use std::env;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
@@ -24,7 +24,7 @@ use ai::AIChatService;
 use bot::client::{TelegramBotClient, TelegramDeliveryContext};
 use bot::models::{
     BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputRichMessage, ReplyKeyboardMarkup,
-    RichBlock, RichBlockTableCell, RichMessageButton, Update,
+    RichBlock, RichBlockListItem, RichBlockTableCell, RichMessageButton, Update,
 };
 use parser::build_full_rich_message;
 use timeline::{ExecutionTimeline, ProgressActivity};
@@ -156,76 +156,6 @@ fn get_main_menu_keyboard() -> Value {
 
 fn get_collapsed_menu_keyboard() -> Value {
     get_main_menu_keyboard()
-}
-
-fn build_session_manager_inline_keyboard(
-    sessions: &[ai::service::ChatSession],
-    active_idx: usize,
-    page: usize,
-    page_size: usize,
-) -> InlineKeyboardMarkup {
-    let sessions_len = sessions.len();
-    let total_pages = 1.max(sessions_len.div_ceil(page_size));
-    let curr_page = 1.max(page.min(total_pages));
-
-    let start_idx = (curr_page - 1) * page_size;
-    let end_idx = (start_idx + page_size).min(sessions_len);
-
-    let mut row_numbers = Vec::new();
-    for i in start_idx..end_idx {
-        let label = if i == active_idx {
-            format!("✅ {}", i + 1)
-        } else {
-            format!("{}", i + 1)
-        };
-        if let Some(session) = sessions.get(i) {
-            row_numbers.push(InlineKeyboardButton::callback(
-                label,
-                format!("session_select_id:{}", session.id),
-            ));
-        }
-    }
-
-    let mut rows = Vec::new();
-    if !row_numbers.is_empty() {
-        rows.push(row_numbers);
-    }
-
-    if total_pages > 1 {
-        let previous_page = curr_page.saturating_sub(1);
-        let next_page = (curr_page + 1).min(total_pages);
-        let previous_button = if curr_page > 1 {
-            InlineKeyboardButton::callback("‹", format!("session_page:{previous_page}"))
-        } else {
-            InlineKeyboardButton::disabled("‹")
-        };
-        let next_button = if curr_page < total_pages {
-            InlineKeyboardButton::callback("›", format!("session_page:{next_page}"))
-        } else {
-            InlineKeyboardButton::disabled("›")
-        };
-        rows.push(vec![
-            previous_button,
-            InlineKeyboardButton::disabled(format!("{curr_page}/{total_pages}")),
-            next_button,
-        ]);
-    }
-
-    let active_session_id = sessions
-        .get(active_idx)
-        .map(|session| session.id)
-        .unwrap_or_default();
-    rows.push(vec![
-        InlineKeyboardButton::callback("ᴅᴇʟᴇᴛᴇ", format!("session_remove_id:{active_session_id}")),
-        InlineKeyboardButton::callback("ʀᴇɴᴀᴍᴇ", format!("session_rename_id:{active_session_id}")),
-        InlineKeyboardButton::callback("ɴᴇᴡ", "session_new"),
-    ]);
-    rows.push(vec![InlineKeyboardButton::callback(
-        "ᴄʟᴏꜱᴇ",
-        "session_close",
-    )]);
-
-    InlineKeyboardMarkup::new(rows)
 }
 
 // ==========================================
@@ -494,62 +424,69 @@ async fn build_session_manager_ui(
     let total_sessions = sessions.len();
     let total_pages = 1.max(total_sessions.div_ceil(page_size));
     let curr_page = 1.max(page.min(total_pages));
-
     let start_idx = (curr_page - 1) * page_size;
     let end_idx = (start_idx + page_size).min(total_sessions);
     let page_sessions = &sessions[start_idx..end_idx];
 
-    let header_row = vec![
-        RichBlockTableCell::text_only("No", true, Some("center")),
-        RichBlockTableCell::text_only("Session name", true, Some("left")),
-        RichBlockTableCell::text_only("Messages", true, Some("center")),
-        RichBlockTableCell::text_only("Last", true, Some("left")),
-    ];
-
-    let mut table_rows = vec![header_row];
-    for (i, session) in page_sessions.iter().enumerate() {
-        let global_idx = start_idx + i;
+    let mut table_rows = vec![vec![
+        RichBlockTableCell::text_only("#", true, Some("center")),
+        RichBlockTableCell::text_only("Session", true, Some("left")),
+        RichBlockTableCell::text_only("Status", true, Some("left")),
+    ]];
+    let mut session_buttons = Vec::new();
+    for (offset, session) in page_sessions.iter().enumerate() {
+        let global_idx = start_idx + offset;
         let name = if session.name.trim().is_empty() {
             format!("Session {}", global_idx + 1)
         } else {
             session.name.trim().to_string()
         };
-        let number = if global_idx == active_idx {
-            format!("✅ {}", global_idx + 1)
+        let is_active = global_idx == active_idx;
+        let status = if is_active {
+            format!("Active · {} msgs", session.messages.len())
         } else {
-            (global_idx + 1).to_string()
+            format!("{} msgs · {}", session.messages.len(), session_last_activity(session))
         };
-        let message_count = session.messages.len() / 2;
-        let last_activity = session_last_activity(session);
-
         table_rows.push(vec![
-            RichBlockTableCell::text_only(&number, false, Some("center")),
-            RichBlockTableCell::text_only(&truncate_session_name(&name, 20), false, Some("left")),
-            RichBlockTableCell::text_only(&message_count.to_string(), false, Some("center")),
-            RichBlockTableCell::text_only(&last_activity, false, Some("left")),
+            RichBlockTableCell::text_only(&(global_idx + 1).to_string(), false, Some("center")),
+            RichBlockTableCell::text_only(
+                &truncate_session_name(&name, 28),
+                false,
+                Some("left"),
+            ),
+            RichBlockTableCell::text_only(&status, false, Some("left")),
         ]);
+        session_buttons.push(if is_active {
+            RichMessageButton::callback_styled(
+                format!("✓ {}", global_idx + 1),
+                format!("session_select_id:{}", session.id),
+                "primary",
+            )
+        } else {
+            RichMessageButton::callback(
+                (global_idx + 1).to_string(),
+                format!("session_select_id:{}", session.id),
+            )
+        });
     }
 
-    let active_name = sessions
+    let active_session_id = sessions
         .get(active_idx)
-        .map(|session| {
-            if session.name.trim().is_empty() {
-                format!("Session {}", active_idx + 1)
-            } else {
-                session.name.trim().to_string()
-            }
-        })
-        .unwrap_or_else(|| "-".to_string());
-    let subtitle = format!("Active: {}", truncate_session_name(&active_name, 36));
-    let pagination = format!("{curr_page}/{total_pages}");
-
-    InputRichMessage::new(vec![
+        .map(|session| session.id)
+        .unwrap_or_default();
+    let mut blocks = vec![
         RichBlock::SectionHeading {
             text: Value::String("SESSIONS".to_string()),
             level: 1,
         },
         RichBlock::Paragraph {
-            text: Value::String(subtitle),
+            text: Value::String(format!(
+                "Active: {}",
+                sessions
+                    .get(active_idx)
+                    .map(|session| truncate_session_name(&session.name, 36))
+                    .unwrap_or_else(|| "-".to_string())
+            )),
         },
         RichBlock::Table {
             cells: table_rows,
@@ -559,10 +496,54 @@ async fn build_session_manager_ui(
             is_compact: true,
             caption: None,
         },
-        RichBlock::Paragraph {
-            text: Value::String(pagination),
-        },
-    ])
+    ];
+    if !session_buttons.is_empty() {
+        blocks.push(RichBlock::Buttons {
+            buttons: session_buttons,
+            align: Some("center".to_string()),
+        });
+    }
+    if total_pages > 1 {
+        blocks.push(RichBlock::Buttons {
+            buttons: vec![
+                if curr_page > 1 {
+                    RichMessageButton::callback("‹", format!("session_page:{}", curr_page - 1))
+                } else {
+                    RichMessageButton::disabled("‹")
+                },
+                RichMessageButton::disabled(format!("{curr_page}/{total_pages}")),
+                if curr_page < total_pages {
+                    RichMessageButton::callback("›", format!("session_page:{}", curr_page + 1))
+                } else {
+                    RichMessageButton::disabled("›")
+                },
+            ],
+            align: Some("center".to_string()),
+        });
+    }
+    blocks.push(RichBlock::Buttons {
+        buttons: vec![
+            RichMessageButton::callback_styled("New", "session_new", "primary"),
+            RichMessageButton::callback(
+                "Rename Active",
+                format!("session_rename_id:{active_session_id}"),
+            ),
+            RichMessageButton::callback_styled(
+                "Delete Active",
+                format!("session_remove_id:{active_session_id}"),
+                "danger",
+            ),
+        ],
+        align: Some("center".to_string()),
+    });
+    blocks.push(RichBlock::Buttons {
+        buttons: vec![
+            RichMessageButton::callback("Context", "open_context"),
+            RichMessageButton::callback("Close", "session_close"),
+        ],
+        align: Some("center".to_string()),
+    });
+    InputRichMessage::new(blocks)
 }
 
 async fn send_or_update_session_manager(
@@ -573,16 +554,11 @@ async fn send_or_update_session_manager(
     message_id: Option<i64>,
     page: usize,
 ) {
-    let sessions = ai_service.get_sessions(user_id).await;
-    let active_idx = ai_service.get_active_session_index(user_id).await;
-
     let rich_msg = build_session_manager_ui(ai_service, user_id, page, 5).await;
-    let inline_kb = build_session_manager_inline_keyboard(&sessions, active_idx, page, 5);
-    let kb_val = serde_json::to_value(inline_kb).ok();
 
     if let Some(mid) = message_id {
         if bot
-            .edit_rich_message(chat_id, mid, &rich_msg, kb_val.clone())
+            .edit_rich_message(chat_id, mid, &rich_msg, None)
             .await
             .is_ok()
         {
@@ -595,14 +571,12 @@ async fn send_or_update_session_manager(
         }
     }
 
-    let res = bot
-        .send_rich_message(chat_id, &rich_msg, kb_val, None)
-        .await;
+    let res = bot.send_rich_message(chat_id, &rich_msg, None, None).await;
     if let Ok(val) = res {
         if let Some(new_id) = val
             .get("result")
-            .and_then(|r| r.get("message_id"))
-            .and_then(|m| m.as_i64())
+            .and_then(|result| result.get("message_id"))
+            .and_then(Value::as_i64)
         {
             ai_service
                 .user_session_msg_id
@@ -618,12 +592,32 @@ async fn build_start_menu_ui(ai_service: &AIChatService, user_id: i64) -> InputR
         .resolve_model_route_unchecked(ai::service::ModelRole::Main)
         .await
         .ok();
+    let stats = ai_service.get_context_stats(user_id).await;
     let routing = ai_service.model_routing_config().await;
     let providers = ai_service.get_user_providers(user_id).await;
-    let main_text = main
+
+    let main_model = main
         .as_ref()
-        .map(|route| format!("{} / {}", route.provider.name, route.model))
+        .map(|route| route.model.clone())
         .unwrap_or_else(|| "Not configured".to_string());
+    let provider_name = main
+        .as_ref()
+        .map(|route| route.provider.name.clone())
+        .unwrap_or_else(|| "Not configured".to_string());
+    let session_name = if stats.session_name.trim().is_empty() {
+        format!("#{}", stats.session_id)
+    } else {
+        format!(
+            "#{} · {}",
+            stats.session_id,
+            truncate_session_name(&stats.session_name, 28)
+        )
+    };
+    let context = format!(
+        "~{} / ~{} tokens ({:.1}%)",
+        stats.total_tokens, stats.limit_tokens, stats.usage_pct
+    );
+
     let addon_summary = ai::service::ModelRole::addon_roles()
         .into_iter()
         .map(|role| {
@@ -640,7 +634,7 @@ async fn build_start_menu_ui(ai_service: &AIChatService, user_id: i64) -> InputR
                         .find(|provider| provider.id == provider_id)
                         .map(|provider| provider.name.as_str())
                         .unwrap_or(provider_id.as_str());
-                    format!("{} / {}", name, model)
+                    format!("{name} / {model}")
                 }
             };
             format!("{}: {}", role.display_name(), value)
@@ -659,20 +653,24 @@ async fn build_start_menu_ui(ai_service: &AIChatService, user_id: i64) -> InputR
         RichBlock::Table {
             cells: vec![
                 vec![
-                    RichBlockTableCell::text_only("Main Model", true, Some("left")),
-                    RichBlockTableCell::text_only("Status", true, Some("left")),
+                    RichBlockTableCell::text_only("Item", true, Some("left")),
+                    RichBlockTableCell::text_only("Current", true, Some("left")),
                 ],
                 vec![
-                    RichBlockTableCell::text_only(&main_text, false, Some("left")),
-                    RichBlockTableCell::text_only(
-                        if main.is_some() {
-                            "Configured"
-                        } else {
-                            "Setup required"
-                        },
-                        false,
-                        Some("left"),
-                    ),
+                    RichBlockTableCell::text_only("Main Model", false, Some("left")),
+                    RichBlockTableCell::text_only(&main_model, false, Some("left")),
+                ],
+                vec![
+                    RichBlockTableCell::text_only("Provider", false, Some("left")),
+                    RichBlockTableCell::text_only(&provider_name, false, Some("left")),
+                ],
+                vec![
+                    RichBlockTableCell::text_only("Session", false, Some("left")),
+                    RichBlockTableCell::text_only(&session_name, false, Some("left")),
+                ],
+                vec![
+                    RichBlockTableCell::text_only("Context", false, Some("left")),
+                    RichBlockTableCell::text_only(&context, false, Some("left")),
                 ],
             ],
             has_header: true,
@@ -686,39 +684,63 @@ async fn build_start_menu_ui(ai_service: &AIChatService, user_id: i64) -> InputR
             blocks: vec![json!({"type":"paragraph","text": addon_summary})],
             is_open: Some(false),
         },
-        RichBlock::BlockQuotation {
-            blocks: vec![
-                json!({"type":"paragraph","text":"Send a message, image, document, video, or voice note. Addon routing is configured from CLI only."}),
+        RichBlock::Buttons {
+            buttons: vec![
+                RichMessageButton::callback_styled("New Chat", "session_new", "primary"),
+                RichMessageButton::callback("Model", "model_dashboard"),
+                RichMessageButton::callback("Session", "open_session"),
+                RichMessageButton::callback("Context", "open_context"),
             ],
+            align: Some("center".to_string()),
         },
         RichBlock::Buttons {
             buttons: vec![
-                RichMessageButton::callback_styled("Sessions", "open_session", "primary"),
-                RichMessageButton::callback("Model", "model_dashboard"),
-                RichMessageButton::callback("Context", "open_context"),
-                RichMessageButton::callback("Image", "img_new"),
+                RichMessageButton::callback("Generate Image", "img_new"),
+                RichMessageButton::callback("Help", "action_help"),
             ],
             align: Some("center".to_string()),
         },
         RichBlock::Paragraph {
-            text: Value::String("Use /help for commands.".to_string()),
+            text: Value::String(
+                "Provider and addon routing are administered from CLI; Telegram edits Main Model only."
+                    .to_string(),
+            ),
         },
     ])
 }
 
 fn build_help_ui() -> InputRichMessage {
+    let input_items = vec![
+        RichBlockListItem::bullet(vec![json!({"type":"paragraph","text":"Text — ordinary chat and instructions."})]),
+        RichBlockListItem::bullet(vec![json!({"type":"paragraph","text":"Images — routed through the verified Vision role."})]),
+        RichBlockListItem::bullet(vec![json!({"type":"paragraph","text":"Documents — local extraction; scanned PDF pages route through Vision."})]),
+        RichBlockListItem::bullet(vec![json!({"type":"paragraph","text":"Voice/audio — native Main audio or the configured Audio STT role."})]),
+        RichBlockListItem::bullet(vec![json!({"type":"paragraph","text":"Video — direct Main or the configured Video specialist when verified."})]),
+    ];
     let command_rows = vec![
         vec![
             RichBlockTableCell::text_only("Command", true, Some("left")),
             RichBlockTableCell::text_only("Action", true, Some("left")),
         ],
         vec![
+            RichBlockTableCell::text_only("/menu", false, Some("left")),
+            RichBlockTableCell::text_only("Open main menu", false, Some("left")),
+        ],
+        vec![
+            RichBlockTableCell::text_only("/new", false, Some("left")),
+            RichBlockTableCell::text_only("Create a new session", false, Some("left")),
+        ],
+        vec![
             RichBlockTableCell::text_only("/session", false, Some("left")),
             RichBlockTableCell::text_only("Manage sessions", false, Some("left")),
         ],
         vec![
+            RichBlockTableCell::text_only("/clear", false, Some("left")),
+            RichBlockTableCell::text_only("Reset active history", false, Some("left")),
+        ],
+        vec![
             RichBlockTableCell::text_only("/model", false, Some("left")),
-            RichBlockTableCell::text_only("Main Model dashboard", false, Some("left")),
+            RichBlockTableCell::text_only("Main Model dashboard/search", false, Some("left")),
         ],
         vec![
             RichBlockTableCell::text_only("/context", false, Some("left")),
@@ -729,12 +751,8 @@ fn build_help_ui() -> InputRichMessage {
             RichBlockTableCell::text_only("Generate an image", false, Some("left")),
         ],
         vec![
-            RichBlockTableCell::text_only("/clear", false, Some("left")),
-            RichBlockTableCell::text_only("Reset active history", false, Some("left")),
-        ],
-        vec![
-            RichBlockTableCell::text_only("/cancel", false, Some("left")),
-            RichBlockTableCell::text_only("Cancel current action", false, Some("left")),
+            RichBlockTableCell::text_only("/help", false, Some("left")),
+            RichBlockTableCell::text_only("Show this help", false, Some("left")),
         ],
     ];
     InputRichMessage::new(vec![
@@ -743,10 +761,9 @@ fn build_help_ui() -> InputRichMessage {
             level: 1,
         },
         RichBlock::Paragraph {
-            text: Value::String(
-                "/start and /menu open the main menu. /new creates a new session.".to_string(),
-            ),
+            text: Value::String("Supported input".to_string()),
         },
+        RichBlock::List { items: input_items },
         RichBlock::Table {
             cells: command_rows,
             has_header: true,
@@ -757,17 +774,22 @@ fn build_help_ui() -> InputRichMessage {
         },
         RichBlock::Details {
             summary: Value::String("Model Routing".to_string()),
-            blocks: vec![
-                json!({"type":"paragraph","text":"Telegram can change Main Model. Vision, Video, Audio STT, and Image Generation routes are read-only here and are configured with `xiao model addon ...` in CLI."}),
-            ],
+            blocks: vec![json!({
+                "type":"paragraph",
+                "text":"Telegram can change Main Model. Vision, Video, Audio STT, and Image Generation routes are read-only here."
+            })],
             is_open: Some(false),
         },
         RichBlock::Details {
             summary: Value::String("Media Routing".to_string()),
-            blocks: vec![
-                json!({"type":"paragraph","text":"When an addon resolves to Main Model and Main is verified compatible, Xiao sends media directly to Main. A different specialist receives only the minimum current context and returns a bounded observation/transcript to Main."}),
-            ],
+            blocks: vec![json!({
+                "type":"paragraph",
+                "text":"Main-compatible media executes directly on Main. A different specialist receives only the minimum current context and returns a bounded observation/transcript to Main."
+            })],
             is_open: Some(false),
+        },
+        RichBlock::Paragraph {
+            text: Value::String("Advanced routing configuration: xiao model addon".to_string()),
         },
         RichBlock::Buttons {
             buttons: vec![RichMessageButton::callback("Menu", "action_menu")],
@@ -917,16 +939,13 @@ async fn run_observable_main_capability_probe(
 async fn build_model_dashboard_ui(ai_service: &AIChatService, user_id: i64) -> InputRichMessage {
     let providers = ai_service.get_user_providers(user_id).await;
     let routing = ai_service.model_routing_config().await;
+    let stats = ai_service.get_context_stats(user_id).await;
     let main = ai_service
         .resolve_model_route_unchecked(ai::service::ModelRole::Main)
         .await
         .ok();
-    let mut rows = vec![vec![
-        RichBlockTableCell::text_only("Role", true, Some("left")),
-        RichBlockTableCell::text_only("Route", true, Some("left")),
-        RichBlockTableCell::text_only("Health", true, Some("left")),
-    ]];
-    if let Some(main_route) = &main {
+
+    let (provider_name, model_name, health, capability_detail) = if let Some(route) = &main {
         let health = if ai_service
             .resolve_model_route(ai::service::ModelRole::Main)
             .await
@@ -936,16 +955,45 @@ async fn build_model_dashboard_ui(ai_service: &AIChatService, user_id: i64) -> I
         } else {
             "Unavailable"
         };
-        rows.push(vec![
-            RichBlockTableCell::text_only("Main", false, Some("left")),
-            RichBlockTableCell::text_only(
-                &format!("{} / {}", main_route.provider.name, main_route.model),
-                false,
-                Some("left"),
+        let cap = &route.capability;
+        let effective = |kind| {
+            format!(
+                "{:?}",
+                AIChatService::effective_capability_state(cap, kind)
+            )
+        };
+        (
+            route.provider.name.clone(),
+            route.model.clone(),
+            health.to_string(),
+            format!(
+                "Text Chat: {}\nImage Input: {}\nImage Generation: {}\nImage Editing: {}\nAudio Input: {}\nAudio Transcription: {}\nVideo Input: {}\nNative File: {}\nTools: {}\nStructured Output: {}\nReasoning: {}",
+                effective(ai::service::CapabilityKind::TextChat),
+                effective(ai::service::CapabilityKind::ImageInput),
+                effective(ai::service::CapabilityKind::ImageGeneration),
+                effective(ai::service::CapabilityKind::ImageEditing),
+                effective(ai::service::CapabilityKind::AudioInput),
+                effective(ai::service::CapabilityKind::AudioTranscription),
+                effective(ai::service::CapabilityKind::VideoInput),
+                effective(ai::service::CapabilityKind::NativeFileInput),
+                effective(ai::service::CapabilityKind::Tools),
+                effective(ai::service::CapabilityKind::StructuredOutput),
+                effective(ai::service::CapabilityKind::Reasoning),
             ),
-            RichBlockTableCell::text_only(health, false, Some("left")),
-        ]);
-    }
+        )
+    } else {
+        (
+            "Not configured".to_string(),
+            "Not configured".to_string(),
+            "Unavailable".to_string(),
+            "Main Model is not configured.".to_string(),
+        )
+    };
+
+    let mut addon_rows = vec![vec![
+        RichBlockTableCell::text_only("Addon Role", true, Some("left")),
+        RichBlockTableCell::text_only("Route", true, Some("left")),
+    ]];
     for role in ai::service::ModelRole::addon_roles() {
         let route = routing
             .route(role)
@@ -960,53 +1008,64 @@ async fn build_model_dashboard_ui(ai_service: &AIChatService, user_id: i64) -> I
                     .find(|provider| provider.id == provider_id)
                     .map(|provider| provider.name.as_str())
                     .unwrap_or(provider_id.as_str());
-                format!("{} / {}", name, model)
+                format!("{name} / {model}")
             }
         };
-        let health = match ai_service.resolve_model_route(role).await {
-            Ok(_) => "Verified".to_string(),
-            Err(error) if error.contains("Disabled") => "Disabled".to_string(),
-            Err(_) => "Unavailable".to_string(),
+        let route_health = match ai_service.resolve_model_route(role).await {
+            Ok(_) => "Verified",
+            Err(error) if error.contains("Disabled") => "Disabled",
+            Err(_) => "Unavailable",
         };
-        rows.push(vec![
+        addon_rows.push(vec![
             RichBlockTableCell::text_only(
                 role.display_name().trim_end_matches(" Model"),
                 false,
                 Some("left"),
             ),
-            RichBlockTableCell::text_only(&route_text, false, Some("left")),
-            RichBlockTableCell::text_only(&health, false, Some("left")),
+            RichBlockTableCell::text_only(
+                &format!("{route_text} · {route_health}"),
+                false,
+                Some("left"),
+            ),
         ]);
     }
-    let capability_detail = main.as_ref().map(|route| {
-        let cap = &route.capability;
-        format!(
-            "Text Chat: {:?}\nImage Input: {:?}\nImage Generation: {:?}\nAudio Input: {:?}\nAudio Transcription: {:?}\nVideo Input: {:?}\nNative File: {:?}\nTools: {:?}\nStructured Output: {:?}\nReasoning: {:?}",
-            cap.state_for(ai::service::CapabilityKind::TextChat),
-            cap.state_for(ai::service::CapabilityKind::ImageInput),
-            cap.state_for(ai::service::CapabilityKind::ImageGeneration),
-            cap.state_for(ai::service::CapabilityKind::AudioInput),
-            cap.state_for(ai::service::CapabilityKind::AudioTranscription),
-            cap.state_for(ai::service::CapabilityKind::VideoInput),
-            cap.state_for(ai::service::CapabilityKind::NativeFileInput),
-            cap.state_for(ai::service::CapabilityKind::Tools),
-            cap.state_for(ai::service::CapabilityKind::StructuredOutput),
-            cap.state_for(ai::service::CapabilityKind::Reasoning),
-        )
-    }).unwrap_or_else(|| "Main Model is not configured.".to_string());
+
     InputRichMessage::new(vec![
         RichBlock::SectionHeading {
-            text: Value::String("MODEL ROUTING".to_string()),
+            text: Value::String("MODEL".to_string()),
             level: 1,
         },
-        RichBlock::Paragraph {
-            text: Value::String(
-                "Telegram can change Main Model only. Addon routes are read-only in v0.3.0."
-                    .to_string(),
-            ),
+        RichBlock::Table {
+            cells: vec![
+                vec![
+                    RichBlockTableCell::text_only("Main Model", true, Some("left")),
+                    RichBlockTableCell::text_only("Value", true, Some("left")),
+                ],
+                vec![
+                    RichBlockTableCell::text_only("Provider", false, Some("left")),
+                    RichBlockTableCell::text_only(&provider_name, false, Some("left")),
+                ],
+                vec![
+                    RichBlockTableCell::text_only("Model", false, Some("left")),
+                    RichBlockTableCell::text_only(&model_name, false, Some("left")),
+                ],
+                vec![
+                    RichBlockTableCell::text_only("Context", false, Some("left")),
+                    RichBlockTableCell::text_only(&stats.limit_str, false, Some("left")),
+                ],
+                vec![
+                    RichBlockTableCell::text_only("Status", false, Some("left")),
+                    RichBlockTableCell::text_only(&health, false, Some("left")),
+                ],
+            ],
+            has_header: true,
+            is_bordered: true,
+            is_striped: true,
+            is_compact: true,
+            caption: None,
         },
         RichBlock::Table {
-            cells: rows,
+            cells: addon_rows,
             has_header: true,
             is_bordered: true,
             is_striped: true,
@@ -1018,20 +1077,17 @@ async fn build_model_dashboard_ui(ai_service: &AIChatService, user_id: i64) -> I
             blocks: vec![json!({"type":"paragraph","text": capability_detail})],
             is_open: Some(false),
         },
+        RichBlock::BlockQuotation {
+            blocks: vec![json!({
+                "type":"paragraph",
+                "text":"Addon routes are read-only in Telegram v0.3.0. Configure them with xiao model addon; changing Main never overwrites Specific routes."
+            })],
+        },
         RichBlock::Buttons {
-            buttons: {
-                let mut buttons = Vec::new();
-                if telegram_can_edit_model_role(ai::service::ModelRole::Main) {
-                    buttons.push(RichMessageButton::callback_styled(
-                        "Change Main",
-                        "model_change_main",
-                        "primary",
-                    ));
-                }
-                buttons.push(RichMessageButton::callback("Refresh", "model_dashboard"));
-                buttons.push(RichMessageButton::callback("Close", "provider_close"));
-                buttons
-            },
+            buttons: vec![
+                RichMessageButton::callback_styled("Change Main", "model_change_main", "primary"),
+                RichMessageButton::callback("Refresh", "model_dashboard"),
+            ],
             align: Some("center".to_string()),
         },
     ])
@@ -1041,62 +1097,73 @@ async fn build_main_model_picker_rich(
     ai_service: &AIChatService,
     user_id: i64,
     query: Option<&str>,
+    page: usize,
 ) -> InputRichMessage {
     let providers = ai_service.get_user_providers(user_id).await;
     let q = query.unwrap_or("").trim().to_ascii_lowercase();
+    let mut matches = Vec::new();
+    for provider in &providers {
+        for (index, model) in provider.models.iter().enumerate() {
+            if q.is_empty()
+                || model.to_ascii_lowercase().contains(&q)
+                || provider.name.to_ascii_lowercase().contains(&q)
+            {
+                matches.push((
+                    provider.id.clone(),
+                    provider.name.clone(),
+                    index,
+                    model.clone(),
+                ));
+            }
+        }
+    }
+
+    let page_size = 8usize;
+    let total_pages = 1.max(matches.len().div_ceil(page_size));
+    let curr_page = page.clamp(1, total_pages);
+    let start = (curr_page - 1) * page_size;
+    let end = (start + page_size).min(matches.len());
+
     let mut rows = vec![vec![
         RichBlockTableCell::text_only("Model", true, Some("left")),
         RichBlockTableCell::text_only("Provider", true, Some("left")),
     ]];
     let mut buttons = Vec::new();
-    for provider in &providers {
-        for (index, model) in provider.models.iter().enumerate() {
-            if !q.is_empty()
-                && !model.to_ascii_lowercase().contains(&q)
-                && !provider.name.to_ascii_lowercase().contains(&q)
-            {
-                continue;
-            }
-            if buttons.len() >= 8 {
-                break;
-            }
-            rows.push(vec![
-                RichBlockTableCell::text_only(
-                    &truncate_chars_with_ellipsis(model, 28),
-                    false,
-                    Some("left"),
-                ),
-                RichBlockTableCell::text_only(
-                    &truncate_chars_with_ellipsis(&provider.name, 20),
-                    false,
-                    Some("left"),
-                ),
-            ]);
-            buttons.push(RichMessageButton::callback(
-                truncate_chars_with_ellipsis(model, 24),
-                format!("set_m:{}:{}", provider.id, index),
-            ));
-        }
-        if buttons.len() >= 8 {
-            break;
-        }
+    for (provider_id, provider_name, model_index, model) in &matches[start..end] {
+        rows.push(vec![
+            RichBlockTableCell::text_only(
+                &truncate_chars_with_ellipsis(model, 28),
+                false,
+                Some("left"),
+            ),
+            RichBlockTableCell::text_only(
+                &truncate_chars_with_ellipsis(provider_name, 20),
+                false,
+                Some("left"),
+            ),
+        ]);
+        buttons.push(RichMessageButton::callback(
+            truncate_chars_with_ellipsis(model, 24),
+            format!("set_m:{provider_id}:{model_index}"),
+        ));
     }
-    if rows.len() == 1 {
+    if matches.is_empty() {
         rows.push(vec![
             RichBlockTableCell::text_only("No matching model", false, Some("left")),
             RichBlockTableCell::text_only("-", false, Some("left")),
         ]);
     }
-    InputRichMessage::new(vec![
+
+    let mut blocks = vec![
         RichBlock::SectionHeading {
             text: Value::String("CHANGE MAIN MODEL".to_string()),
             level: 1,
         },
         RichBlock::Paragraph {
             text: Value::String(if q.is_empty() {
-                "Choose one of the first matching models. Use /model <query> to filter.".to_string()
+                format!("Available Main models · page {curr_page}/{total_pages}")
             } else {
-                format!("Filter: {}", q)
+                format!("Filter: {q} · page {curr_page}/{total_pages}")
             }),
         },
         RichBlock::Table {
@@ -1107,15 +1174,42 @@ async fn build_main_model_picker_rich(
             is_compact: true,
             caption: None,
         },
-        RichBlock::Buttons {
+    ];
+    if !buttons.is_empty() {
+        blocks.push(RichBlock::Buttons {
             buttons,
             align: Some("center".to_string()),
-        },
-        RichBlock::Buttons {
-            buttons: vec![RichMessageButton::callback("Back", "model_dashboard")],
+        });
+    }
+    if total_pages > 1 {
+        blocks.push(RichBlock::Buttons {
+            buttons: vec![
+                if curr_page > 1 {
+                    RichMessageButton::callback(
+                        "‹",
+                        format!("model_main_page:{}", curr_page - 1),
+                    )
+                } else {
+                    RichMessageButton::disabled("‹")
+                },
+                RichMessageButton::disabled(format!("{curr_page}/{total_pages}")),
+                if curr_page < total_pages {
+                    RichMessageButton::callback(
+                        "›",
+                        format!("model_main_page:{}", curr_page + 1),
+                    )
+                } else {
+                    RichMessageButton::disabled("›")
+                },
+            ],
             align: Some("center".to_string()),
-        },
-    ])
+        });
+    }
+    blocks.push(RichBlock::Buttons {
+        buttons: vec![RichMessageButton::callback("Back", "model_dashboard")],
+        align: Some("center".to_string()),
+    });
+    InputRichMessage::new(blocks)
 }
 
 async fn send_model_dashboard(
@@ -1169,17 +1263,19 @@ async fn build_context_monitor_ui(ai_service: &AIChatService, user_id: i64) -> I
         .as_ref()
         .map(|route| format!("{} / {}", route.provider.name, route.model))
         .unwrap_or_else(|| stats.model_name.clone());
+
     let used = stats.total_tokens;
     let limit = stats.limit_tokens.max(1);
+    let available = limit.saturating_sub(used);
     let progress = format!(
-        "{}  ~{:.1}%  ~{} / ~{} tokens  •  {} messages",
-        stats.progress_bar, stats.usage_pct, used, limit, stats.total_messages
+        "{}  ~{:.1}%  ~{} / ~{} tokens",
+        stats.progress_bar, stats.usage_pct, used, limit
     );
 
     let mut specialist_lines = Vec::new();
+    let mut cross_provider = Vec::new();
     for role in ai::service::ModelRole::addon_roles() {
-        let resolved = ai_service.resolve_model_route_unchecked(role).await;
-        match resolved {
+        match ai_service.resolve_model_route_unchecked(role).await {
             Ok(route) => {
                 let relationship = specialist_context_policy(role, route.route_origin);
                 specialist_lines.push(format!(
@@ -1189,6 +1285,15 @@ async fn build_context_monitor_ui(ai_service: &AIChatService, user_id: i64) -> I
                     route.model,
                     relationship
                 ));
+                if route.route_origin == ai::service::RouteOrigin::Specific {
+                    cross_provider.push(format!(
+                        "{} -> {} / {}: {}",
+                        role.display_name(),
+                        route.provider.name,
+                        route.model,
+                        relationship
+                    ));
+                }
             }
             Err(error) => specialist_lines.push(format!("{}: {}", role.display_name(), error)),
         }
@@ -1200,18 +1305,55 @@ async fn build_context_monitor_ui(ai_service: &AIChatService, user_id: i64) -> I
             level: 1,
         },
         RichBlock::Paragraph {
-            text: Value::String("Main Model owns canonical conversation history.".to_string()),
+            text: Value::String(format!(
+                "Session #{} · {}\nMain Model: {}",
+                stats.session_id,
+                truncate_session_name(&stats.session_name, 36),
+                main_name
+            )),
         },
         RichBlock::Table {
             cells: vec![
                 vec![
-                    RichBlockTableCell::text_only("Main Model", true, Some("left")),
-                    RichBlockTableCell::text_only("Canonical Context", true, Some("left")),
+                    RichBlockTableCell::text_only("Canonical Main", true, Some("left")),
+                    RichBlockTableCell::text_only("Value", true, Some("left")),
                 ],
                 vec![
-                    RichBlockTableCell::text_only(&main_name, false, Some("left")),
+                    RichBlockTableCell::text_only("Messages", false, Some("left")),
                     RichBlockTableCell::text_only(
-                        &format!("~{} / ~{} tokens", used, limit),
+                        &stats.total_messages.to_string(),
+                        false,
+                        Some("left"),
+                    ),
+                ],
+                vec![
+                    RichBlockTableCell::text_only("Attachments", false, Some("left")),
+                    RichBlockTableCell::text_only(
+                        &stats.attachment_count.to_string(),
+                        false,
+                        Some("left"),
+                    ),
+                ],
+                vec![
+                    RichBlockTableCell::text_only("Used", false, Some("left")),
+                    RichBlockTableCell::text_only(
+                        &format!("~{used} tokens"),
+                        false,
+                        Some("left"),
+                    ),
+                ],
+                vec![
+                    RichBlockTableCell::text_only("Available", false, Some("left")),
+                    RichBlockTableCell::text_only(
+                        &format!("~{available} tokens"),
+                        false,
+                        Some("left"),
+                    ),
+                ],
+                vec![
+                    RichBlockTableCell::text_only("Output Reserve", false, Some("left")),
+                    RichBlockTableCell::text_only(
+                        &format!("~{} tokens", stats.output_reserve_tokens),
                         false,
                         Some("left"),
                     ),
@@ -1228,18 +1370,37 @@ async fn build_context_monitor_ui(ai_service: &AIChatService, user_id: i64) -> I
             language: None,
         },
         RichBlock::BlockQuotation {
-            blocks: vec![
-                json!({"type":"paragraph","text":"Context windows are not added together. A specialist does not create a second canonical history."}),
-            ],
+            blocks: vec![json!({
+                "type":"paragraph",
+                "text":"Context windows are never added together. Main Model owns canonical history; specialist observations/transcripts are transient execution artifacts."
+            })],
         },
         RichBlock::Details {
-            summary: Value::String("Specialist Transient Context".to_string()),
+            summary: Value::String("Specialist Routing".to_string()),
             blocks: vec![json!({"type":"paragraph","text": specialist_lines.join("\n")})],
             is_open: Some(false),
         },
+        RichBlock::Details {
+            summary: Value::String("Cross-provider Context Policy".to_string()),
+            blocks: vec![json!({
+                "type":"paragraph",
+                "text": if cross_provider.is_empty() {
+                    "No Specific cross-provider addon is active. Main Model routes execute directly when verified.".to_string()
+                } else {
+                    cross_provider.join("\n")
+                }
+            })],
+            is_open: Some(false),
+        },
     ];
-    if used > limit {
-        blocks.push(RichBlock::BlockQuotation { blocks: vec![json!({"type":"paragraph","text":"Current canonical history is larger than the usable Main context. Xiao will compact before the next request when necessary; history is not silently deleted."})] });
+
+    if stats.usage_pct >= 80.0 {
+        blocks.push(RichBlock::BlockQuotation {
+            blocks: vec![json!({
+                "type":"paragraph",
+                "text":"Canonical Main context is near/full. Xiao compacts the provider context before the next request when necessary; stored history is not silently deleted."
+            })],
+        });
     }
     blocks.push(RichBlock::Buttons {
         buttons: vec![
