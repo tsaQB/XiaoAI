@@ -24,6 +24,9 @@ use crate::timeline::{ExecutionTimeline, ProgressActivity, ProgressState};
 
 use super::capability::model_metadata_key;
 pub use super::capability::{ModelCapability, ModelMetadata};
+pub use super::routing::{
+    ModelRole, ModelRoute, ModelRoutingConfig, ResolvedModelRoute, RouteOrigin,
+};
 
 use super::storage::{
     append_session_messages_db_async, create_session_and_activate_db_async,
@@ -33,9 +36,10 @@ use super::storage::{
     switch_active_session_db_async,
 };
 pub use super::storage::{
-    load_app_setting, load_capability_registry, load_provider_store, save_app_setting,
-    save_provider_store, CapabilityRecord, CapabilityRegistry, ChatMessage, ChatSession,
-    ProviderConfig, ProviderStore,
+    load_app_setting, load_capability_registry, load_model_routing, load_provider_store,
+    save_app_setting, save_model_routing, save_provider_store, CapabilityKind, CapabilityRecord,
+    CapabilityRegistry, CapabilityState, ChatMessage, ChatSession, EvidenceFreshness, ProbeEvent,
+    ProbeOutcome, ProviderConfig, ProviderStore,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,48 +156,90 @@ fn validate_generated_image_bytes(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-async fn download_generated_image(url: &str) -> Result<Vec<u8>, String> {
-    let parsed = url::Url::parse(url).map_err(|_| "provider returned an invalid image URL")?;
+async fn download_generated_image(url: &str) -> Result<Vec<u8>, ImageGenerationError> {
+    let parsed = url::Url::parse(url).map_err(|_| {
+        ImageGenerationError::new(
+            ImageGenerationErrorKind::UnsafeImageUrl,
+            "provider returned an invalid image URL",
+        )
+    })?;
     if !matches!(parsed.scheme(), "http" | "https") {
-        return Err("provider image URL must use http or https".to_string());
+        return Err(ImageGenerationError::new(
+            ImageGenerationErrorKind::UnsafeImageUrl,
+            "provider image URL must use http or https",
+        ));
     }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| "provider image URL has no host".to_string())?;
-    let port = parsed
-        .port_or_known_default()
-        .ok_or_else(|| "provider image URL has no usable port".to_string())?;
+    let host = parsed.host_str().ok_or_else(|| {
+        ImageGenerationError::new(
+            ImageGenerationErrorKind::UnsafeImageUrl,
+            "provider image URL has no host",
+        )
+    })?;
+    let port = parsed.port_or_known_default().ok_or_else(|| {
+        ImageGenerationError::new(
+            ImageGenerationErrorKind::UnsafeImageUrl,
+            "provider image URL has no usable port",
+        )
+    })?;
 
     let resolved = tokio::net::lookup_host((host, port))
         .await
-        .map_err(|_| "provider image host could not be resolved".to_string())?
+        .map_err(|_| {
+            ImageGenerationError::new(
+                ImageGenerationErrorKind::UnsafeImageUrl,
+                "provider image host could not be resolved",
+            )
+        })?
         .collect::<Vec<_>>();
     if resolved.is_empty() || resolved.iter().any(|addr| is_unsafe_remote_ip(addr.ip())) {
-        return Err("provider image URL resolved to a blocked network address".to_string());
+        return Err(ImageGenerationError::new(
+            ImageGenerationErrorKind::UnsafeImageUrl,
+            "provider image URL resolved to a blocked network address",
+        ));
     }
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .connect_timeout(timeout_from_env("IMAGE_PROVIDER_CONNECT_TIMEOUT_SECS", 10))
+        .timeout(timeout_from_env("IMAGE_DOWNLOAD_TIMEOUT_SECS", 30))
         .redirect(reqwest::redirect::Policy::none())
         .resolve(host, resolved[0])
         .build()
-        .map_err(|_| "failed to build bounded image downloader".to_string())?;
-    let response = client
-        .get(parsed)
-        .send()
-        .await
-        .map_err(|_| "provider image download failed".to_string())?;
+        .map_err(|_| {
+            ImageGenerationError::new(
+                ImageGenerationErrorKind::Provider,
+                "failed to build bounded image downloader",
+            )
+        })?;
+    let response = client.get(parsed).send().await.map_err(|error| {
+        if error.is_timeout() {
+            ImageGenerationError::new(
+                ImageGenerationErrorKind::DownloadTimeout,
+                "provider image download timed out",
+            )
+        } else {
+            ImageGenerationError::new(
+                ImageGenerationErrorKind::Provider,
+                "provider image download failed",
+            )
+        }
+    })?;
     if !response.status().is_success() {
-        return Err(format!(
-            "provider image download returned status {}",
-            response.status().as_u16()
+        return Err(ImageGenerationError::new(
+            ImageGenerationErrorKind::HttpStatus,
+            format!(
+                "provider image download returned status {}",
+                response.status().as_u16()
+            ),
         ));
     }
     if response
         .content_length()
         .is_some_and(|length| length > MAX_GENERATED_IMAGE_BYTES as u64)
     {
-        return Err("provider image exceeded XiaoAI byte limits".to_string());
+        return Err(ImageGenerationError::new(
+            ImageGenerationErrorKind::InvalidImage,
+            "provider image exceeded XiaoAI byte limits",
+        ));
     }
     if !response
         .headers()
@@ -201,19 +247,32 @@ async fn download_generated_image(url: &str) -> Result<Vec<u8>, String> {
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.to_ascii_lowercase().starts_with("image/"))
     {
-        return Err("provider image URL did not return an image content type".to_string());
+        return Err(ImageGenerationError::new(
+            ImageGenerationErrorKind::InvalidImage,
+            "provider image URL did not return an image content type",
+        ));
     }
 
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| "provider image stream failed".to_string())?;
+        let chunk = chunk.map_err(|_| {
+            ImageGenerationError::new(
+                ImageGenerationErrorKind::Provider,
+                "provider image stream failed",
+            )
+        })?;
         if bytes.len().saturating_add(chunk.len()) > MAX_GENERATED_IMAGE_BYTES {
-            return Err("provider image exceeded XiaoAI byte limits".to_string());
+            return Err(ImageGenerationError::new(
+                ImageGenerationErrorKind::InvalidImage,
+                "provider image exceeded XiaoAI byte limits",
+            ));
         }
         bytes.extend_from_slice(&chunk);
     }
-    validate_generated_image_bytes(&bytes)?;
+    validate_generated_image_bytes(&bytes).map_err(|error| {
+        ImageGenerationError::new(ImageGenerationErrorKind::InvalidImage, error)
+    })?;
     Ok(bytes)
 }
 
@@ -242,6 +301,30 @@ async fn read_bounded_response_bytes(
 async fn read_bounded_json(response: reqwest::Response) -> Result<Value, String> {
     let bytes = read_bounded_response_bytes(response, MAX_PROVIDER_JSON_BYTES).await?;
     serde_json::from_slice(&bytes).map_err(|error| format!("invalid provider JSON: {error}"))
+}
+
+fn canonical_persisted_prompt<'a>(canonical: Option<&'a str>, runtime_prompt: &'a str) -> &'a str {
+    canonical.unwrap_or(runtime_prompt)
+}
+
+fn specialist_chat_payload(model: &str, content: Vec<Value>) -> Value {
+    json!({
+        "model": model,
+        "messages": [{"role": "user", "content": content}],
+        "stream": false,
+        "max_tokens": 1200
+    })
+}
+
+fn external_image_fallback_enabled(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case("pollinations")
+}
+
+fn bounded_timeout_secs(raw: Option<&str>, default_secs: u64) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default_secs)
+        .min(600)
 }
 
 fn provider_url(endpoint: &str, path: &str) -> String {
@@ -273,6 +356,8 @@ type ActiveGenerations = Arc<RwLock<HashMap<GenerationKey, GenerationCancelSende
 
 pub struct GenerationInput<'a> {
     pub prompt: &'a str,
+    pub canonical_prompt: Option<&'a str>,
+    pub media_to_main: bool,
     pub timeline: Option<&'a Arc<ExecutionTimeline>>,
     pub image_bytes: Option<Vec<u8>>,
     pub document_images: Option<Vec<Vec<u8>>>,
@@ -284,6 +369,98 @@ pub struct GenerationInput<'a> {
     pub video_bytes: Option<Vec<u8>>,
     pub video_mime: Option<&'a str>,
     pub video_duration: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageGenerationProtocol {
+    OpenAiImages,
+}
+
+impl ImageGenerationProtocol {
+    fn endpoint(self, base: &str) -> String {
+        match self {
+            Self::OpenAiImages => provider_url(base, "images/generations"),
+        }
+    }
+
+    fn payload(self, model: &str, prompt: &str, width: usize, height: usize) -> Value {
+        match self {
+            Self::OpenAiImages => json!({
+                "model": model,
+                "prompt": prompt,
+                "n": 1,
+                "size": format!("{width}x{height}"),
+                "response_format": "b64_json"
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageGenerationErrorKind {
+    CapabilityUnknown,
+    CapabilityUnsupported,
+    RouteDisabled,
+    ProviderNotFound,
+    ModelNotFound,
+    Timeout,
+    Auth,
+    RateLimited,
+    HttpStatus,
+    ProtocolMismatch,
+    InvalidResponse,
+    InvalidBase64,
+    InvalidImage,
+    UnsafeImageUrl,
+    DownloadTimeout,
+    Cancelled,
+    FallbackDisabled,
+    Provider,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImageGenerationError {
+    pub kind: ImageGenerationErrorKind,
+    pub message: String,
+}
+
+impl ImageGenerationError {
+    fn new(kind: ImageGenerationErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+fn classify_image_route_error(message: &str) -> ImageGenerationErrorKind {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("disabled") {
+        ImageGenerationErrorKind::RouteDisabled
+    } else if lower.contains("provider") && lower.contains("not found") {
+        ImageGenerationErrorKind::ProviderNotFound
+    } else if lower.contains("model")
+        && (lower.contains("not found") || lower.contains("no longer present"))
+    {
+        ImageGenerationErrorKind::ModelNotFound
+    } else if lower.contains("unsupported") {
+        ImageGenerationErrorKind::CapabilityUnsupported
+    } else {
+        ImageGenerationErrorKind::CapabilityUnknown
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GeneratedImage {
+    pub bytes: Vec<u8>,
+    pub provider_name: String,
+    pub model: String,
+    pub used_external_fallback: bool,
+}
+
+fn timeout_from_env(key: &str, default_secs: u64) -> Duration {
+    let raw = std::env::var(key).ok();
+    Duration::from_secs(bounded_timeout_secs(raw.as_deref(), default_secs))
 }
 
 #[derive(Clone)]
@@ -299,6 +476,7 @@ pub struct AIChatService {
     pub user_session_msg_id: Arc<RwLock<HashMap<i64, i64>>>,
     pub(super) provider_store: Arc<RwLock<ProviderStore>>,
     pub(super) capability_registry: Arc<RwLock<CapabilityRegistry>>,
+    pub(super) model_routing: Arc<RwLock<ModelRoutingConfig>>,
     pub user_wizard_state: Arc<RwLock<HashMap<i64, HashMap<String, String>>>>,
     pub model_metadata: Arc<RwLock<HashMap<String, ModelMetadata>>>,
 }
@@ -328,7 +506,9 @@ impl AIChatService {
         }
         let provider_store = load_provider_store();
         let capability_registry = load_capability_registry();
+        let model_routing = load_model_routing();
         let client = Client::builder()
+            .connect_timeout(timeout_from_env("IMAGE_PROVIDER_CONNECT_TIMEOUT_SECS", 10))
             .timeout(Duration::from_secs(90))
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -346,6 +526,7 @@ impl AIChatService {
             user_session_msg_id: Arc::new(RwLock::new(HashMap::new())),
             provider_store: Arc::new(RwLock::new(provider_store)),
             capability_registry: Arc::new(RwLock::new(capability_registry)),
+            model_routing: Arc::new(RwLock::new(model_routing)),
             user_wizard_state: Arc::new(RwLock::new(HashMap::new())),
             model_metadata: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -376,13 +557,13 @@ impl AIChatService {
         for attachment in persisted.attachments {
             let allowed = match attachment.kind.as_str() {
                 "image" | "document_page" => capability
-                    .and_then(|record| record.supports_image)
+                    .and_then(|record| record.supports_image_input)
                     .unwrap_or(false),
                 "audio" => capability
-                    .and_then(|record| record.supports_audio)
+                    .and_then(|record| record.supports_audio_input)
                     .unwrap_or(false),
                 "video" => capability
-                    .and_then(|record| record.supports_video)
+                    .and_then(|record| record.supports_video_input)
                     .unwrap_or(false),
                 _ => false,
             };
@@ -935,86 +1116,192 @@ impl AIChatService {
 
     pub async fn transcribe_audio(
         &self,
-        user_id: i64,
+        _user_id: i64,
         audio_bytes: Vec<u8>,
         file_name: &str,
     ) -> (bool, Result<String, String>) {
-        let provider =
-            match self.get_active_provider(user_id).await {
-                Some(p) if !p.endpoint.is_empty() => p,
-                _ => return (
-                    false,
-                    Err(
-                        "Provider belum dikonfigurasi. Silakan jalankan /provider terlebih dahulu."
-                            .to_string(),
-                    ),
-                ),
-            };
-
-        let stt_url = provider_url(&provider.endpoint, "audio/transcriptions");
-        let part = match Part::bytes(audio_bytes)
-            .file_name(file_name.to_string())
-            .mime_str("audio/ogg")
-        {
-            Ok(p) => p,
-            Err(e) => return (false, Err(format!("Multipart part error: {e}"))),
+        let route = match self.resolve_model_route(ModelRole::AudioStt).await {
+            Ok(route) => route,
+            Err(error) => return (false, Err(error)),
         };
-
-        let form = Form::new().part("file", part).text("model", "whisper-1");
-        let mut req = self
-            .client
-            .post(&stt_url)
-            .multipart(form)
-            .timeout(Duration::from_secs(45));
-
-        if !provider.api_key.is_empty()
-            && !["none", "-", "no"]
-                .iter()
-                .any(|k| provider.api_key.eq_ignore_ascii_case(k))
-        {
-            req = req.header("Authorization", format!("Bearer {}", provider.api_key));
+        if route.capability.supports_audio_transcription != Some(true) {
+            return (
+                false,
+                Err(
+                    "Audio STT Model menggunakan input audio native dan tidak menyediakan endpoint transkripsi terverifikasi."
+                        .to_string(),
+                ),
+            );
         }
-
-        match req.send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() {
-                    match read_bounded_json(resp).await {
-                        Ok(data) => {
-                            if let Some(text) = data.get("text").and_then(|t| t.as_str()) {
-                                if !text.trim().is_empty() {
-                                    return (true, Ok(text.trim().to_string()));
-                                }
-                            }
-                            (false, Err("Hasil transkripsi kosong.".to_string()))
-                        }
-                        Err(e) => (false, Err(format!("Invalid transcription JSON: {e}"))),
-                    }
-                } else if status.as_u16() == 404 {
-                    (false, Err("ENDPOINT_NOT_SUPPORTED".to_string()))
-                } else {
-                    let err_txt = read_bounded_response_bytes(resp, 64 * 1024)
-                        .await
-                        .ok()
-                        .and_then(|bytes| String::from_utf8(bytes).ok())
-                        .unwrap_or_default();
-                    (
-                        false,
-                        Err(format!(
-                            "HTTP {}: {}",
-                            status.as_u16(),
-                            truncate_chars(&err_txt, 100).as_str()
-                        )),
-                    )
-                }
-            }
-            Err(e) => (false, Err(format!("Audio transcription error: {e}"))),
+        match self
+            .transcribe_audio_resolved(&route, audio_bytes, file_name)
+            .await
+        {
+            Ok(text) => (true, Ok(text)),
+            Err(error) => (false, Err(error)),
         }
     }
 
     // ==========================================
     // Streaming Chat Completions & Reasoning
     // ==========================================
+
+    async fn run_specialist_observation(
+        &self,
+        route: &ResolvedModelRoute,
+        prompt: &str,
+        image_bytes: Option<&[u8]>,
+        document_images: Option<&[Vec<u8>]>,
+        mime_type: Option<&str>,
+        video_bytes: Option<&[u8]>,
+        video_mime: Option<&str>,
+    ) -> Result<String, String> {
+        use base64::Engine;
+
+        let mut content = vec![json!({
+            "type": "text",
+            "text": if prompt.trim().is_empty() {
+                "Observe the supplied media accurately. Return a concise factual observation for another model to use. Do not answer beyond what is visible/audible in the media."
+            } else {
+                prompt
+            }
+        })];
+        if let Some(pages) = document_images.filter(|pages| !pages.is_empty()) {
+            for page in pages.iter().take(8) {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(page);
+                content.push(json!({
+                    "type": "image_url",
+                    "image_url": {"url": format!("data:image/png;base64,{encoded}"), "detail": "high"}
+                }));
+            }
+        } else if let Some(bytes) = video_bytes {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+            let mime = video_mime.unwrap_or("video/mp4");
+            content.push(json!({
+                "type": "image_url",
+                "image_url": {"url": format!("data:{mime};base64,{encoded}")}
+            }));
+        } else if let Some(bytes) = image_bytes {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+            let mime = mime_type.unwrap_or("image/jpeg");
+            content.push(json!({
+                "type": "image_url",
+                "image_url": {"url": format!("data:{mime};base64,{encoded}"), "detail": "auto"}
+            }));
+        }
+
+        let url = provider_url(&route.provider.endpoint, "chat/completions");
+        let mut request = self
+            .client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .json(&specialist_chat_payload(&route.model, content))
+            .timeout(Duration::from_secs(90));
+        if !route.provider.api_key.is_empty()
+            && !["none", "-", "no", "null"]
+                .iter()
+                .any(|value| route.provider.api_key.eq_ignore_ascii_case(value))
+        {
+            request = request.header(
+                "Authorization",
+                format!("Bearer {}", route.provider.api_key),
+            );
+        }
+        let response = request.send().await.map_err(|error| {
+            if error.is_timeout() {
+                "specialist request timed out; capability remains unchanged".to_string()
+            } else {
+                "specialist request failed".to_string()
+            }
+        })?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "specialist {} / {} returned HTTP {}",
+                route.provider.name,
+                route.model,
+                response.status().as_u16()
+            ));
+        }
+        let body = read_bounded_json(response).await?;
+        let content = body
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("message"))
+            .and_then(|message| message.get("content"));
+        let text = if let Some(text) = content.and_then(Value::as_str) {
+            text.to_string()
+        } else if let Some(parts) = content.and_then(Value::as_array) {
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("")
+        } else {
+            String::new()
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            return Err("specialist returned an empty observation".to_string());
+        }
+        Ok(truncate_chars(text, 12_000))
+    }
+
+    async fn transcribe_audio_resolved(
+        &self,
+        route: &ResolvedModelRoute,
+        audio_bytes: Vec<u8>,
+        file_name: &str,
+    ) -> Result<String, String> {
+        let stt_url = provider_url(&route.provider.endpoint, "audio/transcriptions");
+        let part = Part::bytes(audio_bytes)
+            .file_name(file_name.to_string())
+            .mime_str("audio/ogg")
+            .map_err(|error| format!("multipart audio error: {error}"))?;
+        let form = Form::new()
+            .part("file", part)
+            .text("model", route.model.clone());
+        let mut request = self
+            .client
+            .post(stt_url)
+            .multipart(form)
+            .timeout(Duration::from_secs(90));
+        if !route.provider.api_key.is_empty()
+            && !["none", "-", "no", "null"]
+                .iter()
+                .any(|value| route.provider.api_key.eq_ignore_ascii_case(value))
+        {
+            request = request.header(
+                "Authorization",
+                format!("Bearer {}", route.provider.api_key),
+            );
+        }
+        let response = request.send().await.map_err(|error| {
+            if error.is_timeout() {
+                "audio transcription timed out; timeout is not Unsupported".to_string()
+            } else {
+                "audio transcription request failed".to_string()
+            }
+        })?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "Audio STT {} / {} returned HTTP {}",
+                route.provider.name,
+                route.model,
+                response.status().as_u16()
+            ));
+        }
+        let body = read_bounded_json(response).await?;
+        let text = body
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if text.is_empty() {
+            return Err("audio transcription returned empty text".to_string());
+        }
+        Ok(truncate_chars(text, 32_000))
+    }
 
     pub async fn generate_response(
         &self,
@@ -1024,6 +1311,237 @@ impl AIChatService {
     ) -> (Option<String>, String, bool) {
         let GenerationInput {
             prompt,
+            canonical_prompt: _,
+            media_to_main: _,
+            timeline,
+            image_bytes,
+            document_images,
+            mime_type,
+            doc_text,
+            doc_name,
+            audio_bytes,
+            audio_mime,
+            video_bytes,
+            video_mime,
+            video_duration,
+        } = input;
+
+        let main = match self.resolve_model_route(ModelRole::Main).await {
+            Ok(route) => route,
+            Err(error) => return (None, format!("Main Model is unavailable: {error}"), false),
+        };
+
+        let has_vision = image_bytes.is_some()
+            || document_images
+                .as_ref()
+                .is_some_and(|pages| !pages.is_empty());
+        let role = if has_vision {
+            Some(ModelRole::Vision)
+        } else if video_bytes.is_some() {
+            Some(ModelRole::Video)
+        } else if audio_bytes.is_some() {
+            Some(ModelRole::AudioStt)
+        } else {
+            None
+        };
+
+        let Some(role) = role else {
+            return self
+                .generate_response_on_main(
+                    user_id,
+                    GenerationInput {
+                        prompt,
+                        canonical_prompt: None,
+                        media_to_main: true,
+                        timeline,
+                        image_bytes,
+                        document_images,
+                        mime_type,
+                        doc_text,
+                        doc_name,
+                        audio_bytes,
+                        audio_mime,
+                        video_bytes,
+                        video_mime,
+                        video_duration,
+                    },
+                    cancel_rx,
+                )
+                .await;
+        };
+
+        let specialist = match self.resolve_model_route(role).await {
+            Ok(route) => route,
+            Err(error) => {
+                return (
+                    None,
+                    format!("{} unavailable: {error}", role.display_name()),
+                    false,
+                )
+            }
+        };
+
+        let same_as_main =
+            specialist.provider.id == main.provider.id && specialist.model == main.model;
+
+        if role == ModelRole::AudioStt {
+            if same_as_main
+                && specialist.capability.supports_audio_input == Some(true)
+                && specialist.route_origin == RouteOrigin::MainModel
+            {
+                return self
+                    .generate_response_on_main(
+                        user_id,
+                        GenerationInput {
+                            prompt,
+                            canonical_prompt: None,
+                            media_to_main: true,
+                            timeline,
+                            image_bytes,
+                            document_images,
+                            mime_type,
+                            doc_text,
+                            doc_name,
+                            audio_bytes,
+                            audio_mime,
+                            video_bytes,
+                            video_mime,
+                            video_duration,
+                        },
+                        cancel_rx,
+                    )
+                    .await;
+            }
+
+            if specialist.capability.supports_audio_transcription != Some(true) {
+                return (
+                    None,
+                    "Audio STT route has no verified transcription capability and Main native audio is not available.".to_string(),
+                    false,
+                );
+            }
+            let Some(bytes) = audio_bytes.clone() else {
+                return (None, "Audio input is missing.".to_string(), false);
+            };
+            let transcript = match self
+                .transcribe_audio_resolved(&specialist, bytes, "voice.ogg")
+                .await
+            {
+                Ok(transcript) => transcript,
+                Err(error) => return (None, error, false),
+            };
+            let synthesis_prompt = if prompt.trim().is_empty() {
+                format!("Transcript from Audio STT specialist:\n\n{transcript}\n\nRespond to the user based on this transcript.")
+            } else {
+                format!(
+                    "User request:\n{prompt}\n\nTranscript from Audio STT specialist:\n{transcript}\n\nAnswer the user request using the transcript as an execution artifact."
+                )
+            };
+            return self
+                .generate_response_on_main(
+                    user_id,
+                    GenerationInput {
+                        prompt: &synthesis_prompt,
+                        canonical_prompt: Some(prompt),
+                        media_to_main: false,
+                        timeline,
+                        image_bytes,
+                        document_images,
+                        mime_type,
+                        doc_text,
+                        doc_name,
+                        audio_bytes,
+                        audio_mime,
+                        video_bytes,
+                        video_mime,
+                        video_duration,
+                    },
+                    cancel_rx,
+                )
+                .await;
+        }
+
+        if same_as_main && specialist.route_origin == RouteOrigin::MainModel {
+            return self
+                .generate_response_on_main(
+                    user_id,
+                    GenerationInput {
+                        prompt,
+                        canonical_prompt: None,
+                        media_to_main: true,
+                        timeline,
+                        image_bytes,
+                        document_images,
+                        mime_type,
+                        doc_text,
+                        doc_name,
+                        audio_bytes,
+                        audio_mime,
+                        video_bytes,
+                        video_mime,
+                        video_duration,
+                    },
+                    cancel_rx,
+                )
+                .await;
+        }
+
+        let observation = match self
+            .run_specialist_observation(
+                &specialist,
+                prompt,
+                image_bytes.as_deref(),
+                document_images.as_deref(),
+                mime_type,
+                video_bytes.as_deref(),
+                video_mime,
+            )
+            .await
+        {
+            Ok(observation) => observation,
+            Err(error) => return (None, error, false),
+        };
+        let synthesis_prompt = format!(
+            "User request:\n{}\n\nBounded {} observation from {} / {}:\n{}\n\nUse the observation as an execution artifact. Do not claim access to media beyond it.",
+            if prompt.trim().is_empty() { "Analyze the supplied media." } else { prompt },
+            role.display_name(),
+            specialist.provider.name,
+            specialist.model,
+            observation
+        );
+        self.generate_response_on_main(
+            user_id,
+            GenerationInput {
+                prompt: &synthesis_prompt,
+                canonical_prompt: Some(prompt),
+                media_to_main: false,
+                timeline,
+                image_bytes,
+                document_images,
+                mime_type,
+                doc_text,
+                doc_name,
+                audio_bytes,
+                audio_mime,
+                video_bytes,
+                video_mime,
+                video_duration,
+            },
+            cancel_rx,
+        )
+        .await
+    }
+
+    async fn generate_response_on_main(
+        &self,
+        user_id: i64,
+        input: GenerationInput<'_>,
+        cancel_rx: &mut watch::Receiver<bool>,
+    ) -> (Option<String>, String, bool) {
+        let GenerationInput {
+            prompt,
+            canonical_prompt,
+            media_to_main,
             timeline,
             image_bytes,
             document_images,
@@ -1061,21 +1579,22 @@ impl AIChatService {
         };
 
         let capability = self.capability_record(&provider.endpoint, &model).await;
-        let required_capability = if document_images
-            .as_ref()
-            .is_some_and(|pages| !pages.is_empty())
-            || image_bytes.is_some()
+        let required_capability = if media_to_main
+            && (document_images
+                .as_ref()
+                .is_some_and(|pages| !pages.is_empty())
+                || image_bytes.is_some())
         {
             require_verified_capability(capability.as_ref(), "vision/image", |record| {
-                record.supports_image
+                record.supports_image_input
             })
-        } else if video_bytes.is_some() {
+        } else if media_to_main && video_bytes.is_some() {
             require_verified_capability(capability.as_ref(), "video", |record| {
-                record.supports_video
+                record.supports_video_input
             })
-        } else if audio_bytes.is_some() {
+        } else if media_to_main && audio_bytes.is_some() {
             require_verified_capability(capability.as_ref(), "audio", |record| {
-                record.supports_audio
+                record.supports_audio_input
             })
         } else {
             Ok(())
@@ -1129,6 +1648,7 @@ impl AIChatService {
         } else if audio_bytes.is_some() && clean_prompt.is_empty() {
             clean_prompt = "Dengarkan rekaman suara ini dan jawab pertanyaan atau instruksi di dalamnya secara lengkap.".to_string();
         }
+        let canonical_history_prompt = canonical_prompt.map(str::to_string);
 
         let resolved_capability = self
             .resolved_model_capability(&provider.endpoint, &model)
@@ -1208,59 +1728,66 @@ impl AIChatService {
 
         messages.extend(history);
 
-        if let Some(pages) = document_images.as_ref().filter(|pages| !pages.is_empty()) {
-            use base64::Engine;
-            let mut content = vec![json!({ "type": "text", "text": enhanced_prompt })];
-            for page in pages {
-                let encoded = base64::engine::general_purpose::STANDARD.encode(page);
-                content.push(json!({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": format!("data:image/png;base64,{encoded}"),
-                        "detail": "high"
-                    }
+        if media_to_main {
+            if let Some(pages) = document_images.as_ref().filter(|pages| !pages.is_empty()) {
+                use base64::Engine;
+                let mut content = vec![json!({ "type": "text", "text": enhanced_prompt })];
+                for page in pages {
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(page);
+                    content.push(json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("data:image/png;base64,{encoded}"),
+                            "detail": "high"
+                        }
+                    }));
+                }
+                messages.push(json!({ "role": "user", "content": content }));
+            } else if let Some(v_bytes) = video_bytes.as_ref() {
+                use base64::Engine;
+                let b64_vid = base64::engine::general_purpose::STANDARD.encode(v_bytes);
+                let v_m = video_mime.unwrap_or("video/mp4");
+                let data_url = format!("data:{v_m};base64,{b64_vid}");
+                messages.push(json!({
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": enhanced_prompt },
+                        { "type": "image_url", "image_url": { "url": data_url } }
+                    ]
                 }));
-            }
-            messages.push(json!({ "role": "user", "content": content }));
-        } else if let Some(v_bytes) = video_bytes.as_ref() {
-            use base64::Engine;
-            let b64_vid = base64::engine::general_purpose::STANDARD.encode(v_bytes);
-            let v_m = video_mime.unwrap_or("video/mp4");
-            let data_url = format!("data:{v_m};base64,{b64_vid}");
-            messages.push(json!({
-                "role": "user",
-                "content": [
-                    { "type": "text", "text": enhanced_prompt },
-                    { "type": "image_url", "image_url": { "url": data_url } }
-                ]
-            }));
-        } else if let Some(i_bytes) = image_bytes.as_ref() {
-            use base64::Engine;
-            let b64_img = base64::engine::general_purpose::STANDARD.encode(i_bytes);
-            let i_m = mime_type.unwrap_or("image/jpeg");
-            let data_url = format!("data:{i_m};base64,{b64_img}");
-            messages.push(json!({
-                "role": "user",
-                "content": [
-                    { "type": "text", "text": enhanced_prompt },
-                    { "type": "image_url", "image_url": { "url": data_url, "detail": "auto" } }
-                ]
-            }));
-        } else if let Some(a_bytes) = audio_bytes.as_ref() {
-            use base64::Engine;
-            let b64_audio = base64::engine::general_purpose::STANDARD.encode(a_bytes);
-            let fmt = if audio_mime.unwrap_or("").contains("ogg") {
-                "ogg"
-            } else {
-                "mp3"
-            };
-            messages.push(json!({
+            } else if let Some(i_bytes) = image_bytes.as_ref() {
+                use base64::Engine;
+                let b64_img = base64::engine::general_purpose::STANDARD.encode(i_bytes);
+                let i_m = mime_type.unwrap_or("image/jpeg");
+                let data_url = format!("data:{i_m};base64,{b64_img}");
+                messages.push(json!({
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": enhanced_prompt },
+                        { "type": "image_url", "image_url": { "url": data_url, "detail": "auto" } }
+                    ]
+                }));
+            } else if let Some(a_bytes) = audio_bytes.as_ref() {
+                use base64::Engine;
+                let b64_audio = base64::engine::general_purpose::STANDARD.encode(a_bytes);
+                let fmt = if audio_mime.unwrap_or("").contains("ogg") {
+                    "ogg"
+                } else {
+                    "mp3"
+                };
+                messages.push(json!({
                 "role": "user",
                 "content": [
                     { "type": "text", "text": enhanced_prompt },
                     { "type": "input_audio", "input_audio": { "data": b64_audio, "format": fmt } }
                 ]
             }));
+            } else {
+                messages.push(json!({
+                    "role": "user",
+                    "content": enhanced_prompt
+                }));
+            }
         } else {
             messages.push(json!({
                 "role": "user",
@@ -1759,7 +2286,10 @@ impl AIChatService {
 
         let user_message = ChatMessage {
             role: "user".to_string(),
-            content: encode_user_content(&clean_prompt, attachment_refs.clone()),
+            content: encode_user_content(
+                canonical_persisted_prompt(canonical_history_prompt.as_deref(), &clean_prompt),
+                attachment_refs.clone(),
+            ),
         };
         let assistant_message = ChatMessage {
             role: "assistant".to_string(),
@@ -1767,7 +2297,9 @@ impl AIChatService {
         };
         let appended = vec![user_message, assistant_message];
         if candidate_session.messages.is_empty() && candidate_session.name.starts_with("Session ") {
-            let clean_title = prompt.trim().replace('\n', " ");
+            let title_source =
+                canonical_persisted_prompt(canonical_history_prompt.as_deref(), &clean_prompt);
+            let clean_title = title_source.trim().replace('\n', " ");
             let short_title = truncate_chars_with_ellipsis(&clean_title, 32);
             if !short_title.is_empty() {
                 candidate_session.name = short_title;
@@ -1818,149 +2350,239 @@ impl AIChatService {
     }
 
     // ==========================================
-    // Image Generation (Custom Provider / FLUX.1 Fallback)
+    // Image Generation (role-aware OpenAI Images + explicit fallback)
     // ==========================================
 
     pub async fn generate_image(
         &self,
-        user_id: i64,
+        _user_id: i64,
         prompt: &str,
         width: usize,
         height: usize,
-    ) -> (bool, Option<Vec<u8>>, String) {
+        cancel_rx: &mut watch::Receiver<bool>,
+    ) -> Result<GeneratedImage, ImageGenerationError> {
         let clean_prompt = prompt.trim();
-        let provider = self.get_active_provider(user_id).await;
+        let route = self
+            .resolve_model_route(ModelRole::ImageGeneration)
+            .await
+            .map_err(|error| {
+                ImageGenerationError::new(classify_image_route_error(&error), error)
+            })?;
 
-        // 1. Try Custom Provider /images/generations endpoint
-        if let Some(ref p) = provider {
-            if !p.endpoint.is_empty() {
-                let gen_url = provider_url(&p.endpoint, "images/generations");
-                let mut req = self
-                    .client
-                    .post(&gen_url)
-                    .header("Content-Type", "application/json")
-                    .json(&json!({
-                        "prompt": clean_prompt,
-                        "n": 1,
-                        "size": format!("{width}x{height}"),
-                        "response_format": "b64_json"
-                    }))
-                    .timeout(Duration::from_secs(45));
+        let generation_timeout = timeout_from_env("IMAGE_GENERATION_TIMEOUT_SECS", 120);
+        let protocol = ImageGenerationProtocol::OpenAiImages;
+        let gen_url = protocol.endpoint(&route.provider.endpoint);
+        let payload = protocol.payload(&route.model, clean_prompt, width, height);
+        let mut req = self
+            .client
+            .post(&gen_url)
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .timeout(generation_timeout);
 
-                if !p.api_key.is_empty()
-                    && !["none", "-", "no"]
-                        .iter()
-                        .any(|k| p.api_key.eq_ignore_ascii_case(k))
-                {
-                    req = req.header("Authorization", format!("Bearer {}", p.api_key));
-                }
-
-                if let Ok(resp) = req.send().await {
-                    if resp.status().is_success() {
-                        if let Ok(res_json) = read_bounded_json(resp).await {
-                            if let Some(data) = res_json.get("data").and_then(|d| d.get(0)) {
-                                if let Some(b64_str) = data.get("b64_json").and_then(|s| s.as_str())
-                                {
-                                    use base64::Engine;
-                                    if let Ok(bytes) =
-                                        base64::engine::general_purpose::STANDARD.decode(b64_str)
-                                    {
-                                        if validate_generated_image_bytes(&bytes).is_ok() {
-                                            return (
-                                                true,
-                                                Some(bytes),
-                                                format!("OpenAI Compatible ({})", p.name),
-                                            );
-                                        }
-                                    }
-                                } else if let Some(img_url) =
-                                    data.get("url").and_then(|s| s.as_str())
-                                {
-                                    match download_generated_image(img_url).await {
-                                        Ok(bytes) => {
-                                            return (
-                                                true,
-                                                Some(bytes),
-                                                format!("OpenAI Compatible ({})", p.name),
-                                            );
-                                        }
-                                        Err(error) => {
-                                            warn!("Rejected provider image URL: {error}");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 2. Optional external fallback. Disabled by default to avoid silently
-        // sending user prompts to a provider they did not select.
-        let fallback = match std::env::var("IMAGE_FALLBACK_PROVIDER") {
-            Ok(value) => value,
-            Err(_) => load_app_setting_async("IMAGE_FALLBACK_PROVIDER")
-                .await
-                .unwrap_or_else(|| "none".to_string()),
-        };
-        if !fallback.eq_ignore_ascii_case("pollinations") {
-            return (
-                false,
-                None,
-                "Provider aktif tidak menghasilkan gambar dan fallback eksternal dinonaktifkan. Set IMAGE_FALLBACK_PROVIDER=pollinations untuk opt-in.".to_string(),
+        if !route.provider.api_key.is_empty()
+            && !["none", "-", "no"]
+                .iter()
+                .any(|key| route.provider.api_key.eq_ignore_ascii_case(key))
+        {
+            req = req.header(
+                "Authorization",
+                format!("Bearer {}", route.provider.api_key),
             );
         }
 
-        let encoded_prompt = urlencoding::encode(clean_prompt);
-        let poll_url = format!(
-            "https://image.pollinations.ai/prompt/{}?width={}&height={}&model=flux&nologo=true&enhance=true",
-            encoded_prompt, width, height
-        );
-
-        match self
-            .client
-            .get(&poll_url)
-            .timeout(Duration::from_secs(60))
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() {
-                    match read_bounded_response_bytes(resp, MAX_GENERATED_IMAGE_BYTES).await {
-                        Ok(bytes)
-                            if bytes.len() > 1000
-                                && validate_generated_image_bytes(&bytes).is_ok() =>
-                        {
-                            (true, Some(bytes), "FLUX.1 (Ultra HD)".to_string())
-                        }
-                        _ => (
-                            false,
-                            None,
-                            "Respon gambar rusak atau terlalu kecil.".to_string(),
+        let provider_result = tokio::select! {
+            changed = cancel_rx.changed() => {
+                if changed.is_ok() && *cancel_rx.borrow() {
+                    return Err(ImageGenerationError::new(
+                        ImageGenerationErrorKind::Cancelled,
+                        "Pembuatan gambar dibatalkan.",
+                    ));
+                }
+                Err(ImageGenerationError::new(
+                    ImageGenerationErrorKind::Provider,
+                    "Kanal pembatalan image generation ditutup.",
+                ))
+            }
+            response = req.send() => {
+                match response {
+                    Err(error) if error.is_timeout() => Err(ImageGenerationError::new(
+                        ImageGenerationErrorKind::Timeout,
+                        format!(
+                            "Image Generation Model melewati batas waktu {} detik.",
+                            generation_timeout.as_secs()
                         ),
+                    )),
+                    Err(error) => Err(ImageGenerationError::new(
+                        ImageGenerationErrorKind::Provider,
+                        format!("Koneksi ke Image Generation Model gagal: {error}"),
+                    )),
+                    Ok(response) if !response.status().is_success() => {
+                        let status = response.status();
+                        let detail = read_bounded_response_bytes(response, 64 * 1024)
+                            .await
+                            .ok()
+                            .and_then(|bytes| String::from_utf8(bytes).ok())
+                            .unwrap_or_default();
+                        let kind = match status.as_u16() {
+                            401 | 403 => ImageGenerationErrorKind::Auth,
+                            429 => ImageGenerationErrorKind::RateLimited,
+                            404 | 405 => ImageGenerationErrorKind::ProtocolMismatch,
+                            _ => ImageGenerationErrorKind::HttpStatus,
+                        };
+                        Err(ImageGenerationError::new(
+                            kind,
+                            format!(
+                                "Image Generation Model mengembalikan HTTP {}: {}",
+                                status.as_u16(),
+                                truncate_chars(&detail, 160)
+                            ),
+                        ))
                     }
-                } else {
-                    (
-                        false,
-                        None,
-                        format!("HTTP Error {} saat membuat gambar.", status.as_u16()),
-                    )
+                    Ok(response) => {
+                        let body = read_bounded_json(response).await.map_err(|error| {
+                            ImageGenerationError::new(
+                                ImageGenerationErrorKind::InvalidResponse,
+                                format!("Respons image generation tidak valid: {error}"),
+                            )
+                        })?;
+                        let data = body
+                            .get("data")
+                            .and_then(|value| value.get(0))
+                            .ok_or_else(|| {
+                                ImageGenerationError::new(
+                                    ImageGenerationErrorKind::InvalidResponse,
+                                    "Respons image generation tidak memiliki data gambar.",
+                                )
+                            })?;
+
+                        let bytes = if let Some(encoded) =
+                            data.get("b64_json").and_then(|value| value.as_str())
+                        {
+                            use base64::Engine;
+                            let bytes = base64::engine::general_purpose::STANDARD
+                                .decode(encoded)
+                                .map_err(|_| {
+                                    ImageGenerationError::new(
+                                        ImageGenerationErrorKind::InvalidBase64,
+                                        "Provider mengembalikan base64 gambar yang rusak.",
+                                    )
+                                })?;
+                            validate_generated_image_bytes(&bytes).map_err(|error| {
+                                ImageGenerationError::new(
+                                    ImageGenerationErrorKind::InvalidImage,
+                                    error,
+                                )
+                            })?;
+                            bytes
+                        } else if let Some(url) = data.get("url").and_then(|value| value.as_str()) {
+                            download_generated_image(url).await?
+                        } else {
+                            return Err(ImageGenerationError::new(
+                                ImageGenerationErrorKind::InvalidResponse,
+                                "Provider tidak mengembalikan b64_json atau URL gambar.",
+                            ));
+                        };
+
+                        Ok(GeneratedImage {
+                            bytes,
+                            provider_name: route.provider.name.clone(),
+                            model: route.model.clone(),
+                            used_external_fallback: false,
+                        })
+                    }
                 }
             }
-            Err(e) => {
-                if e.is_timeout() {
-                    (
-                        false,
-                        None,
-                        "Waktu generate gambar habis (Timeout). Silakan coba lagi.".to_string(),
-                    )
-                } else {
-                    (false, None, format!("Gagal membuat gambar: {e}"))
+        };
+
+        match provider_result {
+            Ok(image) => return Ok(image),
+            Err(error) if error.kind == ImageGenerationErrorKind::Cancelled => return Err(error),
+            Err(error) if error.kind == ImageGenerationErrorKind::Timeout => return Err(error),
+            Err(provider_error) => {
+                let fallback =
+                    std::env::var("IMAGE_FALLBACK_PROVIDER").unwrap_or_else(|_| "none".to_string());
+                if !external_image_fallback_enabled(&fallback) {
+                    return Err(provider_error);
                 }
             }
         }
+
+        let encoded_prompt = urlencoding::encode(clean_prompt);
+        let fallback_model = "flux";
+        let poll_url = format!(
+            "https://image.pollinations.ai/prompt/{}?width={}&height={}&model={}&nologo=true&enhance=true",
+            encoded_prompt, width, height, fallback_model
+        );
+        let fallback_timeout = timeout_from_env("IMAGE_GENERATION_TIMEOUT_SECS", 120);
+        let request = self.client.get(&poll_url).timeout(fallback_timeout);
+        let response = tokio::select! {
+            changed = cancel_rx.changed() => {
+                if changed.is_ok() && *cancel_rx.borrow() {
+                    return Err(ImageGenerationError::new(
+                        ImageGenerationErrorKind::Cancelled,
+                        "Pembuatan gambar dibatalkan.",
+                    ));
+                }
+                return Err(ImageGenerationError::new(
+                    ImageGenerationErrorKind::Provider,
+                    "Kanal pembatalan image generation ditutup.",
+                ));
+            }
+            response = request.send() => response
+        }
+        .map_err(|error| {
+            if error.is_timeout() {
+                ImageGenerationError::new(
+                    ImageGenerationErrorKind::Timeout,
+                    format!(
+                        "Fallback image generation melewati batas waktu {} detik.",
+                        fallback_timeout.as_secs()
+                    ),
+                )
+            } else {
+                ImageGenerationError::new(
+                    ImageGenerationErrorKind::Provider,
+                    format!("Fallback image generation gagal: {error}"),
+                )
+            }
+        })?;
+
+        if !response.status().is_success() {
+            return Err(ImageGenerationError::new(
+                ImageGenerationErrorKind::Provider,
+                format!(
+                    "Fallback image generation mengembalikan HTTP {}.",
+                    response.status().as_u16()
+                ),
+            ));
+        }
+        if !response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.to_ascii_lowercase().starts_with("image/"))
+        {
+            return Err(ImageGenerationError::new(
+                ImageGenerationErrorKind::InvalidResponse,
+                "Fallback tidak mengembalikan content-type gambar.",
+            ));
+        }
+        let bytes = read_bounded_response_bytes(response, MAX_GENERATED_IMAGE_BYTES)
+            .await
+            .map_err(|error| {
+                ImageGenerationError::new(ImageGenerationErrorKind::InvalidResponse, error)
+            })?;
+        validate_generated_image_bytes(&bytes).map_err(|error| {
+            ImageGenerationError::new(ImageGenerationErrorKind::InvalidImage, error)
+        })?;
+
+        Ok(GeneratedImage {
+            bytes,
+            provider_name: "Pollinations fallback".to_string(),
+            model: fallback_model.to_string(),
+            used_external_fallback: true,
+        })
     }
 }
 
@@ -2024,23 +2646,26 @@ mod tests {
     #[test]
     fn multimodal_unknown_fails_closed() {
         let mut supported = CapabilityRecord {
-            supports_image: Some(true),
+            supports_image_input: Some(true),
             ..CapabilityRecord::default()
         };
         assert!(
-            require_verified_capability(Some(&supported), "image", |r| r.supports_image).is_ok()
+            require_verified_capability(Some(&supported), "image", |r| r.supports_image_input)
+                .is_ok()
         );
 
-        supported.supports_image = Some(false);
+        supported.supports_image_input = Some(false);
         assert!(
-            require_verified_capability(Some(&supported), "image", |r| r.supports_image).is_err()
+            require_verified_capability(Some(&supported), "image", |r| r.supports_image_input)
+                .is_err()
         );
 
-        supported.supports_image = None;
+        supported.supports_image_input = None;
         assert!(
-            require_verified_capability(Some(&supported), "image", |r| r.supports_image).is_err()
+            require_verified_capability(Some(&supported), "image", |r| r.supports_image_input)
+                .is_err()
         );
-        assert!(require_verified_capability(None, "image", |r| r.supports_image).is_err());
+        assert!(require_verified_capability(None, "image", |r| r.supports_image_input).is_err());
     }
 
     #[test]
@@ -2054,5 +2679,94 @@ mod tests {
         assert!(push_bounded(&mut reasoning, "🧠", 4));
         assert!(!push_bounded(&mut reasoning, "x", 4));
         assert_eq!(reasoning, "🧠");
+    }
+
+    #[test]
+    fn selected_image_model_is_propagated_to_openai_images_payload() {
+        let payload = ImageGenerationProtocol::OpenAiImages.payload(
+            "black-forest-labs/FLUX.1-schnell",
+            "galaxy",
+            1024,
+            1024,
+        );
+        assert_eq!(
+            payload.get("model").and_then(Value::as_str),
+            Some("black-forest-labs/FLUX.1-schnell")
+        );
+        assert_eq!(
+            payload.get("size").and_then(Value::as_str),
+            Some("1024x1024")
+        );
+    }
+
+    #[test]
+    fn image_timeout_parser_uses_default_and_bounds_extreme_values() {
+        assert_eq!(bounded_timeout_secs(None, 120), 120);
+        assert_eq!(bounded_timeout_secs(Some("0"), 120), 120);
+        assert_eq!(bounded_timeout_secs(Some("75"), 120), 75);
+        assert_eq!(bounded_timeout_secs(Some("99999"), 120), 600);
+    }
+
+    #[test]
+    fn external_image_fallback_is_explicit_opt_in_only() {
+        assert!(external_image_fallback_enabled("pollinations"));
+        assert!(external_image_fallback_enabled(" POLLINATIONS "));
+        assert!(!external_image_fallback_enabled("none"));
+        assert!(!external_image_fallback_enabled(""));
+    }
+
+    #[test]
+    fn specialist_payload_contains_only_the_current_user_message() {
+        let payload = specialist_chat_payload(
+            "vision-model",
+            vec![json!({"type":"text","text":"current question"})],
+        );
+        let messages = payload.get("messages").and_then(Value::as_array).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].get("role").and_then(Value::as_str),
+            Some("user")
+        );
+        assert_eq!(
+            payload.get("model").and_then(Value::as_str),
+            Some("vision-model")
+        );
+    }
+
+    #[test]
+    fn specialist_runtime_prompt_does_not_replace_canonical_user_prompt() {
+        assert_eq!(
+            canonical_persisted_prompt(
+                Some("what is in this image?"),
+                "internal specialist synthesis"
+            ),
+            "what is in this image?"
+        );
+        assert_eq!(
+            canonical_persisted_prompt(None, "ordinary chat"),
+            "ordinary chat"
+        );
+    }
+
+    #[test]
+    fn generated_image_validation_rejects_non_image_bytes() {
+        assert!(validate_generated_image_bytes(b"not an image").is_err());
+        assert!(validate_generated_image_bytes(b"\x89PNG\r\n\x1a\nrest").is_ok());
+    }
+
+    #[test]
+    fn image_route_errors_keep_capability_and_route_failures_distinct() {
+        assert_eq!(
+            classify_image_route_error("Image Generation Model is Disabled"),
+            ImageGenerationErrorKind::RouteDisabled
+        );
+        assert_eq!(
+            classify_image_route_error("Image Generation Model is explicitly Unsupported"),
+            ImageGenerationErrorKind::CapabilityUnsupported
+        );
+        assert_eq!(
+            classify_image_route_error("Image Generation Model capability is Unknown"),
+            ImageGenerationErrorKind::CapabilityUnknown
+        );
     }
 }

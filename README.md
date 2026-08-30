@@ -1,6 +1,6 @@
 # xiaochat
 
-xiaochat adalah bot Telegram asynchronous berbasis Rust untuk endpoint AI yang kompatibel dengan OpenAI. Versi 0.2.0 berfokus pada **session/data-integrity hardening, owner-only security, streaming yang dapat dibatalkan, serta integrasi fitur Telegram Bot API 10.3 yang dipakai XiaoAI**.
+xiaochat adalah bot Telegram asynchronous berbasis Rust untuk endpoint AI yang kompatibel dengan OpenAI. Branch v0.3.0 menambahkan **role-based multimodal model routing, observable capability discovery, model-aware image generation, dan native Rich command UI Telegram 10.3** di atas hardening session/security 0.2.0.
 
 > XiaoAI tidak mengklaim mengimplementasikan seluruh Telegram Bot API. Client hanya memodelkan method dan update yang dibutuhkan aplikasi.
 
@@ -16,6 +16,21 @@ xiaochat adalah bot Telegram asynchronous berbasis Rust untuk endpoint AI yang k
 - Owner-only authorization melalui `OWNER_USER_ID`; `ALLOWED_CHAT_IDS` hanya mengatur chat tambahan tempat owner boleh menggunakan XiaoAI.
 - Batas download media dan fallback image eksternal yang default-nya nonaktif.
 - Unicode-safe truncation/prefix handling serta HTML escaping untuk data dinamis yang masuk ke `parse_mode=HTML`.
+
+
+### Routing model v0.3.0
+
+Xiao mempunyai lima role:
+
+- **Main Model** — chat/final answer dan pemilik canonical history.
+- **Vision Model** — image dan halaman PDF scan.
+- **Video Model** — video understanding.
+- **Audio STT Model** — native Main audio atau transcription route.
+- **Image Generation Model** — text-to-image.
+
+Empat addon memakai tepat tiga state: **Main Model**, **Specific Model**, atau **Disabled**. Default adalah Main Model. `Main Model` adalah referensi hidup: mengganti Main otomatis memengaruhi addon yang memakai Main, sedangkan Specific tidak berubah. Capability tetap fail-closed; route boleh tersimpan walaupun capability belum tersedia.
+
+Jika specialist berbeda provider/model, Xiao mengirim media + pertanyaan saat ini saja, menerima observation/transcript yang dibatasi, lalu meminta Main membuat jawaban final. Full session history tidak dikirim ke specialist secara default dan intermediate specialist tidak menjadi canonical assistant turn.
 
 ## Telegram Bot API 10.3 yang Digunakan
 
@@ -80,7 +95,7 @@ Mengaktifkannya berarti prompt image dapat dikirim ke provider eksternal tersebu
 - PDF text-native diekstrak lokal; DOCX dan XLSX diekstrak dari container XML dengan batas entry/worksheet untuk mencegah resource exhaustion.
 - PDF scan/image-only dirender maksimal 6 halaman melalui `pdftoppm` dan dianalisis oleh vision model. Pada Linux, instal `poppler-utils` untuk jalur ini.
 - Attachment image/audio/video dan halaman PDF scan dipersist per-session dengan permission ketat, lalu dapat direhidrasi pada turn berikutnya sesuai capability model dan budget context.
-- Capability memakai state `Supported / Unsupported / Unknown`: `/models` metadata digabung dengan probe aman untuk text, vision, tools, dan structured output. Untuk **semua input multimodal baru maupun rehidrasi**, hanya `Some(true)` yang boleh dirutekan; `Unsupported`, `Unknown`, dan record yang hilang fail-closed sampai probe/metadata mengonfirmasi dukungan.
+- Capability memakai state `Supported / Unsupported / Unknown` dengan freshness per capability. `/models` hanya merupakan catalog/metadata evidence dan **tidak** otomatis membuktikan text-chat. Probe aman mencakup text, Vision merah/biru, tools, structured output, native audio/STT; active image-generation probe hanya dijalankan secara eksplisit karena dapat memakai kredit. Semua media baru maupun rehidrasi tetap fail-closed bila capability Unknown/stale.
 
 ## Struktur Direktori
 
@@ -122,6 +137,14 @@ xiao telegram owner <telegram_user_id>
 xiao model [name]
 xiao model probe
 xiao model pick
+xiao model addon
+xiao model addon set vision main
+xiao model addon set image_gen provider_id::model
+xiao model addon reset <vision|video|audio_stt|image_gen|all>
+xiao model addon disable <vision|video|audio_stt|image_gen>
+xiao model addon show <vision|video|audio_stt|image_gen>
+xiao model addon probe [role]
+xiao model addon test <role>
 xiao status
 xiao help
 ```
@@ -140,6 +163,10 @@ AI_ENDPOINT=https://provider.example/v1
 AI_API_KEY=provider-api-key
 AI_MODEL=model-name
 IMAGE_FALLBACK_PROVIDER=none
+IMAGE_PROVIDER_CONNECT_TIMEOUT_SECS=10
+IMAGE_GENERATION_TIMEOUT_SECS=120
+IMAGE_DOWNLOAD_TIMEOUT_SECS=30
+IMAGE_JOB_TIMEOUT_SECS=180
 ```
 
 `AI_ENDPOINT` dan `AI_API_KEY` bersifat generik untuk endpoint OpenAI-compatible.

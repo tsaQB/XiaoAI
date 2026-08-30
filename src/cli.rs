@@ -16,7 +16,10 @@ use crossterm::{
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 
-use crate::ai::service::{load_provider_store, save_provider_store, ProviderConfig};
+use crate::ai::service::{
+    load_provider_store, save_provider_store, CapabilityKind, ModelRole, ModelRoute, ProbeEvent,
+    ProviderConfig,
+};
 
 struct CleanRawMode;
 impl CleanRawMode {
@@ -345,14 +348,14 @@ fn terminal_interactive_multi_select(
 
 pub(crate) async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Option<String> {
     println!("\n\x1b[1;36m== XiaoAI Quickstart Setup Wizard ==\x1b[0m");
-    println!("\x1b[38;5;244mThis wizard will configure your AI Provider and Telegram Bot.\x1b[0m");
+    println!("\x1b[38;5;244mThis wizard will configure your Main Model, addon model routing, and Telegram Bot.\x1b[0m");
     println!("\x1b[38;5;238m────────────────────────────────────────────────────────────\x1b[0m");
 
     let stdin = io::stdin();
     let mut reader = stdin.lock();
 
     // Step 1: AI Provider Endpoint
-    println!("\n\x1b[1;37m[1/3] Configure AI Provider\x1b[0m");
+    println!("\n\x1b[1;37m[1/4] Configure AI Provider & Main Model\x1b[0m");
     println!("\x1b[38;5;244mCommon Endpoints:\x1b[0m");
     println!("  \x1b[38;5;246m• https://api.openai.com/v1\x1b[0m");
     println!("  \x1b[38;5;246m• https://openrouter.ai/api/v1\x1b[0m");
@@ -463,21 +466,118 @@ pub(crate) async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Opt
         println!("\x1b[1;31m[ERROR] Provider was committed but runtime reload failed. Restart XiaoAI before continuing.\x1b[0m");
         return None;
     }
+    println!("\n\x1b[38;5;244mChecking Main Model capabilities...\x1b[0m");
     let probe = ai_service
-        .probe_model_capabilities(&provider, &active_model)
+        .probe_model_capabilities_with_observer(&provider, &active_model, print_probe_event)
         .await;
     println!(
-        "\x1b[38;5;244mCapability probe: vision={:?}, tools={:?}, structured={:?}\x1b[0m",
-        probe.supports_image, probe.supports_tools, probe.supports_structured_output
+        "\x1b[38;5;244mMain capability state: text={:?}, vision={:?}, video={:?}, audio={:?}, stt={:?}, image_gen={:?}\x1b[0m",
+        probe.supports_text_chat,
+        probe.supports_image_input,
+        probe.supports_video_input,
+        probe.supports_audio_input,
+        probe.supports_audio_transcription,
+        probe.supports_image_generation,
     );
 
     println!(
-        "\x1b[1;32m[OK] AI Provider '{}' configured with model '{}'!\x1b[0m",
+        "\x1b[1;32m[OK] AI Provider '{}' configured with Main Model '{}'!\x1b[0m",
         clean_alias, active_model
     );
 
-    // Step 5: Telegram Bot Token
-    println!("\n\x1b[1;37m[2/3] Configure Telegram Bot Token\x1b[0m");
+    // Step 2: Addon model routing. Fresh/default route is always Main Model.
+    println!("\n\x1b[1;37m[2/4] Configure Addon Model Routing\x1b[0m");
+    println!("\x1b[38;5;244mPress Enter for Main Model. Addons are optional overrides and can be changed later with `xiao model addon ...`.\x1b[0m");
+    for role in ModelRole::addon_roles() {
+        loop {
+            print!(
+                "\n\x1b[1;37m{}\x1b[0m \x1b[38;5;244m[Enter=Main Model, s=Specific, d=Disabled]:\x1b[0m ",
+                role.display_name()
+            );
+            let _ = io::stdout().flush();
+            let mut input = String::new();
+            if reader.read_line(&mut input).is_err() {
+                println!("\n\x1b[38;5;244mSetup cancelled.\x1b[0m");
+                return None;
+            }
+            let choice = input.trim().to_ascii_lowercase();
+            let route = match choice.as_str() {
+                "" | "m" | "main" => ModelRoute::MainModel,
+                "d" | "disabled" => ModelRoute::Disabled,
+                "s" | "specific" => {
+                    let providers = ai_service.get_user_providers(0).await;
+                    let mut catalog = Vec::new();
+                    for candidate_provider in &providers {
+                        for candidate_model in &candidate_provider.models {
+                            catalog.push((
+                                candidate_provider.id.clone(),
+                                candidate_model.clone(),
+                                format!("{} :: {}", candidate_provider.name, candidate_model),
+                            ));
+                        }
+                    }
+                    if catalog.is_empty() {
+                        println!("\x1b[1;31m[ERROR] No provider models are available for a Specific route.\x1b[0m");
+                        continue;
+                    }
+                    let labels: Vec<String> = catalog.iter().map(|entry| entry.2.clone()).collect();
+                    let Some(index) = terminal_interactive_select(
+                        &format!("Select {}", role.display_name()),
+                        &labels,
+                        0,
+                        true,
+                        None,
+                    ) else {
+                        println!(
+                            "\x1b[38;5;244mSpecific selection cancelled; choose again.\x1b[0m"
+                        );
+                        continue;
+                    };
+                    let (provider_id, model, _) = catalog[index].clone();
+                    ModelRoute::Specific { provider_id, model }
+                }
+                _ => {
+                    println!("\x1b[1;31m[ERROR] Choose Enter/Main, Specific, or Disabled.\x1b[0m");
+                    continue;
+                }
+            };
+
+            if let Err(error) = ai_service.set_model_route(role, route.clone()).await {
+                println!(
+                    "\x1b[1;31m[ERROR] {} was not saved: {}\x1b[0m",
+                    role.display_name(),
+                    error
+                );
+                continue;
+            }
+            let route_label = match &route {
+                ModelRoute::MainModel => "Main Model".to_string(),
+                ModelRoute::Disabled => "Disabled".to_string(),
+                ModelRoute::Specific { provider_id, model } => {
+                    format!("{} :: {}", provider_id, model)
+                }
+            };
+            match ai_service.resolve_model_route(role).await {
+                Ok(resolved) => println!(
+                    "\x1b[1;32m[OK] {} -> {} (available: {} / {})\x1b[0m",
+                    role.display_name(),
+                    route_label,
+                    resolved.provider.name,
+                    resolved.model
+                ),
+                Err(error) => println!(
+                    "\x1b[38;5;214m[WARN] {} -> {} saved, but currently unavailable: {}\x1b[0m",
+                    role.display_name(),
+                    route_label,
+                    error
+                ),
+            }
+            break;
+        }
+    }
+
+    // Step 3: Telegram Bot Token
+    println!("\n\x1b[1;37m[3/4] Configure Telegram Bot Token\x1b[0m");
     println!("\x1b[38;5;244mHow to get your Bot Token:\x1b[0m");
     println!("  \x1b[38;5;246m1. Open Telegram and search for @BotFather\x1b[0m");
     println!("  \x1b[38;5;246m2. Send /newbot and follow instructions\x1b[0m");
@@ -534,7 +634,7 @@ pub(crate) async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Opt
         }
     };
 
-    println!("\n\x1b[1;37m[3/3] Configure Telegram Owner\x1b[0m");
+    println!("\n\x1b[1;37m[4/4] Configure Telegram Owner\x1b[0m");
     println!("\x1b[38;5;244mMasukkan numeric Telegram user ID Anda. Hanya owner ini yang boleh menggunakan Xiao.\x1b[0m");
     let owner_user_id = loop {
         print!("\x1b[1;37mOwner User ID:\x1b[0m ");
@@ -697,12 +797,13 @@ pub(crate) async fn run_cli_provider_add(ai_service: &AIChatService) {
         println!("\x1b[1;31m[ERROR] Provider was committed but runtime reload failed. Restart XiaoAI before continuing.\x1b[0m");
         return;
     }
+    println!("  Checking model capabilities...");
     let probe = ai_service
-        .probe_model_capabilities(&provider, &active_model)
+        .probe_model_capabilities_with_observer(&provider, &active_model, print_probe_event)
         .await;
     println!(
         "  \x1b[38;5;244mCapability probe: vision={:?}, tools={:?}, structured={:?}\x1b[0m",
-        probe.supports_image, probe.supports_tools, probe.supports_structured_output
+        probe.supports_image_input, probe.supports_tools, probe.supports_structured_output
     );
 
     println!(
@@ -713,7 +814,7 @@ pub(crate) async fn run_cli_provider_add(ai_service: &AIChatService) {
     println!("  \x1b[38;5;244mConfiguration saved to SQLite (runtime source of truth)\x1b[0m\n");
 }
 
-pub(crate) async fn run_cli_provider_remove(_ai_service: &AIChatService) {
+pub(crate) async fn run_cli_provider_remove(ai_service: &AIChatService) {
     let mut store = load_provider_store();
     if store.providers.is_empty() {
         println!("\n\x1b[38;5;214m[WARN] No configured providers found.\x1b[0m");
@@ -737,12 +838,31 @@ pub(crate) async fn run_cli_provider_remove(_ai_service: &AIChatService) {
         terminal_interactive_select("Select Provider to Remove:", &items, 0, false, None);
 
     if let Some(idx) = selected {
+        let target = store.providers[idx].clone();
+        let dependencies = ai_service.provider_route_dependencies(&target.id).await;
+        if !dependencies.is_empty() {
+            let roles = dependencies
+                .iter()
+                .map(|role| role.display_name())
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "\n\x1b[1;31m[BLOCKED] Provider '{}' masih dipakai oleh addon Specific: {}.\x1b[0m",
+                target.name, roles
+            );
+            println!("  Reset/disable addon tersebut terlebih dahulu; Xiao tidak akan meroute ulang diam-diam.\n");
+            return;
+        }
         let removed = store.providers.remove(idx);
         if store.active_id.as_deref() == Some(removed.id.as_str()) {
             store.active_id = store.providers.first().map(|provider| provider.id.clone());
         }
         if let Err(error) = save_provider_store(&store) {
             println!("\n\x1b[1;31m[ERROR] Provider was not removed: {error}\x1b[0m\n");
+            return;
+        }
+        if !ai_service.reload_provider_store().await {
+            println!("\n\x1b[38;5;214m[WARN] Provider terhapus secara durable, tetapi runtime reload gagal. Restart Xiao sebelum melanjutkan.\x1b[0m\n");
             return;
         }
         println!(
@@ -969,6 +1089,18 @@ pub(crate) async fn run_cli_provider_menu(ai_service: &AIChatService, action: Op
                     }
                 }
                 2 => {
+                    let dependencies = ai_service
+                        .provider_route_dependencies(&target_prov.id)
+                        .await;
+                    if !dependencies.is_empty() {
+                        let roles = dependencies
+                            .iter()
+                            .map(|role| role.display_name())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        println!("\n\x1b[1;31m[BLOCKED] Provider '{}' masih dipakai oleh addon Specific: {}.\x1b[0m\n", target_prov.name, roles);
+                        continue;
+                    }
                     let mut updated_store = load_provider_store();
                     if let Some(pos) = updated_store
                         .providers
@@ -988,6 +1120,10 @@ pub(crate) async fn run_cli_provider_menu(ai_service: &AIChatService, action: Op
                             );
                             continue;
                         }
+                        if !ai_service.reload_provider_store().await {
+                            println!("\n\x1b[38;5;214m[WARN] Provider terhapus secara durable, tetapi runtime reload gagal. Restart Xiao.\x1b[0m\n");
+                            continue;
+                        }
                         println!(
                             "\n\x1b[1;32m[OK] Provider '{}' deleted.\x1b[0m\n",
                             removed.name
@@ -1002,6 +1138,297 @@ pub(crate) async fn run_cli_provider_menu(ai_service: &AIChatService, action: Op
             run_cli_provider_remove(ai_service).await;
         } else {
             break;
+        }
+    }
+}
+
+fn addon_route_text(route: &ModelRoute, providers: &[ProviderConfig]) -> String {
+    match route {
+        ModelRoute::MainModel => "Main Model".to_string(),
+        ModelRoute::Disabled => "Disabled".to_string(),
+        ModelRoute::Specific { provider_id, model } => {
+            let provider = providers
+                .iter()
+                .find(|provider| &provider.id == provider_id)
+                .map(|provider| provider.name.as_str())
+                .unwrap_or(provider_id.as_str());
+            format!("{} :: {}", provider, model)
+        }
+    }
+}
+
+fn print_probe_event(event: ProbeEvent) {
+    match event {
+        ProbeEvent::Started { capability } => {
+            println!("  [probe] {:?}: started", capability);
+        }
+        ProbeEvent::Progress {
+            capability,
+            message,
+        } => {
+            println!("  [probe] {:?}: {}", capability, message);
+        }
+        ProbeEvent::Completed {
+            capability,
+            outcome,
+        } => {
+            println!("  [probe] {:?}: {:?}", capability, outcome);
+        }
+        ProbeEvent::Skipped { capability, reason } => {
+            println!("  [skip] {:?}: {}", capability, reason);
+        }
+        ProbeEvent::Persistence { saved } => {
+            if saved {
+                println!("  [save] capability candidate persisted");
+            } else {
+                println!("  [ERROR] capability candidate was not persisted");
+            }
+        }
+        ProbeEvent::Finished => println!("  [done] probe completed"),
+    }
+}
+
+async fn probe_addon_role(ai_service: &AIChatService, role: ModelRole) {
+    let route = match ai_service.resolve_model_route_unchecked(role).await {
+        Ok(route) => route,
+        Err(error) => {
+            println!("[ERROR] {}", error);
+            return;
+        }
+    };
+    println!(
+        "Checking {}: {} / {}",
+        role.display_name(),
+        route.provider.name,
+        route.model
+    );
+    let record = ai_service
+        .probe_model_capabilities_with_observer(&route.provider, &route.model, print_probe_event)
+        .await;
+    println!(
+        "Result: text={:?}, vision={:?}, video={:?}, audio={:?}, stt={:?}, image_gen={:?}",
+        record.supports_text_chat,
+        record.supports_image_input,
+        record.supports_video_input,
+        record.supports_audio_input,
+        record.supports_audio_transcription,
+        record.supports_image_generation,
+    );
+}
+
+pub(crate) async fn run_cli_model_addon(ai_service: &AIChatService, args: &[String]) {
+    let action = args.first().map(String::as_str).unwrap_or("list");
+    let providers = ai_service.get_user_providers(0).await;
+    let routing = ai_service.model_routing_config().await;
+
+    match action {
+        "list" => {
+            println!("\n== Model Addon Routing ==");
+            for role in ModelRole::addon_roles() {
+                let route = routing
+                    .route(role)
+                    .cloned()
+                    .unwrap_or(ModelRoute::MainModel);
+                let health = match ai_service.resolve_model_route(role).await {
+                    Ok(resolved) => format!(
+                        "Available — {} / {}",
+                        resolved.provider.name, resolved.model
+                    ),
+                    Err(error) => format!("Unavailable — {}", error),
+                };
+                println!(
+                    "  {:<24} {:<36} {}",
+                    role.display_name(),
+                    addon_route_text(&route, &providers),
+                    health
+                );
+            }
+            println!("\nAddon configuration is CLI-only in v0.3.0. `reset` means Main Model.\n");
+        }
+        "show" => {
+            let Some(role) = args.get(1).and_then(|value| ModelRole::parse(value)) else {
+                println!("Usage: xiao model addon show <vision|video|audio_stt|image_gen>");
+                return;
+            };
+            if role == ModelRole::Main {
+                println!("Main Model is not an addon route.");
+                return;
+            }
+            let route = routing
+                .route(role)
+                .cloned()
+                .unwrap_or(ModelRoute::MainModel);
+            println!(
+                "{}: {}",
+                role.display_name(),
+                addon_route_text(&route, &providers)
+            );
+            match ai_service.resolve_model_route(role).await {
+                Ok(resolved) => println!(
+                    "Health: Available — {} / {}",
+                    resolved.provider.name, resolved.model
+                ),
+                Err(error) => println!("Health: Unavailable — {}", error),
+            }
+        }
+        "set" => {
+            let Some(role) = args.get(1).and_then(|value| ModelRole::parse(value)) else {
+                println!("Usage: xiao model addon set <role> [main|provider::model]");
+                return;
+            };
+            if role == ModelRole::Main {
+                println!("[ERROR] Main Model is changed with `xiao model`, not addon routing.");
+                return;
+            }
+            let route = if let Some(target) = args.get(2) {
+                if target.eq_ignore_ascii_case("main") {
+                    ModelRoute::MainModel
+                } else if let Some((provider_id, model)) = target.split_once("::") {
+                    ModelRoute::Specific {
+                        provider_id: provider_id.to_string(),
+                        model: model.to_string(),
+                    }
+                } else {
+                    println!("[ERROR] Expected `main` or `provider_id::model`.");
+                    return;
+                }
+            } else {
+                let mut choices = vec!["Main Model".to_string()];
+                let mut routes = vec![ModelRoute::MainModel];
+                for provider in &providers {
+                    for model in &provider.models {
+                        choices.push(format!("{} :: {}", provider.name, model));
+                        routes.push(ModelRoute::Specific {
+                            provider_id: provider.id.clone(),
+                            model: model.clone(),
+                        });
+                    }
+                }
+                let Some(index) = terminal_interactive_select(
+                    &format!(
+                        "Select {} route (Enter on Main Model keeps default):",
+                        role.display_name()
+                    ),
+                    &choices,
+                    0,
+                    true,
+                    None,
+                ) else {
+                    return;
+                };
+                routes[index].clone()
+            };
+            match ai_service.set_model_route(role, route.clone()).await {
+                Ok(()) => println!(
+                    "[OK] {} -> {}",
+                    role.display_name(),
+                    addon_route_text(&route, &providers)
+                ),
+                Err(error) => println!("[ERROR] {}", error),
+            }
+        }
+        "reset" => {
+            let Some(target) = args.get(1) else {
+                println!("Usage: xiao model addon reset <role|all>");
+                return;
+            };
+            if target.eq_ignore_ascii_case("all") {
+                for role in ModelRole::addon_roles() {
+                    if let Err(error) = ai_service
+                        .set_model_route(role, ModelRoute::MainModel)
+                        .await
+                    {
+                        println!("[ERROR] {}: {}", role.display_name(), error);
+                        return;
+                    }
+                }
+                println!("[OK] All addon routes reset to Main Model.");
+                return;
+            }
+            let Some(role) = ModelRole::parse(target) else {
+                println!("[ERROR] Unknown addon role: {}", target);
+                return;
+            };
+            match ai_service
+                .set_model_route(role, ModelRoute::MainModel)
+                .await
+            {
+                Ok(()) => println!("[OK] {} -> Main Model", role.display_name()),
+                Err(error) => println!("[ERROR] {}", error),
+            }
+        }
+        "disable" => {
+            let Some(role) = args.get(1).and_then(|value| ModelRole::parse(value)) else {
+                println!("Usage: xiao model addon disable <role>");
+                return;
+            };
+            match ai_service.set_model_route(role, ModelRoute::Disabled).await {
+                Ok(()) => println!("[OK] {} -> Disabled", role.display_name()),
+                Err(error) => println!("[ERROR] {}", error),
+            }
+        }
+        "probe" => {
+            if let Some(role_name) = args.get(1) {
+                let Some(role) = ModelRole::parse(role_name) else {
+                    println!("[ERROR] Unknown role: {}", role_name);
+                    return;
+                };
+                probe_addon_role(ai_service, role).await;
+            } else {
+                for role in ModelRole::addon_roles() {
+                    probe_addon_role(ai_service, role).await;
+                }
+            }
+        }
+        "test" => {
+            let Some(role) = args.get(1).and_then(|value| ModelRole::parse(value)) else {
+                println!("Usage: xiao model addon test <role>");
+                return;
+            };
+            if role == ModelRole::Main {
+                println!("[ERROR] Main Model is not an addon route.");
+                return;
+            }
+            println!("Testing saved route end-to-end without changing routing...");
+            match role {
+                ModelRole::ImageGeneration => {
+                    println!("[WARN] This explicit image-generation test can consume provider credits.");
+                    match ai_service
+                        .probe_image_generation_active_with_observer(role, print_probe_event)
+                        .await
+                    {
+                        Ok(record) if record.supports_image_generation == Some(true) => {
+                            println!("[OK] Image Generation Model completed an active functional probe and the evidence was saved.");
+                        }
+                        Ok(record) => println!(
+                            "[FAIL] Image generation remains {:?}; timeout/provider errors remain Unknown rather than Unsupported.",
+                            record.state_for(CapabilityKind::ImageGeneration)
+                        ),
+                        Err(error) => println!("[FAIL] {error}"),
+                    }
+                }
+                ModelRole::Vision | ModelRole::AudioStt => {
+                    probe_addon_role(ai_service, role).await;
+                    match ai_service.resolve_model_route(role).await {
+                        Ok(resolved) => println!(
+                            "[OK] {} functional sample verified on {} / {}.",
+                            role.display_name(), resolved.provider.name, resolved.model
+                        ),
+                        Err(error) => println!("[FAIL] {error}"),
+                    }
+                }
+                ModelRole::Video => match ai_service.resolve_model_route(role).await {
+                    Ok(resolved) => println!(
+                        "[OK] Video route is verified by available evidence: {} / {}. No portable active video sample is sent automatically.",
+                        resolved.provider.name, resolved.model
+                    ),
+                    Err(error) => println!("[FAIL] {error}"),
+                },
+                ModelRole::Main => unreachable!(),
+            }
+        }
+        _ => {
+            println!("Usage: xiao model addon [list|set|reset|disable|show|probe|test]");
         }
     }
 }
@@ -1029,15 +1456,21 @@ pub(crate) async fn run_cli_model_probe(ai_service: &AIChatService) {
                     models.first().cloned().unwrap_or_default()
                 };
                 if !model.is_empty() {
-                    let record = ai_service.probe_model_capabilities(&provider, &model).await;
+                    let record = ai_service
+                        .probe_model_capabilities_with_observer(
+                            &provider,
+                            &model,
+                            print_probe_event,
+                        )
+                        .await;
                     println!(
                         "  active {}: text={:?} image={:?} tools={:?} structured={:?} files={:?}",
                         record.model,
-                        record.supports_text,
-                        record.supports_image,
+                        record.supports_text_chat,
+                        record.supports_image_input,
                         record.supports_tools,
                         record.supports_structured_output,
-                        record.supports_file_input,
+                        record.supports_native_file_input,
                     );
                 }
             }
@@ -1051,12 +1484,12 @@ pub(crate) async fn run_cli_model_probe(ai_service: &AIChatService) {
             "- {} / {}: image={:?}, audio={:?}, video={:?}, tools={:?}, structured={:?}, files={:?}, context={:?} [{}]",
             record.provider_name,
             record.model,
-            record.supports_image,
-            record.supports_audio,
-            record.supports_video,
+            record.supports_image_input,
+            record.supports_audio_input,
+            record.supports_video_input,
             record.supports_tools,
             record.supports_structured_output,
-            record.supports_file_input,
+            record.supports_native_file_input,
             record.context_window,
             record.source
         );
@@ -1572,9 +2005,8 @@ pub(crate) fn print_cli_help() {
     println!("  \x1b[36msetup\x1b[0m                               Quickstart setup wizard");
     println!("  \x1b[36mprovider [add] [del] [status]\x1b[0m       Manage AI providers");
     println!("  \x1b[36mtelegram [check|bind|change|owner]\x1b[0m  Manage Telegram bot and owner");
-    println!(
-        "  \x1b[36mmodel [name] [pick]\x1b[0m                 Select, search, or whitelist models"
-    );
+    println!("  \x1b[36mmodel [name] [pick]\x1b[0m                 Select/search Main Model");
+    println!("  \x1b[36mmodel addon [list|set|reset|disable|show|probe|test]\x1b[0m");
     println!("  \x1b[36mstatus\x1b[0m                              System health check");
     println!("  \x1b[36mhelp\x1b[0m                                Show this help\n");
 }

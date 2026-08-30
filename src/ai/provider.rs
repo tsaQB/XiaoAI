@@ -1,5 +1,7 @@
+use base64::Engine;
 use chrono::Local;
 use futures_util::StreamExt;
+use reqwest::multipart::{Form, Part};
 use serde_json::{json, Value};
 use std::time::Duration;
 use tracing::warn;
@@ -40,20 +42,110 @@ async fn read_bounded_provider_text(response: reqwest::Response, max_bytes: usiz
     String::from_utf8(bytes).unwrap_or_default()
 }
 
+fn tiny_silent_wav() -> Vec<u8> {
+    const SAMPLE_RATE: u32 = 8_000;
+    const SAMPLES: usize = 2_000;
+    let data_len = (SAMPLES * 2) as u32;
+    let mut wav = Vec::with_capacity(44 + data_len as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    wav.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.resize(44 + data_len as usize, 0);
+    wav
+}
+
 use super::capability::{
     get_model_capabilities_with_meta, model_metadata_key, ModelCapability, ModelMetadata,
 };
+use super::routing::{ModelRole, ModelRoute, ResolvedModelRoute, RouteOrigin};
 use super::service::AIChatService;
 use super::storage::{
-    load_provider_store, persist_capability_registry, persist_provider_state, CapabilityRecord,
-    ProviderConfig,
+    load_provider_store, persist_capability_registry, persist_model_routing,
+    persist_provider_state, CapabilityEvidence, CapabilityEvidenceSource, CapabilityKind,
+    CapabilityRecord, CapabilityState, EvidenceFreshness, ProbeEvent, ProbeOutcome, ProviderConfig,
 };
 
 #[derive(Debug)]
 enum CapabilityProbeResponse {
     Success(Value),
     Rejected,
-    Unknown,
+    Unknown(ProbeOutcome),
+}
+
+impl CapabilityProbeResponse {
+    fn outcome(&self, validator: Option<bool>) -> ProbeOutcome {
+        match (self, validator) {
+            (_, Some(true)) => ProbeOutcome::Supported,
+            (Self::Rejected, _) | (_, Some(false)) => ProbeOutcome::Unsupported,
+            (Self::Unknown(outcome), _) => *outcome,
+            (Self::Success(_), None) => ProbeOutcome::Inconclusive,
+        }
+    }
+}
+
+fn capability_state(value: Option<bool>) -> CapabilityState {
+    match value {
+        Some(true) => CapabilityState::Supported,
+        Some(false) => CapabilityState::Unsupported,
+        None => CapabilityState::Unknown,
+    }
+}
+
+fn catalog_presence_text_chat_claim() -> Option<bool> {
+    // Being present in GET /models is catalog evidence only.
+    None
+}
+
+fn normalized_modalities(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => (!value.trim().is_empty()).then(|| value.trim().to_string()),
+        Value::Array(values) => {
+            let joined = values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join(",");
+            (!joined.is_empty()).then_some(joined)
+        }
+        _ => None,
+    }
+}
+
+fn normalize_provider_model_metadata(item: &Value) -> Option<ModelMetadata> {
+    let id = item.get("id").and_then(Value::as_str)?.to_string();
+    let context_length = item
+        .get("context_length")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    let modalities = item
+        .get("architecture")
+        .and_then(|architecture| architecture.get("modality"))
+        .or_else(|| item.get("modalities"))
+        .and_then(normalized_modalities);
+    let max_completion_tokens = item
+        .get("top_provider")
+        .and_then(|provider| provider.get("max_completion_tokens"))
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+
+    Some(ModelMetadata {
+        id,
+        name: item.get("name").and_then(Value::as_str).map(str::to_string),
+        context_length,
+        modalities,
+        max_completion_tokens,
+    })
 }
 
 fn assistant_text(body: &Value) -> Option<String> {
@@ -80,17 +172,25 @@ fn assistant_text(body: &Value) -> Option<String> {
 fn validate_text_probe(response: &CapabilityProbeResponse) -> Option<bool> {
     match response {
         CapabilityProbeResponse::Rejected => Some(false),
-        CapabilityProbeResponse::Unknown => None,
+        CapabilityProbeResponse::Unknown(_) => None,
         CapabilityProbeResponse::Success(body) => assistant_text(body)
             .filter(|text| !text.is_empty())
             .map(|_| true),
     }
 }
 
+fn validate_endpoint_acceptance(response: &CapabilityProbeResponse) -> Option<bool> {
+    match response {
+        CapabilityProbeResponse::Rejected => Some(false),
+        CapabilityProbeResponse::Unknown(_) => None,
+        CapabilityProbeResponse::Success(_) => Some(true),
+    }
+}
+
 fn validate_tools_probe(response: &CapabilityProbeResponse) -> Option<bool> {
     match response {
         CapabilityProbeResponse::Rejected => Some(false),
-        CapabilityProbeResponse::Unknown => None,
+        CapabilityProbeResponse::Unknown(_) => None,
         CapabilityProbeResponse::Success(body) => {
             let tool_calls = body
                 .get("choices")
@@ -119,7 +219,7 @@ fn validate_tools_probe(response: &CapabilityProbeResponse) -> Option<bool> {
 fn validate_structured_probe(response: &CapabilityProbeResponse) -> Option<bool> {
     match response {
         CapabilityProbeResponse::Rejected => Some(false),
-        CapabilityProbeResponse::Unknown => None,
+        CapabilityProbeResponse::Unknown(_) => None,
         CapabilityProbeResponse::Success(body) => assistant_text(body)
             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
             .and_then(|value| {
@@ -131,7 +231,7 @@ fn validate_structured_probe(response: &CapabilityProbeResponse) -> Option<bool>
 fn validate_color_probe(response: &CapabilityProbeResponse, expected: &str) -> Option<bool> {
     match response {
         CapabilityProbeResponse::Rejected => Some(false),
-        CapabilityProbeResponse::Unknown => None,
+        CapabilityProbeResponse::Unknown(_) => None,
         CapabilityProbeResponse::Success(body) => {
             let text = assistant_text(body)?;
             let normalized = text
@@ -212,6 +312,242 @@ impl AIChatService {
             .or_else(|| store.providers.first().cloned())
     }
 
+    pub async fn model_routing_config(&self) -> super::routing::ModelRoutingConfig {
+        self.model_routing.read().await.clone()
+    }
+
+    pub async fn reload_model_routing(&self) -> bool {
+        let config = match tokio::task::spawn_blocking(super::storage::load_model_routing).await {
+            Ok(config) => config,
+            Err(error) => {
+                warn!("Failed to reload model routing: {error}");
+                return false;
+            }
+        };
+        *self.model_routing.write().await = config;
+        true
+    }
+
+    pub async fn set_model_route(&self, role: ModelRole, route: ModelRoute) -> Result<(), String> {
+        if role == ModelRole::Main {
+            return Err(
+                "Main Model is changed through `xiao model` or Telegram /model".to_string(),
+            );
+        }
+        if let ModelRoute::Specific { provider_id, model } = &route {
+            let store = self.provider_store.read().await;
+            let provider = store
+                .providers
+                .iter()
+                .find(|provider| &provider.id == provider_id)
+                .ok_or_else(|| format!("Provider '{provider_id}' not found"))?;
+            if provider.models.is_empty() || !provider.models.iter().any(|entry| entry == model) {
+                return Err(format!(
+                    "Model '{model}' is not present in provider '{}' catalog; refresh/probe the provider first",
+                    provider.name
+                ));
+            }
+        }
+
+        let candidate = {
+            let current = self.model_routing.read().await;
+            let mut candidate = current.clone();
+            candidate.set_route(role, route)?;
+            candidate
+        };
+        if !persist_model_routing(candidate.clone()).await {
+            return Err(
+                "model routing persistence failed; runtime state was not changed".to_string(),
+            );
+        }
+        *self.model_routing.write().await = candidate;
+        Ok(())
+    }
+
+    pub async fn provider_route_dependencies(&self, provider_id: &str) -> Vec<ModelRole> {
+        self.model_routing
+            .read()
+            .await
+            .roles_using_provider(provider_id)
+    }
+
+    fn capability_ttl(record: &CapabilityRecord, capability: CapabilityKind) -> Duration {
+        if record.evidence.iter().any(|evidence| {
+            evidence.capability == capability
+                && evidence.source == CapabilityEvidenceSource::ActiveProbe
+        }) {
+            Duration::from_secs(7 * 24 * 60 * 60)
+        } else {
+            Duration::from_secs(6 * 60 * 60)
+        }
+    }
+
+    fn capability_is_fresh(record: &CapabilityRecord, capability: CapabilityKind) -> bool {
+        record.freshness_for(capability, Self::capability_ttl(record, capability))
+            == EvidenceFreshness::Fresh
+    }
+
+    fn required_capability_is_fresh(
+        role: ModelRole,
+        record: &CapabilityRecord,
+        origin: RouteOrigin,
+    ) -> bool {
+        match role {
+            ModelRole::Main => Self::capability_is_fresh(record, CapabilityKind::TextChat),
+            ModelRole::Vision => Self::capability_is_fresh(record, CapabilityKind::ImageInput),
+            ModelRole::Video => Self::capability_is_fresh(record, CapabilityKind::VideoInput),
+            ModelRole::ImageGeneration => {
+                Self::capability_is_fresh(record, CapabilityKind::ImageGeneration)
+            }
+            ModelRole::AudioStt if origin == RouteOrigin::MainModel => {
+                let audio = record.state_for(CapabilityKind::AudioInput);
+                let stt = record.state_for(CapabilityKind::AudioTranscription);
+                (audio == CapabilityState::Supported
+                    && Self::capability_is_fresh(record, CapabilityKind::AudioInput))
+                    || (stt == CapabilityState::Supported
+                        && Self::capability_is_fresh(record, CapabilityKind::AudioTranscription))
+                    || (audio == CapabilityState::Unsupported
+                        && stt == CapabilityState::Unsupported
+                        && Self::capability_is_fresh(record, CapabilityKind::AudioInput)
+                        && Self::capability_is_fresh(record, CapabilityKind::AudioTranscription))
+            }
+            ModelRole::AudioStt => {
+                Self::capability_is_fresh(record, CapabilityKind::AudioTranscription)
+            }
+        }
+    }
+
+    fn required_capability_state(
+        role: ModelRole,
+        record: &CapabilityRecord,
+        origin: RouteOrigin,
+    ) -> CapabilityState {
+        match role {
+            ModelRole::Main => record.state_for(CapabilityKind::TextChat),
+            ModelRole::Vision => record.state_for(CapabilityKind::ImageInput),
+            ModelRole::Video => record.state_for(CapabilityKind::VideoInput),
+            ModelRole::ImageGeneration => record.state_for(CapabilityKind::ImageGeneration),
+            ModelRole::AudioStt if origin == RouteOrigin::MainModel => {
+                if record.state_for(CapabilityKind::AudioInput) == CapabilityState::Supported
+                    || record.state_for(CapabilityKind::AudioTranscription)
+                        == CapabilityState::Supported
+                {
+                    CapabilityState::Supported
+                } else if record.state_for(CapabilityKind::AudioInput)
+                    == CapabilityState::Unsupported
+                    && record.state_for(CapabilityKind::AudioTranscription)
+                        == CapabilityState::Unsupported
+                {
+                    CapabilityState::Unsupported
+                } else {
+                    CapabilityState::Unknown
+                }
+            }
+            ModelRole::AudioStt => record.state_for(CapabilityKind::AudioTranscription),
+        }
+    }
+
+    pub async fn resolve_model_route_unchecked(
+        &self,
+        role: ModelRole,
+    ) -> Result<ResolvedModelRoute, String> {
+        let store = self.provider_store.read().await;
+        let main_provider = store
+            .active_id
+            .as_deref()
+            .and_then(|id| store.providers.iter().find(|provider| provider.id == id))
+            .or_else(|| store.providers.first())
+            .cloned()
+            .ok_or_else(|| "No AI provider is configured".to_string())?;
+        let main_model = main_provider.active_model.trim().to_string();
+        if main_model.is_empty() {
+            return Err("Main Model is not selected".to_string());
+        }
+
+        let (provider, model, route_origin) = if role == ModelRole::Main {
+            (main_provider, main_model, RouteOrigin::Main)
+        } else {
+            let routing = self.model_routing.read().await;
+            match routing
+                .route(role)
+                .cloned()
+                .unwrap_or(ModelRoute::MainModel)
+            {
+                ModelRoute::MainModel => (main_provider, main_model, RouteOrigin::MainModel),
+                ModelRoute::Disabled => return Err(format!("{} is Disabled", role.display_name())),
+                ModelRoute::Specific { provider_id, model } => {
+                    let provider = store
+                        .providers
+                        .iter()
+                        .find(|provider| provider.id == provider_id)
+                        .cloned()
+                        .ok_or_else(|| format!("Provider '{provider_id}' not found"))?;
+                    if provider.models.is_empty()
+                        || !provider.models.iter().any(|entry| entry == &model)
+                    {
+                        return Err(format!(
+                            "Model '{model}' is no longer present in provider '{}' catalog",
+                            provider.name
+                        ));
+                    }
+                    (provider, model, RouteOrigin::Specific)
+                }
+            }
+        };
+        drop(store);
+
+        let capability = self
+            .capability_record(&provider.endpoint, &model)
+            .await
+            .unwrap_or_else(|| CapabilityRecord {
+                provider_id: provider.endpoint.trim_end_matches('/').to_string(),
+                provider_name: provider.name.clone(),
+                model: model.clone(),
+                ..CapabilityRecord::default()
+            });
+
+        Ok(ResolvedModelRoute {
+            role,
+            provider,
+            model,
+            capability,
+            route_origin,
+        })
+    }
+
+    pub async fn resolve_model_route(&self, role: ModelRole) -> Result<ResolvedModelRoute, String> {
+        let resolved = self.resolve_model_route_unchecked(role).await?;
+        if resolved.capability.checked_at.is_empty()
+            || !Self::required_capability_is_fresh(
+                role,
+                &resolved.capability,
+                resolved.route_origin,
+            )
+        {
+            return Err(format!(
+                "{} capability is Unknown or stale for {} / {}; run a capability probe",
+                role.display_name(),
+                resolved.provider.name,
+                resolved.model
+            ));
+        }
+        match Self::required_capability_state(role, &resolved.capability, resolved.route_origin) {
+            CapabilityState::Supported => Ok(resolved),
+            CapabilityState::Unsupported => Err(format!(
+                "{} is explicitly Unsupported by {} / {}",
+                role.display_name(),
+                resolved.provider.name,
+                resolved.model
+            )),
+            CapabilityState::Unknown => Err(format!(
+                "{} capability is Unknown for {} / {}; Xiao fails closed",
+                role.display_name(),
+                resolved.provider.name,
+                resolved.model
+            )),
+        }
+    }
+
     pub async fn update_provider_models(
         &self,
         _user_id: i64,
@@ -267,7 +603,7 @@ impl AIChatService {
         provider_id: &str,
         model_name: &str,
     ) -> bool {
-        let (candidate, selected_provider) = {
+        let candidate = {
             let store = self.provider_store.read().await;
             let mut candidate = store.clone();
             let Some(provider) = candidate
@@ -283,24 +619,14 @@ impl AIChatService {
                 return false;
             }
             provider.active_model = model_name.to_string();
-            let selected_provider = provider.clone();
             candidate.active_id = Some(provider_id.to_string());
-            (candidate, selected_provider)
+            candidate
         };
 
         if !persist_provider_state(candidate.clone()).await {
             return false;
         }
         *self.provider_store.write().await = candidate;
-        if self
-            .capability_record(&selected_provider.endpoint, model_name)
-            .await
-            .is_none()
-        {
-            let _ = self
-                .probe_model_capabilities(&selected_provider, model_name)
-                .await;
-        }
         true
     }
 
@@ -329,17 +655,303 @@ impl AIChatService {
 
         let response = match req.send().await {
             Ok(response) => response,
-            Err(_) => return CapabilityProbeResponse::Unknown,
+            Err(error) if error.is_timeout() => {
+                return CapabilityProbeResponse::Unknown(ProbeOutcome::Timeout)
+            }
+            Err(error) if error.is_connect() => {
+                return CapabilityProbeResponse::Unknown(ProbeOutcome::NetworkError)
+            }
+            Err(_) => return CapabilityProbeResponse::Unknown(ProbeOutcome::NetworkError),
         };
         if response.status().is_success() {
             return match read_bounded_provider_json(response).await {
                 Ok(body) => CapabilityProbeResponse::Success(body),
-                Err(_) => CapabilityProbeResponse::Unknown,
+                Err(_) => CapabilityProbeResponse::Unknown(ProbeOutcome::Inconclusive),
             };
         }
-        match response.status().as_u16() {
-            400 | 404 | 405 | 415 | 422 => CapabilityProbeResponse::Rejected,
-            _ => CapabilityProbeResponse::Unknown,
+        let status = response.status().as_u16();
+        let body = read_bounded_provider_text(response, 64 * 1024)
+            .await
+            .to_ascii_lowercase();
+        match status {
+            401 | 403 => CapabilityProbeResponse::Unknown(ProbeOutcome::AuthFailed),
+            429 => CapabilityProbeResponse::Unknown(ProbeOutcome::RateLimited),
+            500..=599 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProviderError),
+            404 | 405 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch),
+            400 | 415 | 422
+                if body.contains("unsupported")
+                    || body.contains("not supported")
+                    || body.contains("does not support")
+                    || body.contains("unsupported content")
+                    || body.contains("unsupported modality") =>
+            {
+                CapabilityProbeResponse::Rejected
+            }
+            400 | 415 | 422 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch),
+            _ => CapabilityProbeResponse::Unknown(ProbeOutcome::Inconclusive),
+        }
+    }
+
+    async fn run_audio_input_probe_request(
+        &self,
+        provider: &ProviderConfig,
+        model: &str,
+    ) -> CapabilityProbeResponse {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(tiny_silent_wav());
+        self.run_capability_probe_request(
+            provider,
+            json!({
+                "model": model,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Reply with exactly OK after processing this short audio sample."},
+                        {"type": "input_audio", "input_audio": {"data": encoded, "format": "wav"}}
+                    ]
+                }],
+                "stream": false,
+                "max_tokens": 4
+            }),
+        )
+        .await
+    }
+
+    async fn run_transcription_probe_request(
+        &self,
+        provider: &ProviderConfig,
+        model: &str,
+    ) -> CapabilityProbeResponse {
+        let url = format!(
+            "{}/audio/transcriptions",
+            provider.endpoint.trim_end_matches('/')
+        );
+        let part = match Part::bytes(tiny_silent_wav())
+            .file_name("xiao-capability-probe.wav")
+            .mime_str("audio/wav")
+        {
+            Ok(part) => part,
+            Err(_) => return CapabilityProbeResponse::Unknown(ProbeOutcome::Inconclusive),
+        };
+        let form = Form::new()
+            .part("file", part)
+            .text("model", model.to_string());
+        let mut request = self
+            .client
+            .post(url)
+            .multipart(form)
+            .timeout(Duration::from_secs(20));
+        if !provider.api_key.is_empty()
+            && !["none", "-", "no", "null"]
+                .iter()
+                .any(|value| provider.api_key.eq_ignore_ascii_case(value))
+        {
+            request = request.header("Authorization", format!("Bearer {}", provider.api_key));
+        }
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) if error.is_timeout() => {
+                return CapabilityProbeResponse::Unknown(ProbeOutcome::Timeout)
+            }
+            Err(error) if error.is_connect() => {
+                return CapabilityProbeResponse::Unknown(ProbeOutcome::NetworkError)
+            }
+            Err(_) => return CapabilityProbeResponse::Unknown(ProbeOutcome::NetworkError),
+        };
+        if response.status().is_success() {
+            return match read_bounded_provider_json(response).await {
+                Ok(body) if body.get("text").and_then(Value::as_str).is_some() => {
+                    CapabilityProbeResponse::Success(body)
+                }
+                Ok(_) | Err(_) => CapabilityProbeResponse::Unknown(ProbeOutcome::Inconclusive),
+            };
+        }
+        let status = response.status().as_u16();
+        let body = read_bounded_provider_text(response, 64 * 1024)
+            .await
+            .to_ascii_lowercase();
+        match status {
+            401 | 403 => CapabilityProbeResponse::Unknown(ProbeOutcome::AuthFailed),
+            429 => CapabilityProbeResponse::Unknown(ProbeOutcome::RateLimited),
+            500..=599 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProviderError),
+            404 | 405 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch),
+            400 | 415 | 422
+                if body.contains("unsupported")
+                    || body.contains("not supported")
+                    || body.contains("does not support")
+                    || body.contains("unsupported modality") =>
+            {
+                CapabilityProbeResponse::Rejected
+            }
+            400 | 415 | 422 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch),
+            _ => CapabilityProbeResponse::Unknown(ProbeOutcome::Inconclusive),
+        }
+    }
+
+    async fn run_image_generation_probe_request(
+        &self,
+        provider: &ProviderConfig,
+        model: &str,
+    ) -> CapabilityProbeResponse {
+        let url = format!(
+            "{}/images/generations",
+            provider.endpoint.trim_end_matches('/')
+        );
+        let mut request = self
+            .client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .json(&json!({
+                "model": model,
+                "prompt": "A simple solid gray square. Capability probe.",
+                "n": 1,
+                "response_format": "b64_json"
+            }))
+            .timeout(Duration::from_secs(120));
+        if !provider.api_key.is_empty()
+            && !["none", "-", "no", "null"]
+                .iter()
+                .any(|value| provider.api_key.eq_ignore_ascii_case(value))
+        {
+            request = request.header("Authorization", format!("Bearer {}", provider.api_key));
+        }
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) if error.is_timeout() => {
+                return CapabilityProbeResponse::Unknown(ProbeOutcome::Timeout)
+            }
+            Err(error) if error.is_connect() => {
+                return CapabilityProbeResponse::Unknown(ProbeOutcome::NetworkError)
+            }
+            Err(_) => return CapabilityProbeResponse::Unknown(ProbeOutcome::NetworkError),
+        };
+        if response.status().is_success() {
+            return match read_bounded_provider_json(response).await {
+                Ok(body)
+                    if body
+                        .get("data")
+                        .and_then(Value::as_array)
+                        .and_then(|data| data.first())
+                        .is_some_and(|item| {
+                            item.get("b64_json").and_then(Value::as_str).is_some()
+                                || item
+                                    .get("url")
+                                    .and_then(Value::as_str)
+                                    .and_then(|url| url::Url::parse(url).ok())
+                                    .is_some_and(|url| matches!(url.scheme(), "http" | "https"))
+                        }) =>
+                {
+                    CapabilityProbeResponse::Success(body)
+                }
+                Ok(_) | Err(_) => CapabilityProbeResponse::Unknown(ProbeOutcome::Inconclusive),
+            };
+        }
+        let status = response.status().as_u16();
+        let body = read_bounded_provider_text(response, 64 * 1024)
+            .await
+            .to_ascii_lowercase();
+        match status {
+            401 | 403 => CapabilityProbeResponse::Unknown(ProbeOutcome::AuthFailed),
+            429 => CapabilityProbeResponse::Unknown(ProbeOutcome::RateLimited),
+            500..=599 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProviderError),
+            404 | 405 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch),
+            400 | 415 | 422
+                if body.contains("unsupported")
+                    || body.contains("not supported")
+                    || body.contains("does not support")
+                    || body.contains("unsupported image generation") =>
+            {
+                CapabilityProbeResponse::Rejected
+            }
+            400 | 415 | 422 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch),
+            _ => CapabilityProbeResponse::Unknown(ProbeOutcome::Inconclusive),
+        }
+    }
+
+    pub async fn probe_image_generation_active_with_observer<F>(
+        &self,
+        role: ModelRole,
+        mut observer: F,
+    ) -> Result<CapabilityRecord, String>
+    where
+        F: FnMut(ProbeEvent),
+    {
+        let route = self.resolve_model_route_unchecked(role).await?;
+        observer(ProbeEvent::Started {
+            capability: CapabilityKind::ImageGeneration,
+        });
+        observer(ProbeEvent::Progress {
+            capability: CapabilityKind::ImageGeneration,
+            message: "Running explicit active image-generation probe; this may consume provider credits...".to_string(),
+        });
+        let response = self
+            .run_image_generation_probe_request(&route.provider, &route.model)
+            .await;
+        let value = validate_endpoint_acceptance(&response);
+        let outcome = response.outcome(value);
+        observer(ProbeEvent::Completed {
+            capability: CapabilityKind::ImageGeneration,
+            outcome,
+        });
+
+        let checked_at = Local::now().to_rfc3339();
+        let provider_id = route.provider.endpoint.trim_end_matches('/').to_string();
+        let mut record = self
+            .capability_record(&route.provider.endpoint, &route.model)
+            .await
+            .unwrap_or_else(|| CapabilityRecord {
+                provider_id: provider_id.clone(),
+                provider_name: route.provider.name.clone(),
+                model: route.model.clone(),
+                ..CapabilityRecord::default()
+            });
+        record.provider_id = provider_id.clone();
+        record.provider_name = route.provider.name.clone();
+        record.model = route.model.clone();
+        record.supports_image_generation = value;
+        record.checked_at = checked_at.clone();
+        record.evidence.retain(|evidence| {
+            evidence.capability != CapabilityKind::ImageGeneration
+                || evidence.source != CapabilityEvidenceSource::ActiveProbe
+        });
+        record.evidence.push(CapabilityEvidence {
+            capability: CapabilityKind::ImageGeneration,
+            source: CapabilityEvidenceSource::ActiveProbe,
+            outcome: capability_state(value),
+            checked_at,
+            detail: Some(format!("explicit active probe={outcome:?}")),
+        });
+
+        observer(ProbeEvent::Progress {
+            capability: CapabilityKind::ImageGeneration,
+            message: "Persisting capability registry...".to_string(),
+        });
+        let candidate = {
+            let registry = self.capability_registry.read().await;
+            let mut candidate = registry.clone();
+            if let Some(existing) = candidate
+                .models
+                .iter_mut()
+                .find(|entry| entry.provider_id == provider_id && entry.model == route.model)
+            {
+                *existing = record.clone();
+            } else {
+                candidate.models.push(record.clone());
+            }
+            candidate
+        };
+        let saved = persist_capability_registry(candidate.clone()).await;
+        if saved {
+            *self.capability_registry.write().await = candidate;
+        }
+        observer(ProbeEvent::Persistence { saved });
+        observer(ProbeEvent::Finished);
+        if saved {
+            Ok(record)
+        } else {
+            Err(
+                "image-generation probe result was not published because persistence failed"
+                    .to_string(),
+            )
         }
     }
 
@@ -348,11 +960,36 @@ impl AIChatService {
         provider: &ProviderConfig,
         model: &str,
     ) -> CapabilityRecord {
+        self.probe_model_capabilities_with_observer(provider, model, |_| {})
+            .await
+    }
+
+    pub async fn probe_model_capabilities_with_observer<F>(
+        &self,
+        provider: &ProviderConfig,
+        model: &str,
+        mut observer: F,
+    ) -> CapabilityRecord
+    where
+        F: FnMut(ProbeEvent),
+    {
         const RED_PNG: &str =
             "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAF0lEQVR4nGP8z0AaYCJR/aiGUQ1DSAMAQC4BH2bjRnMAAAAASUVORK5CYII=";
         const BLUE_PNG: &str =
             "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAGUlEQVR4nGNkYPjPQApgIkn1qIZRDUNKAwA+MAEfWiW9ygAAAABJRU5ErkJggg==";
 
+        observer(ProbeEvent::Progress {
+            capability: CapabilityKind::TextChat,
+            message: "Checking provider metadata...".to_string(),
+        });
+
+        observer(ProbeEvent::Started {
+            capability: CapabilityKind::TextChat,
+        });
+        observer(ProbeEvent::Progress {
+            capability: CapabilityKind::TextChat,
+            message: "Probing text chat...".to_string(),
+        });
         let text_probe = self
             .run_capability_probe_request(
                 provider,
@@ -365,7 +1002,18 @@ impl AIChatService {
             )
             .await;
         let text = validate_text_probe(&text_probe);
+        observer(ProbeEvent::Completed {
+            capability: CapabilityKind::TextChat,
+            outcome: text_probe.outcome(text),
+        });
 
+        observer(ProbeEvent::Started {
+            capability: CapabilityKind::Tools,
+        });
+        observer(ProbeEvent::Progress {
+            capability: CapabilityKind::Tools,
+            message: "Probing function call...".to_string(),
+        });
         let tools_probe = self
             .run_capability_probe_request(
                 provider,
@@ -397,7 +1045,18 @@ impl AIChatService {
             )
             .await;
         let tools = validate_tools_probe(&tools_probe);
+        observer(ProbeEvent::Completed {
+            capability: CapabilityKind::Tools,
+            outcome: tools_probe.outcome(tools),
+        });
 
+        observer(ProbeEvent::Started {
+            capability: CapabilityKind::StructuredOutput,
+        });
+        observer(ProbeEvent::Progress {
+            capability: CapabilityKind::StructuredOutput,
+            message: "Probing JSON structured output...".to_string(),
+        });
         let structured_probe = self
             .run_capability_probe_request(
                 provider,
@@ -414,10 +1073,25 @@ impl AIChatService {
             )
             .await;
         let structured = validate_structured_probe(&structured_probe);
+        observer(ProbeEvent::Completed {
+            capability: CapabilityKind::StructuredOutput,
+            outcome: structured_probe.outcome(structured),
+        });
 
+        observer(ProbeEvent::Started {
+            capability: CapabilityKind::ImageInput,
+        });
+        observer(ProbeEvent::Progress {
+            capability: CapabilityKind::ImageInput,
+            message: "Vision 1/2: identifying red image...".to_string(),
+        });
         let red_probe = self
             .run_capability_probe_request(provider, vision_probe_payload(model, RED_PNG))
             .await;
+        observer(ProbeEvent::Progress {
+            capability: CapabilityKind::ImageInput,
+            message: "Vision 2/2: identifying blue image...".to_string(),
+        });
         let blue_probe = self
             .run_capability_probe_request(provider, vision_probe_payload(model, BLUE_PNG))
             .await;
@@ -425,6 +1099,50 @@ impl AIChatService {
             validate_color_probe(&red_probe, "red"),
             validate_color_probe(&blue_probe, "blue"),
         );
+        let vision_outcome = if image == Some(true) {
+            ProbeOutcome::Supported
+        } else if image == Some(false) {
+            ProbeOutcome::Unsupported
+        } else {
+            match (&red_probe, &blue_probe) {
+                (CapabilityProbeResponse::Unknown(outcome), _) => *outcome,
+                (_, CapabilityProbeResponse::Unknown(outcome)) => *outcome,
+                _ => ProbeOutcome::Inconclusive,
+            }
+        };
+        observer(ProbeEvent::Completed {
+            capability: CapabilityKind::ImageInput,
+            outcome: vision_outcome,
+        });
+
+        observer(ProbeEvent::Started {
+            capability: CapabilityKind::AudioInput,
+        });
+        observer(ProbeEvent::Progress {
+            capability: CapabilityKind::AudioInput,
+            message: "Probing native Main-compatible audio input with a bounded WAV sample..."
+                .to_string(),
+        });
+        let audio_input_probe = self.run_audio_input_probe_request(provider, model).await;
+        let probed_audio_input = validate_text_probe(&audio_input_probe);
+        observer(ProbeEvent::Completed {
+            capability: CapabilityKind::AudioInput,
+            outcome: audio_input_probe.outcome(probed_audio_input),
+        });
+
+        observer(ProbeEvent::Started {
+            capability: CapabilityKind::AudioTranscription,
+        });
+        observer(ProbeEvent::Progress {
+            capability: CapabilityKind::AudioTranscription,
+            message: "Probing audio/transcriptions with a tiny bounded WAV sample...".to_string(),
+        });
+        let transcription_probe = self.run_transcription_probe_request(provider, model).await;
+        let audio_transcription = validate_endpoint_acceptance(&transcription_probe);
+        observer(ProbeEvent::Completed {
+            capability: CapabilityKind::AudioTranscription,
+            outcome: transcription_probe.outcome(audio_transcription),
+        });
 
         let provider_id = provider.endpoint.trim_end_matches('/').to_string();
         let metadata = self
@@ -438,38 +1156,125 @@ impl AIChatService {
             .and_then(|meta| meta.modalities.as_deref())
             .unwrap_or("")
             .to_ascii_lowercase();
+        let checked_at = Local::now().to_rfc3339();
+        let metadata_image_input = (modalities.contains("image")
+            || modalities.contains("vision")
+            || modalities.contains("multimodal"))
+        .then_some(true);
+        let metadata_audio_input = modalities.contains("audio").then_some(true);
+        let video_input = modalities.contains("video").then_some(true);
+        let native_file_input =
+            (modalities.contains("file") || modalities.contains("document")).then_some(true);
+        let image_input = image.or(metadata_image_input);
+        let audio_input = probed_audio_input.or(metadata_audio_input);
 
-        let record = CapabilityRecord {
+        observer(ProbeEvent::Started {
+            capability: CapabilityKind::VideoInput,
+        });
+        if video_input == Some(true) {
+            observer(ProbeEvent::Completed {
+                capability: CapabilityKind::VideoInput,
+                outcome: ProbeOutcome::Supported,
+            });
+        } else {
+            observer(ProbeEvent::Skipped {
+                capability: CapabilityKind::VideoInput,
+                reason: "No verified video metadata and no portable safe active video sample for this provider; remains Unknown.".to_string(),
+            });
+        }
+        observer(ProbeEvent::Skipped {
+            capability: CapabilityKind::ImageGeneration,
+            reason: "Active image-generation probe can spend credits and is never run automatically; passive evidence only.".to_string(),
+        });
+
+        let mut evidence = vec![
+            CapabilityEvidence {
+                capability: CapabilityKind::TextChat,
+                source: CapabilityEvidenceSource::ActiveProbe,
+                outcome: capability_state(text),
+                checked_at: checked_at.clone(),
+                detail: Some(format!("probe={:?}", text_probe.outcome(text))),
+            },
+            CapabilityEvidence {
+                capability: CapabilityKind::ImageInput,
+                source: CapabilityEvidenceSource::ActiveProbe,
+                outcome: capability_state(image),
+                checked_at: checked_at.clone(),
+                detail: Some("two-image red/blue semantic probe".to_string()),
+            },
+            CapabilityEvidence {
+                capability: CapabilityKind::Tools,
+                source: CapabilityEvidenceSource::ActiveProbe,
+                outcome: capability_state(tools),
+                checked_at: checked_at.clone(),
+                detail: Some(format!("probe={:?}", tools_probe.outcome(tools))),
+            },
+            CapabilityEvidence {
+                capability: CapabilityKind::StructuredOutput,
+                source: CapabilityEvidenceSource::ActiveProbe,
+                outcome: capability_state(structured),
+                checked_at: checked_at.clone(),
+                detail: Some(format!("probe={:?}", structured_probe.outcome(structured))),
+            },
+            CapabilityEvidence {
+                capability: CapabilityKind::AudioInput,
+                source: CapabilityEvidenceSource::ActiveProbe,
+                outcome: capability_state(probed_audio_input),
+                checked_at: checked_at.clone(),
+                detail: Some(format!(
+                    "probe={:?}",
+                    audio_input_probe.outcome(probed_audio_input)
+                )),
+            },
+            CapabilityEvidence {
+                capability: CapabilityKind::AudioTranscription,
+                source: CapabilityEvidenceSource::ActiveProbe,
+                outcome: capability_state(audio_transcription),
+                checked_at: checked_at.clone(),
+                detail: Some(format!(
+                    "probe={:?}",
+                    transcription_probe.outcome(audio_transcription)
+                )),
+            },
+        ];
+        for (capability, value) in [
+            (CapabilityKind::ImageInput, metadata_image_input),
+            (CapabilityKind::AudioInput, metadata_audio_input),
+            (CapabilityKind::VideoInput, video_input),
+            (CapabilityKind::NativeFileInput, native_file_input),
+        ] {
+            if let Some(value) = value {
+                evidence.push(CapabilityEvidence {
+                    capability,
+                    source: CapabilityEvidenceSource::ProviderMetadata,
+                    outcome: if value {
+                        CapabilityState::Supported
+                    } else {
+                        CapabilityState::Unsupported
+                    },
+                    checked_at: checked_at.clone(),
+                    detail: Some(format!("modalities={modalities}")),
+                });
+            }
+        }
+
+        let mut record = CapabilityRecord {
             provider_id: provider_id.clone(),
             provider_name: provider.name.clone(),
             model: model.to_string(),
             context_window: metadata.as_ref().and_then(|meta| meta.context_length),
-            supports_text: text,
-            supports_image: image.or_else(|| {
-                (!modalities.is_empty()).then(|| {
-                    modalities.contains("image")
-                        || modalities.contains("vision")
-                        || modalities.contains("multimodal")
-                })
-            }),
-            supports_audio: if modalities.is_empty() {
-                None
-            } else {
-                Some(modalities.contains("audio"))
-            },
-            supports_video: if modalities.is_empty() {
-                None
-            } else {
-                Some(modalities.contains("video"))
-            },
+            supports_text_chat: text,
+            supports_image_input: image_input,
+            supports_image_generation: None,
+            supports_image_editing: None,
+            supports_audio_input: audio_input,
+            supports_audio_transcription: audio_transcription,
+            supports_video_input: video_input,
+            supports_native_file_input: native_file_input,
             supports_reasoning: None,
             supports_tools: tools,
             supports_structured_output: structured,
-            supports_file_input: if modalities.is_empty() {
-                None
-            } else {
-                Some(modalities.contains("file") || modalities.contains("document"))
-            },
+            evidence,
             source: "active capability probe + provider metadata".to_string(),
             details: vec![
                 format!("text={text:?}"),
@@ -481,10 +1286,32 @@ impl AIChatService {
                 } else {
                     format!("modalities={modalities}")
                 },
+                "image_generation=unknown (active probe is explicit only)".to_string(),
+                format!("audio_transcription={audio_transcription:?}"),
             ],
-            checked_at: Local::now().to_rfc3339(),
+            checked_at,
         };
 
+        if let Some(previous) = self.capability_record(&provider.endpoint, model).await {
+            record.supports_image_generation = previous.supports_image_generation;
+            record.supports_image_editing = previous.supports_image_editing;
+            record.supports_reasoning = previous.supports_reasoning;
+            record
+                .evidence
+                .extend(previous.evidence.into_iter().filter(|evidence| {
+                    matches!(
+                        evidence.capability,
+                        CapabilityKind::ImageGeneration
+                            | CapabilityKind::ImageEditing
+                            | CapabilityKind::Reasoning
+                    )
+                }));
+        }
+
+        observer(ProbeEvent::Progress {
+            capability: CapabilityKind::TextChat,
+            message: "Persisting capability registry...".to_string(),
+        });
         let candidate = {
             let registry = self.capability_registry.read().await;
             let mut candidate = registry.clone();
@@ -499,11 +1326,14 @@ impl AIChatService {
             }
             candidate
         };
-        if persist_capability_registry(candidate.clone()).await {
+        let saved = persist_capability_registry(candidate.clone()).await;
+        if saved {
             *self.capability_registry.write().await = candidate;
         } else {
             warn!("Capability probe result was not published because persistence failed");
         }
+        observer(ProbeEvent::Persistence { saved });
+        observer(ProbeEvent::Finished);
         record
     }
 
@@ -527,20 +1357,20 @@ impl AIChatService {
             .cloned();
         let mut capability = get_model_capabilities_with_meta(model, metadata.as_ref());
         if let Some(record) = self.capability_record(endpoint, model).await {
-            capability.vision = record.supports_image == Some(true);
-            capability.vision_desc = match record.supports_image {
+            capability.vision = record.supports_image_input == Some(true);
+            capability.vision_desc = match record.supports_image_input {
                 Some(true) => "✅ Verified by provider metadata/probe".to_string(),
                 Some(false) => "❌ Rejected by provider metadata/probe".to_string(),
                 None => "⚪ Unknown: provider did not prove vision support".to_string(),
             };
-            capability.audio = record.supports_audio == Some(true);
-            capability.audio_desc = match record.supports_audio {
+            capability.audio = record.supports_audio_input == Some(true);
+            capability.audio_desc = match record.supports_audio_input {
                 Some(true) => "✅ Published/verified by provider".to_string(),
                 Some(false) => "❌ Provider reports/rejects audio input".to_string(),
                 None => "⚪ Unknown: audio capability not proven".to_string(),
             };
-            capability.video = record.supports_video == Some(true);
-            capability.video_desc = match record.supports_video {
+            capability.video = record.supports_video_input == Some(true);
+            capability.video_desc = match record.supports_video_input {
                 Some(true) => "✅ Published/verified by provider".to_string(),
                 Some(false) => "❌ Provider reports/rejects video input".to_string(),
                 None => "⚪ Unknown: video capability not proven".to_string(),
@@ -586,45 +1416,12 @@ impl AIChatService {
 
                             if let Some(data_arr) = data.get("data").and_then(|d| d.as_array()) {
                                 for item in data_arr {
-                                    if let Some(id_str) = item.get("id").and_then(|s| s.as_str()) {
-                                        model_ids.push(id_str.to_string());
-
-                                        let context_length = item
-                                            .get("context_length")
-                                            .and_then(|c| c.as_u64())
-                                            .map(|u| u as usize);
-                                        let modality = item
-                                            .get("architecture")
-                                            .and_then(|a| a.get("modality"))
-                                            .or_else(|| item.get("modalities"))
-                                            .map(|value| match value {
-                                                Value::String(s) => s.clone(),
-                                                Value::Array(values) => values
-                                                    .iter()
-                                                    .filter_map(Value::as_str)
-                                                    .collect::<Vec<_>>()
-                                                    .join(","),
-                                                _ => String::new(),
-                                            })
-                                            .filter(|value| !value.is_empty());
-                                        let max_comp = item
-                                            .get("top_provider")
-                                            .and_then(|p| p.get("max_completion_tokens"))
-                                            .and_then(|m| m.as_u64())
-                                            .map(|u| u as usize);
-
+                                    if let Some(metadata) = normalize_provider_model_metadata(item)
+                                    {
+                                        model_ids.push(metadata.id.clone());
                                         meta_guard.insert(
-                                            model_metadata_key(clean_endpoint, id_str),
-                                            ModelMetadata {
-                                                id: id_str.to_string(),
-                                                name: item
-                                                    .get("name")
-                                                    .and_then(|s| s.as_str())
-                                                    .map(|s| s.to_string()),
-                                                context_length,
-                                                modalities: modality,
-                                                max_completion_tokens: max_comp,
-                                            },
+                                            model_metadata_key(clean_endpoint, &metadata.id),
+                                            metadata,
                                         );
                                     } else if let Some(s) = item.as_str() {
                                         model_ids.push(s.to_string());
@@ -654,30 +1451,28 @@ impl AIChatService {
                                         provider_name: provider_id.clone(),
                                         model: model_id.clone(),
                                         context_window: meta.and_then(|m| m.context_length),
-                                        supports_text: Some(true),
-                                        supports_image: if modalities.is_empty() {
-                                            None
-                                        } else {
-                                            Some(
-                                                modalities.contains("image")
-                                                    || modalities.contains("vision")
-                                                    || modalities.contains("multimodal"),
-                                            )
-                                        },
-                                        supports_audio: if modalities.is_empty() {
-                                            None
-                                        } else {
-                                            Some(modalities.contains("audio"))
-                                        },
-                                        supports_video: if modalities.is_empty() {
-                                            None
-                                        } else {
-                                            Some(modalities.contains("video"))
-                                        },
+                                        // Catalog presence is not proof that chat/completions works.
+                                        supports_text_chat: catalog_presence_text_chat_claim(),
+                                        supports_image_input: (modalities.contains("image")
+                                            || modalities.contains("vision")
+                                            || modalities.contains("multimodal"))
+                                        .then_some(true),
+                                        supports_image_generation: None,
+                                        supports_image_editing: None,
+                                        supports_audio_input: modalities
+                                            .contains("audio")
+                                            .then_some(true),
+                                        supports_audio_transcription: None,
+                                        supports_video_input: modalities
+                                            .contains("video")
+                                            .then_some(true),
                                         supports_reasoning: None,
                                         supports_tools: None,
                                         supports_structured_output: None,
-                                        supports_file_input: None,
+                                        supports_native_file_input: (modalities.contains("file")
+                                            || modalities.contains("document"))
+                                        .then_some(true),
+                                        evidence: Vec::new(),
                                         source: "provider /models metadata".to_string(),
                                         details: if modalities.is_empty() {
                                             vec!["Input modality tidak dipublikasikan endpoint"
@@ -696,14 +1491,17 @@ impl AIChatService {
                                         existing.provider_name = record.provider_name;
                                         existing.context_window =
                                             record.context_window.or(existing.context_window);
-                                        if existing.supports_image.is_none() {
-                                            existing.supports_image = record.supports_image;
+                                        if existing.supports_image_input.is_none() {
+                                            existing.supports_image_input =
+                                                record.supports_image_input;
                                         }
-                                        if existing.supports_audio.is_none() {
-                                            existing.supports_audio = record.supports_audio;
+                                        if existing.supports_audio_input.is_none() {
+                                            existing.supports_audio_input =
+                                                record.supports_audio_input;
                                         }
-                                        if existing.supports_video.is_none() {
-                                            existing.supports_video = record.supports_video;
+                                        if existing.supports_video_input.is_none() {
+                                            existing.supports_video_input =
+                                                record.supports_video_input;
                                         }
                                         existing.checked_at = record.checked_at;
                                         if !record.details.is_empty() {
@@ -845,5 +1643,51 @@ mod tests {
             validate_structured_probe(&CapabilityProbeResponse::Rejected),
             Some(false)
         );
+    }
+
+    #[test]
+    fn catalog_presence_does_not_claim_text_chat() {
+        assert_eq!(catalog_presence_text_chat_claim(), None);
+    }
+
+    #[test]
+    fn provider_metadata_normalizer_handles_observed_openai_compatible_shapes() {
+        let metadata = normalize_provider_model_metadata(&json!({
+            "id": "model-a",
+            "name": "Model A",
+            "context_length": 131072,
+            "architecture": {"modality": "text+image"},
+            "top_provider": {"max_completion_tokens": 8192}
+        }))
+        .unwrap();
+        assert_eq!(metadata.id, "model-a");
+        assert_eq!(metadata.context_length, Some(131072));
+        assert_eq!(metadata.modalities.as_deref(), Some("text+image"));
+        assert_eq!(metadata.max_completion_tokens, Some(8192));
+
+        let metadata = normalize_provider_model_metadata(&json!({
+            "id": "model-b",
+            "modalities": ["text", "audio", "video"]
+        }))
+        .unwrap();
+        assert_eq!(metadata.modalities.as_deref(), Some("text,audio,video"));
+    }
+
+    #[test]
+    fn transient_probe_failures_remain_unknown_outcomes() {
+        for outcome in [
+            ProbeOutcome::Timeout,
+            ProbeOutcome::RateLimited,
+            ProbeOutcome::ProviderError,
+            ProbeOutcome::AuthFailed,
+            ProbeOutcome::ProtocolMismatch,
+            ProbeOutcome::NetworkError,
+            ProbeOutcome::Inconclusive,
+        ] {
+            assert_eq!(
+                CapabilityProbeResponse::Unknown(outcome).outcome(None),
+                outcome
+            );
+        }
     }
 }

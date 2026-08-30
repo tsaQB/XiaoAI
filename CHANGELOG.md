@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased — xiaochat v0.3.0 role-based multimodal routing
+
+### Model routing
+- Add five explicit roles: Main Model, Vision Model, Video Model, Audio STT Model, and Image Generation Model.
+- Persist addon routing separately as `Main Model`, `Specific`, or `Disabled`; fresh/default addon routes resolve live to Main Model.
+- Keep addon configuration CLI-only while Telegram can inspect all routes and change Main Model only.
+- Block provider deletion while a Specific addon still references that provider.
+
+### Capability discovery
+- Split image input from image generation and audio input from transcription; migrate legacy fields without granting new capabilities.
+- Stop treating `/models` catalog presence as proof of text-chat support.
+- Add per-capability evidence/freshness, observable typed probe outcomes, two-step semantic Vision probing, bounded audio/STT probes, and explicit credit-consuming image-generation tests.
+- Keep Unknown/stale capability fail-closed and persist probe candidates before runtime publication.
+
+### Multimodal execution
+- Route verified Main-compatible image/video/audio directly to Main without a redundant specialist pass.
+- Route different Vision/Video specialists through bounded observations and Audio STT specialists through transcripts before Main synthesis, without sending full canonical history to the specialist.
+- Keep only the canonical user/final assistant turn in session history.
+- Route scanned-PDF render pages through the configured Vision role.
+
+### Image generation
+- Resolve the actual Image Generation Model and propagate its selected model through the OpenAI-compatible Images payload.
+- Replace the fixed image-generation timeout with configurable connect/generation/download bounds (10s/120s/30s defaults).
+- Add cancellation, typed capability/route/provider/timeout/protocol/image errors, common bounded image validation, SSRF-safe remote downloads, and explicit Pollinations opt-in fallback.
+- Support compound image + explanation requests by generating the image through the image role and sending the explanation request to Main.
+
+### Telegram Bot API 10.3 UI
+- Move `/start`, `/menu`, `/help`, `/session`, `/new`, `/clear`, `/model`, `/context`, `/image`, and `/cancel` system surfaces toward deterministic typed Rich Message blocks.
+- Make `/model` a Main Model dashboard with read-only addon health and capability details.
+- Make `/context` report canonical Main context separately from transient specialist context, never summing provider context windows.
+- Require confirmation before `/clear`; revision hardening prevents older in-flight generations from restoring cleared history.
+
 ## Unreleased — Post-merge P1/P2/P3 hardening
 
 ### Data integrity
