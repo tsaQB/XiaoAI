@@ -549,7 +549,9 @@ impl AIChatService {
         };
         let replacement = if sessions.len() == 1 {
             let Some(replacement_id) = allocate_session_id_db_async(user_id).await else {
-                warn!("Refusing to remove the last session because replacement ID allocation failed");
+                warn!(
+                    "Refusing to remove the last session because replacement ID allocation failed"
+                );
                 return false;
             };
             let now_str = Local::now().format("%d %b %H:%M").to_string();
@@ -582,7 +584,8 @@ impl AIChatService {
                 let replacement_id = replacement.id;
                 list.push(replacement);
                 replacement_id
-            } else if removed.id == active_id || !list.iter().any(|session| session.id == active_id) {
+            } else if removed.id == active_id || !list.iter().any(|session| session.id == active_id)
+            {
                 let target_index = current_index.min(list.len().saturating_sub(1));
                 list[target_index].id
             } else {
@@ -715,12 +718,15 @@ impl AIChatService {
     }
 
     pub async fn get_context_stats(&self, user_id: i64) -> ContextStats {
-        let active_sess = self.get_active_session(user_id).await.unwrap_or(ChatSession {
-            id: 0,
-            name: "Storage unavailable".to_string(),
-            messages: Vec::new(),
-            created_at: "-".to_string(),
-        });
+        let active_sess = self
+            .get_active_session(user_id)
+            .await
+            .unwrap_or(ChatSession {
+                id: 0,
+                name: "Storage unavailable".to_string(),
+                messages: Vec::new(),
+                created_at: "-".to_string(),
+            });
         let active_model = self.get_user_model(user_id).await;
         let endpoint = self
             .get_active_provider(user_id)
