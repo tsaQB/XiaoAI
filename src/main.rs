@@ -2409,17 +2409,30 @@ async fn handle_update(
         }
 
         if ["/cancel", "/batal", "batal", "cancel"].contains(&text.as_str()) {
-            ai_service.user_wizard_state.write().await.remove(&user_id);
-            ai_service.cancel_all_generations().await;
+            let rename_active = ai_service
+                .user_waiting_rename
+                .write()
+                .await
+                .remove(&user_id)
+                .is_some();
+            if rename_active {
+                ai_service.user_rename_msg_id.write().await.remove(&user_id);
+            }
             let rich = InputRichMessage::new(vec![
                 RichBlock::SectionHeading {
-                    text: Value::String("CANCELLED".to_string()),
+                    text: Value::String(if rename_active {
+                        "CANCELLED".to_string()
+                    } else {
+                        "NO ACTIVE ACTION".to_string()
+                    }),
                     level: 1,
                 },
                 RichBlock::Paragraph {
-                    text: Value::String(
-                        "Current action/generation cancellation was requested.".to_string(),
-                    ),
+                    text: Value::String(if rename_active {
+                        "Current interactive action was cancelled.".to_string()
+                    } else {
+                        "No interactive action is currently active. Use Telegram's native Stop control to cancel an active generation.".to_string()
+                    }),
                 },
             ]);
             let _ = bot.send_rich_message(chat_id, &rich, None, None).await;
@@ -2546,7 +2559,7 @@ async fn handle_update(
             ]
             .contains(&text.as_str())
         {
-            if ai_service.create_new_session(user_id, None).await.is_none() {
+            let Some(new_session) = ai_service.create_new_session(user_id, None).await else {
                 let rich = InputRichMessage::new(vec![
                     RichBlock::SectionHeading {
                         text: Value::String("SESSION NOT CREATED".to_string()),
@@ -2561,7 +2574,7 @@ async fn handle_update(
                 ]);
                 let _ = bot.send_rich_message(chat_id, &rich, None, None).await;
                 return;
-            }
+            };
             let total_sessions = ai_service.get_sessions(user_id).await.len();
             let target_page = total_sessions.saturating_sub(1) / 5 + 1;
             let rich = InputRichMessage::new(vec![
@@ -2570,9 +2583,11 @@ async fn handle_update(
                     level: 1,
                 },
                 RichBlock::Paragraph {
-                    text: Value::String(
-                        "A new session was durably created and activated.".to_string(),
-                    ),
+                    text: Value::String(format!(
+                        "Session #{} · {} is active. Canonical history is empty.",
+                        new_session.id,
+                        new_session.name
+                    )),
                 },
             ]);
             let _ = bot.send_rich_message(chat_id, &rich, None, None).await;
@@ -2767,9 +2782,16 @@ async fn handle_update(
                     .map(str::trim)
                     .filter(|value| !value.is_empty());
                 if let Some(query) = query {
-                    let rich = build_main_model_picker_rich(ai_service, user_id, Some(query)).await;
+                    ai_service
+                        .model_picker_query
+                        .write()
+                        .await
+                        .insert(user_id, query.to_string());
+                    let rich =
+                        build_main_model_picker_rich(ai_service, user_id, Some(query), 1).await;
                     let _ = bot.send_rich_message(chat_id, &rich, None, None).await;
                 } else {
+                    ai_service.model_picker_query.write().await.remove(&user_id);
                     send_model_dashboard(bot, ai_service, chat_id, user_id, None).await;
                 }
             }
@@ -3168,17 +3190,44 @@ async fn handle_update(
             let _ = bot.answer_callback_query(&cq_id, None, false).await;
             send_or_update_session_manager(bot, ai_service, chat_id, user_id, None, 1).await;
         } else if cq_data == "model_dashboard" {
+            ai_service.model_picker_query.write().await.remove(&user_id);
             let _ = bot.answer_callback_query(&cq_id, None, false).await;
             send_model_dashboard(bot, ai_service, chat_id, user_id, msg_id).await;
         } else if cq_data == "model_change_main" {
+            ai_service.model_picker_query.write().await.remove(&user_id);
             let _ = bot.answer_callback_query(&cq_id, None, false).await;
-            let rich = build_main_model_picker_rich(ai_service, user_id, None).await;
+            let rich = build_main_model_picker_rich(ai_service, user_id, None, 1).await;
             if let Some(mid) = msg_id {
                 if bot
                     .edit_rich_message(chat_id, mid, &rich, None)
                     .await
                     .is_ok()
                 {
+                    return;
+                }
+            }
+            let _ = bot.send_rich_message(chat_id, &rich, None, None).await;
+        } else if let Some(page) = cq_data.strip_prefix("model_main_page:") {
+            let page = page.parse::<usize>().unwrap_or(1);
+            let query = ai_service.model_picker_query.read().await.get(&user_id).cloned();
+            let rich =
+                build_main_model_picker_rich(ai_service, user_id, query.as_deref(), page).await;
+            let _ = bot.answer_callback_query(&cq_id, None, false).await;
+            if let Some(mid) = msg_id {
+                if bot
+                    .edit_rich_message(chat_id, mid, &rich, None)
+                    .await
+                    .is_ok()
+                {
+                    return;
+                }
+            }
+            let _ = bot.send_rich_message(chat_id, &rich, None, None).await;
+        } else if cq_data == "action_help" {
+            let _ = bot.answer_callback_query(&cq_id, None, false).await;
+            let rich = build_help_ui();
+            if let Some(mid) = msg_id {
+                if bot.edit_rich_message(chat_id, mid, &rich, None).await.is_ok() {
                     return;
                 }
             }
