@@ -1552,9 +1552,17 @@ async fn handle_image_generation(
     let safe_provider = escape_html(&generated.provider_name);
     let safe_model = escape_html(&generated.model);
     let fallback_note = if generated.used_external_fallback {
-        "\n⚠️ <i>External fallback opt-in digunakan.</i>"
+        let primary_failure = generated
+            .primary_failure
+            .as_deref()
+            .map(|failure| escape_html(&truncate_chars(failure, 160)))
+            .unwrap_or_else(|| "Primary provider failure was not reported.".to_string());
+        format!(
+            "\n⚠️ <i>External fallback opt-in digunakan.</i>\n\
+             <b>Primary failure:</b> {primary_failure}"
+        )
     } else {
-        ""
+        String::new()
     };
     let caption_text = format!(
         "🫟 <b>Gambar Berhasil Dibuat!</b>\n\n\
