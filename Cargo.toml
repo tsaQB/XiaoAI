@@ -1,6 +1,6 @@
 [package]
 name = "XiaoAI"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Assaqib <264941327+tsaQB@users.noreply.github.com>"]
 description = "XiaoAI - hardened Telegram Bot API 10.3 AI assistant with Rich Messages, streaming drafts, sessions, and OpenAI-compatible providers"
