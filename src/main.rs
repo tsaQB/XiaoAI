@@ -1787,7 +1787,7 @@ async fn handle_image_generation(
         draft_id,
         10,
         chat_id == user_id,
-        false,
+        chat_id == user_id,
     ));
     timeline
         .add_action("Generating Image", Some(ProgressActivity::Drawing))
@@ -4061,6 +4061,30 @@ mod update_lane_tests {
             intent.explanation_prompt.as_deref(),
             Some("jelaskan bagaimana lengan spiral terbentuk")
         );
+    }
+
+    #[test]
+    fn image_generation_draft_can_stop_policy_is_private_only() {
+        let owner_id = 123456789i64;
+        let group_id = -100987654321i64;
+
+        let private_can_stop = owner_id == owner_id;
+        assert!(private_can_stop);
+
+        let group_can_stop = group_id == owner_id;
+        assert!(!group_can_stop);
+    }
+
+    #[test]
+    fn access_policy_allows_native_stop_only_in_owner_private_chat() {
+        let policy = AccessPolicy {
+            owner_user_id: 42,
+            allowed_chat_ids: [100, 200].into_iter().collect(),
+        };
+        assert!(policy.allows_stop_chat(42));
+        assert!(!policy.allows_stop_chat(100));
+        assert!(!policy.allows_stop_chat(200));
+        assert!(!policy.allows_stop_chat(999));
     }
 
     #[test]

@@ -1225,10 +1225,15 @@ async fn probe_addon_role(ai_service: &AIChatService, role: ModelRole) {
         route.provider.name,
         route.model
     );
-    let Some(record) =
-        run_persisted_capability_probe(ai_service, &route.provider, &route.model).await
-    else {
-        return;
+    let record = match ai_service
+        .probe_addon_role_with_observer(role, print_probe_event)
+        .await
+    {
+        Ok(record) => record,
+        Err(error) => {
+            println!("[FAIL] {error}");
+            return;
+        }
     };
     println!(
         "Saved result: text={:?}, vision={:?}, video={:?}, audio={:?}, stt={:?}, image_gen={:?}",

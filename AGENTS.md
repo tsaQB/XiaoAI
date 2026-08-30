@@ -46,6 +46,7 @@ Run before declaring a change ready:
 16. Addon routes are persisted separately from ProviderStore as Main Model / Specific / Disabled. Telegram may edit Main only; addon configuration is CLI-only in v0.3.0.
 17. Capability freshness is per capability. A new text/vision probe must not refresh unrelated image-generation/STT evidence. Unknown or stale evidence remains fail-closed.
 18. Image generation must resolve the Image Generation Model, propagate the actual model in provider requests, use bounded configurable timeouts, validate all returned image bytes/URLs, and preserve explicit fallback opt-in.
+19. Provider protocol contracts are strictly OpenAI-compatible: Image Generation uses `POST /images/generations` (or explicit Pollinations fallback), Audio STT uses `POST /audio/transcriptions`, and Chat/Vision/Video/Audio uses `POST /chat/completions` with bounded standard media payload shapes. Protocol mismatch (404/405) produces typed errors and is never silently converted to Unsupported capability.
 
 ## Architecture
 

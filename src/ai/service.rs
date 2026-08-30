@@ -93,6 +93,79 @@ fn estimate_stored_content_tokens(content: &Value) -> usize {
     }
 }
 
+pub fn resolve_audio_file_and_mime(
+    mime_type: Option<&str>,
+    suggested_filename: Option<&str>,
+) -> (&'static str, String) {
+    let clean_mime = mime_type.unwrap_or("").trim().to_ascii_lowercase();
+    let (mime_str, ext) =
+        if clean_mime.starts_with("audio/ogg") || clean_mime.starts_with("application/ogg") {
+            ("audio/ogg", "ogg")
+        } else if clean_mime.starts_with("audio/opus") {
+            ("audio/opus", "opus")
+        } else if clean_mime.starts_with("audio/mpeg") || clean_mime.starts_with("audio/mp3") {
+            ("audio/mpeg", "mp3")
+        } else if clean_mime.starts_with("audio/x-m4a") {
+            ("audio/x-m4a", "m4a")
+        } else if clean_mime.starts_with("audio/mp4") || clean_mime.starts_with("audio/m4a") {
+            ("audio/mp4", "m4a")
+        } else if clean_mime.starts_with("audio/wav")
+            || clean_mime.starts_with("audio/x-wav")
+            || clean_mime.starts_with("audio/wave")
+        {
+            ("audio/wav", "wav")
+        } else if clean_mime.starts_with("audio/flac") || clean_mime.starts_with("audio/x-flac") {
+            ("audio/flac", "flac")
+        } else if clean_mime.starts_with("audio/webm") {
+            ("audio/webm", "webm")
+        } else {
+            let lower_fn = suggested_filename.unwrap_or("").to_ascii_lowercase();
+            if lower_fn.ends_with(".ogg") {
+                ("audio/ogg", "ogg")
+            } else if lower_fn.ends_with(".opus") {
+                ("audio/opus", "opus")
+            } else if lower_fn.ends_with(".mp3") {
+                ("audio/mpeg", "mp3")
+            } else if lower_fn.ends_with(".m4a") {
+                ("audio/mp4", "m4a")
+            } else if lower_fn.ends_with(".wav") {
+                ("audio/wav", "wav")
+            } else if lower_fn.ends_with(".flac") {
+                ("audio/flac", "flac")
+            } else if lower_fn.ends_with(".webm") {
+                ("audio/webm", "webm")
+            } else {
+                ("application/octet-stream", "bin")
+            }
+        };
+
+    let filename = if let Some(suggested) = suggested_filename {
+        let trimmed = suggested.trim();
+        let safe_name: String = trimmed
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .take(64)
+            .collect();
+        if safe_name.to_ascii_lowercase().ends_with(&format!(".{ext}")) {
+            safe_name
+        } else if !safe_name.is_empty() && safe_name != "." {
+            format!("{safe_name}.{ext}")
+        } else {
+            format!("audio.{ext}")
+        }
+    } else {
+        format!("audio.{ext}")
+    };
+
+    (mime_str, filename)
+}
+
 const MAX_GENERATED_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_PROVIDER_JSON_BYTES: usize = 32 * 1024 * 1024;
 const MAX_STREAM_VISIBLE_BYTES: usize = 8 * 1024 * 1024;
@@ -1195,6 +1268,7 @@ impl AIChatService {
         _user_id: i64,
         audio_bytes: Vec<u8>,
         file_name: &str,
+        mime_type: Option<&str>,
     ) -> (bool, Result<String, String>) {
         let route = match self.resolve_model_route(ModelRole::AudioStt).await {
             Ok(route) => route,
@@ -1210,7 +1284,7 @@ impl AIChatService {
             );
         }
         match self
-            .transcribe_audio_resolved(&route, audio_bytes, file_name)
+            .transcribe_audio_resolved(&route, audio_bytes, file_name, mime_type)
             .await
         {
             Ok(text) => (true, Ok(text)),
@@ -1332,11 +1406,13 @@ impl AIChatService {
         route: &ResolvedModelRoute,
         audio_bytes: Vec<u8>,
         file_name: &str,
+        mime_type: Option<&str>,
     ) -> Result<String, String> {
+        let (safe_mime, safe_filename) = resolve_audio_file_and_mime(mime_type, Some(file_name));
         let stt_url = provider_url(&route.provider.endpoint, "audio/transcriptions");
         let part = Part::bytes(audio_bytes)
-            .file_name(file_name.to_string())
-            .mime_str("audio/ogg")
+            .file_name(safe_filename)
+            .mime_str(safe_mime)
             .map_err(|error| format!("multipart audio error: {error}"))?;
         let form = Form::new()
             .part("file", part)
@@ -1364,11 +1440,16 @@ impl AIChatService {
             }
         })?;
         if !response.status().is_success() {
+            let status = response.status().as_u16();
+            if status == 404 || status == 405 {
+                return Err(format!(
+                    "Audio STT route {} / {} returned HTTP {}: endpoint /audio/transcriptions is not supported by this provider protocol.",
+                    route.provider.name, route.model, status
+                ));
+            }
             return Err(format!(
                 "Audio STT {} / {} returned HTTP {}",
-                route.provider.name,
-                route.model,
-                response.status().as_u16()
+                route.provider.name, route.model, status
             ));
         }
         let body = read_bounded_json(response).await?;
@@ -1429,6 +1510,7 @@ impl AIChatService {
             return self
                 .generate_response_on_main(
                     user_id,
+                    &main,
                     GenerationInput {
                         prompt,
                         canonical_prompt: None,
@@ -1472,6 +1554,7 @@ impl AIChatService {
                 return self
                     .generate_response_on_main(
                         user_id,
+                        &main,
                         GenerationInput {
                             prompt,
                             canonical_prompt: None,
@@ -1504,7 +1587,12 @@ impl AIChatService {
                 return (None, "Audio input is missing.".to_string(), false);
             };
             let transcript = match self
-                .transcribe_audio_resolved(&specialist, bytes, "voice.ogg")
+                .transcribe_audio_resolved(
+                    &specialist,
+                    bytes,
+                    doc_name.unwrap_or("audio"),
+                    audio_mime,
+                )
                 .await
             {
                 Ok(transcript) => transcript,
@@ -1520,6 +1608,7 @@ impl AIChatService {
             return self
                 .generate_response_on_main(
                     user_id,
+                    &main,
                     GenerationInput {
                         prompt: &synthesis_prompt,
                         canonical_prompt: Some(prompt),
@@ -1545,6 +1634,7 @@ impl AIChatService {
             return self
                 .generate_response_on_main(
                     user_id,
+                    &main,
                     GenerationInput {
                         prompt,
                         canonical_prompt: None,
@@ -1593,6 +1683,7 @@ impl AIChatService {
         );
         self.generate_response_on_main(
             user_id,
+            &main,
             GenerationInput {
                 prompt: &synthesis_prompt,
                 canonical_prompt: Some(prompt),
@@ -1617,6 +1708,7 @@ impl AIChatService {
     async fn generate_response_on_main(
         &self,
         user_id: i64,
+        main_route: &ResolvedModelRoute,
         input: GenerationInput<'_>,
         cancel_rx: &mut watch::Receiver<bool>,
     ) -> (Option<String>, String, bool) {
@@ -1636,46 +1728,26 @@ impl AIChatService {
             video_mime,
             video_duration,
         } = input;
-        let provider = match self.get_active_provider(user_id).await {
-            Some(p) if !p.endpoint.is_empty() => p,
-            _ => {
-                return (
-                    None,
-                    "👋 <b>Hi, selamat datang di XiaoAI!</b>\n\n⚠️ <i>AI Provider belum dikonfigurasi.</i>\nSilakan jalankan perintah <code>xiao provider add</code> di terminal.".to_string(),
-                    false,
-                );
-            }
-        };
 
-        let user_m = self.get_user_model(user_id).await;
-        let model = if !user_m.is_empty() {
-            user_m
-        } else if !provider.active_model.is_empty() {
-            provider.active_model.clone()
-        } else {
-            provider
-                .models
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "gpt-4o".to_string())
-        };
+        let provider = &main_route.provider;
+        let model = &main_route.model;
+        let capability = &main_route.capability;
 
-        let capability = self.capability_record(&provider.endpoint, &model).await;
         let required_capability = if media_to_main
             && (document_images
                 .as_ref()
                 .is_some_and(|pages| !pages.is_empty())
                 || image_bytes.is_some())
         {
-            require_verified_capability(capability.as_ref(), "vision/image", |record| {
+            require_verified_capability(Some(capability), "vision/image", |record| {
                 record.supports_image_input
             })
         } else if media_to_main && video_bytes.is_some() {
-            require_verified_capability(capability.as_ref(), "video", |record| {
+            require_verified_capability(Some(capability), "video", |record| {
                 record.supports_video_input
             })
         } else if media_to_main && audio_bytes.is_some() {
-            require_verified_capability(capability.as_ref(), "audio", |record| {
+            require_verified_capability(Some(capability), "audio", |record| {
                 record.supports_audio_input
             })
         } else {
@@ -1733,15 +1805,15 @@ impl AIChatService {
         let canonical_history_prompt = canonical_prompt.map(str::to_string);
 
         let resolved_capability = self
-            .resolved_model_capability(&provider.endpoint, &model)
+            .resolved_model_capability(&provider.endpoint, model)
             .await;
         let metadata_max_completion_tokens = self
             .model_metadata
             .read()
             .await
-            .get(&model_metadata_key(&provider.endpoint, &model))
+            .get(&model_metadata_key(&provider.endpoint, model))
             .and_then(|metadata| metadata.max_completion_tokens);
-        let mut max_output_tokens = max_output_tokens_for_model(&model)
+        let mut max_output_tokens = max_output_tokens_for_model(model)
             .min(resolved_capability.context_limit.saturating_div(2).max(1));
         if let Some(limit) = metadata_max_completion_tokens.filter(|limit| *limit > 0) {
             max_output_tokens = max_output_tokens.min(limit);
@@ -1789,7 +1861,7 @@ impl AIChatService {
                     user_id,
                     request_session_id,
                     &message.content,
-                    capability.as_ref(),
+                    Some(capability),
                 )
                 .await
             } else {
@@ -2903,5 +2975,67 @@ mod tests {
             classify_image_route_error("Image Generation Model capability is Unknown"),
             ImageGenerationErrorKind::CapabilityUnknown
         );
+    }
+
+    #[test]
+    fn audio_mime_mapping_covers_all_standard_formats() {
+        let (mime, name) = resolve_audio_file_and_mime(Some("audio/ogg"), Some("voice"));
+        assert_eq!(mime, "audio/ogg");
+        assert_eq!(name, "voice.ogg");
+
+        let (mime, name) = resolve_audio_file_and_mime(Some("audio/opus"), Some("note"));
+        assert_eq!(mime, "audio/opus");
+        assert_eq!(name, "note.opus");
+
+        let (mime, name) = resolve_audio_file_and_mime(Some("audio/mpeg"), Some("speech"));
+        assert_eq!(mime, "audio/mpeg");
+        assert_eq!(name, "speech.mp3");
+
+        let (mime, name) = resolve_audio_file_and_mime(Some("audio/mp4"), Some("recording"));
+        assert_eq!(mime, "audio/mp4");
+        assert_eq!(name, "recording.m4a");
+
+        let (mime, name) = resolve_audio_file_and_mime(Some("audio/x-m4a"), Some("memo"));
+        assert_eq!(mime, "audio/x-m4a");
+        assert_eq!(name, "memo.m4a");
+
+        let (mime, name) = resolve_audio_file_and_mime(Some("audio/wav"), Some("sample"));
+        assert_eq!(mime, "audio/wav");
+        assert_eq!(name, "sample.wav");
+
+        let (mime, name) = resolve_audio_file_and_mime(Some("audio/x-wav"), Some("test"));
+        assert_eq!(mime, "audio/wav");
+        assert_eq!(name, "test.wav");
+
+        let (mime, name) = resolve_audio_file_and_mime(Some("application/custom"), Some("data"));
+        assert_eq!(mime, "application/octet-stream");
+        assert_eq!(name, "data.bin");
+        assert_ne!(mime, "audio/ogg");
+    }
+
+    #[test]
+    fn main_route_snapshot_keeps_provider_model_and_capability_stable() {
+        let route = ResolvedModelRoute {
+            provider: ProviderConfig {
+                id: "prov-a".to_string(),
+                name: "Provider A".to_string(),
+                endpoint: "https://a.example/v1".to_string(),
+                api_key: String::new(),
+                api_key_ref: None,
+                models: vec!["model-a".to_string()],
+                active_model: "model-a".to_string(),
+            },
+            model: "model-a".to_string(),
+            capability: CapabilityRecord {
+                provider_id: "https://a.example/v1".to_string(),
+                model: "model-a".to_string(),
+                supports_text_chat: Some(true),
+                ..CapabilityRecord::default()
+            },
+            route_origin: RouteOrigin::Main,
+        };
+        assert_eq!(route.provider.id, "prov-a");
+        assert_eq!(route.model, "model-a");
+        assert_eq!(route.capability.supports_text_chat, Some(true));
     }
 }

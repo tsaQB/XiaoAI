@@ -1408,14 +1408,12 @@ impl CapabilityRecord {
             .max_by_key(|(timestamp, _)| timestamp.timestamp_millis())
             .map(|(_, checked_at)| checked_at);
 
-        // Legacy capability records did not carry per-capability evidence. The
-        // record timestamp remains a compatibility fallback only when the
-        // entire record is legacy. Once any typed evidence exists, a missing
-        // capability-specific timestamp is Unknown/stale rather than borrowing
-        // freshness from an unrelated capability.
+        // Freshness is strictly capability-scoped. Unrelated metadata or
+        // catalog refreshes must never re-authorize stale legacy or missing
+        // capability evidence. If no typed evidence exists for this capability,
+        // it is always Stale (fail-closed).
         match latest {
             Some(checked_at) => Self::timestamp_freshness(checked_at, ttl),
-            None if self.evidence.is_empty() => Self::timestamp_freshness(&self.checked_at, ttl),
             None => EvidenceFreshness::Stale,
         }
     }
@@ -2135,6 +2133,116 @@ mod tests {
         assert_eq!(record.supports_image_generation, None);
         assert_eq!(record.supports_image_editing, None);
         assert_eq!(record.supports_audio_transcription, None);
+    }
+
+    #[test]
+    fn legacy_supports_image_without_evidence_and_stale_timestamp_remains_stale() {
+        let old = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        let record = CapabilityRecord {
+            supports_image_input: Some(true),
+            evidence: Vec::new(),
+            checked_at: old,
+            ..CapabilityRecord::default()
+        };
+        let ttl = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+        assert_eq!(
+            record.freshness_for(CapabilityKind::ImageInput, ttl),
+            EvidenceFreshness::Stale
+        );
+    }
+
+    #[test]
+    fn legacy_audio_not_refreshed_by_unrelated_text_metadata() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let record = CapabilityRecord {
+            supports_audio_input: Some(true),
+            evidence: vec![CapabilityEvidence {
+                capability: CapabilityKind::TextChat,
+                source: CapabilityEvidenceSource::ProviderMetadata,
+                outcome: CapabilityState::Supported,
+                checked_at: now.clone(),
+                detail: None,
+            }],
+            checked_at: now,
+            ..CapabilityRecord::default()
+        };
+        let ttl = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+        assert_eq!(
+            record.freshness_for(CapabilityKind::AudioInput, ttl),
+            EvidenceFreshness::Stale
+        );
+        assert_eq!(
+            record.freshness_for(CapabilityKind::TextChat, ttl),
+            EvidenceFreshness::Fresh
+        );
+    }
+
+    #[test]
+    fn fresh_provider_metadata_specifically_for_image_input_is_fresh() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let record = CapabilityRecord {
+            supports_image_input: Some(true),
+            evidence: vec![CapabilityEvidence {
+                capability: CapabilityKind::ImageInput,
+                source: CapabilityEvidenceSource::ProviderMetadata,
+                outcome: CapabilityState::Supported,
+                checked_at: now.clone(),
+                detail: Some("modalities: text,image".to_string()),
+            }],
+            checked_at: now,
+            ..CapabilityRecord::default()
+        };
+        let ttl = std::time::Duration::from_secs(6 * 60 * 60);
+        assert_eq!(
+            record.freshness_for(CapabilityKind::ImageInput, ttl),
+            EvidenceFreshness::Fresh
+        );
+    }
+
+    #[test]
+    fn fresh_text_chat_evidence_does_not_make_image_generation_fresh() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let record = CapabilityRecord {
+            supports_text_chat: Some(true),
+            supports_image_generation: Some(true),
+            evidence: vec![CapabilityEvidence {
+                capability: CapabilityKind::TextChat,
+                source: CapabilityEvidenceSource::ActiveProbe,
+                outcome: CapabilityState::Supported,
+                checked_at: now.clone(),
+                detail: None,
+            }],
+            checked_at: now,
+            ..CapabilityRecord::default()
+        };
+        let ttl = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+        assert_eq!(
+            record.freshness_for(CapabilityKind::ImageGeneration, ttl),
+            EvidenceFreshness::Stale
+        );
+    }
+
+    #[test]
+    fn stale_active_probe_for_image_generation_with_fresh_model_catalog_metadata_stays_stale() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let old = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        let record = CapabilityRecord {
+            supports_image_generation: Some(true),
+            evidence: vec![CapabilityEvidence {
+                capability: CapabilityKind::ImageGeneration,
+                source: CapabilityEvidenceSource::ActiveProbe,
+                outcome: CapabilityState::Supported,
+                checked_at: old,
+                detail: None,
+            }],
+            checked_at: now,
+            ..CapabilityRecord::default()
+        };
+        let ttl = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+        assert_eq!(
+            record.freshness_for(CapabilityKind::ImageGeneration, ttl),
+            EvidenceFreshness::Stale
+        );
     }
 
     #[cfg(unix)]

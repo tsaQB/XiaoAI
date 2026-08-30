@@ -68,6 +68,15 @@ const RED_PNG_BASE64: &str =
 const BLUE_PNG_BASE64: &str =
     "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAGUlEQVR4nGNkYPjPQApgIkn1qIZRDUNKAwA+MAEfWiW9ygAAAABJRU5ErkJggg==";
 
+const SPOKEN_PROBE_MP3_BASE64: &str = "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";
+
+fn spoken_probe_audio_bytes() -> Vec<u8> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(SPOKEN_PROBE_MP3_BASE64)
+        .unwrap_or_default()
+}
+
 const TINY_RED_MP4_BASE64: &str = "AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAMUbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAA+gAAQAAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAj90cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAA+gAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAABAAAAAQAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAPoAAAAAAABAAAAAAG3bWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAABAAAAAQABVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAABYm1pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAASJzdGJsAAAAvnN0c2QAAAAAAAAAAQAAAK5hdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAABAAEABIAAAASAAAAAAAAAABFUxhdmM2MS4xOS4xMDEgbGlieDI2NAAAAAAAAAAAAAAAGP//AAAANGF2Y0MBZAAK/+EAF2dkAAqs2V7ARAAAAwAEAAADAAg8SJZYAQAGaOvjyyLA/fj4AAAAABBwYXNwAAAAAQAAAAEAAAAUYnRydAAAAAAAABZYAAAAAAAAABhzdHRzAAAAAAAAAAEAAAABAABAAAAAABxzdHNjAAAAAAAAAAEAAAABAAAAAQAAAAEAAAAUc3RzegAAAAAAAALLAAAAAQAAABRzdGNvAAAAAAAAAAEAAANEAAAAYXVkdGEAAABZbWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAbWRpcmFwcGwAAAAAAAAAAAAAAAAsaWxzdAAAACSpdG9vAAAAHGRhdGEAAAABAAAAAExhdmY2MS43LjEwMwAAAAhmcmVlAAAC021kYXQAAAKtBgX//6ncRem95tlIt5Ys2CDZI+7veDI2NCAtIGNvcmUgMTY0IHIzMTA4IDMxZTE5ZjkgLSBILjI2NC9NUEVHLTQgQVZDIGNvZGVjIC0gQ29weWxlZnQgMjAwMy0yMDIzIC0gaHR0cDovL3d3dy52aWRlb2xhbi5vcmcveDI2NC5odG1sIC0gb3B0aW9uczogY2FiYWM9MSByZWY9MyBkZWJsb2NrPTE6MDowIGFuYWx5c2U9MHgzOjB4MTEzIG1lPWhleCBzdWJtZT03IHBzeT0xIHBzeV9yZD0xLjAwOjAuMDAgbWl4ZWRfcmVmPTEgbWVfcmFuZ2U9MTYgY2hyb21hX21lPTEgdHJlbGxpcz0xIDh4OGRjdD0xIGNxbT0wIGRlYWR6b25lPTIxLDExIGZhc3RfcHNraXA9MSBjaHJvbWFfcXBfb2Zmc2V0PS0yIHRocmVhZHM9MSBsb29rYWhlYWRfdGhyZWFkcz0xIHNsaWNlZF90aHJlYWRzPTAgbnI9MCBkZWNpbWF0ZT0xIGludGVybGFjZWQ9MCBibHVyYXlfY29tcGF0PTAgY29uc3RyYWluZWRfaW50cmE9MCBiZnJhbWVzPTMgYl9weXJhbWlkPTIgYl9hZGFwdD0xIGJfYmlhcz0wIGRpcmVjdD0xIHdlaWdodGI9MSBvcGVuX2dvcD0wIHdlaWdodHA9MiBrZXlpbnQ9MjUwIGtleWludF9taW49MSBzY2VuZWN1dD00MCBpbnRyYV9yZWZyZXNoPTAgcmNfbG9va2FoZWFkPTQwIHJjPWNyZiBtYnRyZWU9MSBjcmY9MjMuMCBxY29tcD0wLjYwIHFwbWluPTAgcXBtYXg9NjkgcXBzdGVwPTQgaXBfcmF0aW89MS40MCBhcT0xOjEuMDAAgAAAABZliIQAFf/+7M9+BTZo5i/D8UVzjn2B";
 
 fn video_probe_payload(model: &str) -> Value {
@@ -228,6 +237,55 @@ fn validate_text_probe(response: &CapabilityProbeResponse) -> Option<bool> {
     }
 }
 
+pub fn normalize_transcript(transcript: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_space = false;
+    for ch in transcript.chars() {
+        if ch.is_alphanumeric() {
+            normalized.extend(ch.to_lowercase());
+            last_was_space = false;
+        } else if (ch.is_whitespace()
+            || matches!(
+                ch,
+                '.' | ',' | '!' | '?' | '-' | '_' | ';' | ':' | '\'' | '"' | '`' | '(' | ')'
+            ))
+            && !last_was_space
+            && !normalized.is_empty()
+        {
+            normalized.push(' ');
+            last_was_space = true;
+        }
+    }
+    normalized.trim().to_string()
+}
+
+pub fn is_expected_probe_transcript(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "xiao capability probe"
+            | "xiao capability prob"
+            | "ciao capability probe"
+            | "shiao capability probe"
+            | "xiao capability prove"
+    )
+}
+
+fn validate_transcription_probe(response: &CapabilityProbeResponse) -> Option<bool> {
+    match response {
+        CapabilityProbeResponse::Rejected => Some(false),
+        CapabilityProbeResponse::Unknown(_) => None,
+        CapabilityProbeResponse::Success(body) => {
+            let text = body.get("text").and_then(Value::as_str)?;
+            let normalized = normalize_transcript(text);
+            if is_expected_probe_transcript(&normalized) {
+                Some(true)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 fn validate_endpoint_acceptance(response: &CapabilityProbeResponse) -> Option<bool> {
     match response {
         CapabilityProbeResponse::Rejected => Some(false),
@@ -383,6 +441,12 @@ fn publish_capability_candidate(
     } else {
         false
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbePlan {
+    FullSafe,
+    Role(ModelRole),
 }
 
 impl AIChatService {
@@ -790,9 +854,9 @@ impl AIChatService {
             "{}/audio/transcriptions",
             provider.endpoint.trim_end_matches('/')
         );
-        let part = match Part::bytes(tiny_silent_wav())
-            .file_name("xiao-capability-probe.wav")
-            .mime_str("audio/wav")
+        let part = match Part::bytes(spoken_probe_audio_bytes())
+            .file_name("xiao-capability-probe.mp3")
+            .mime_str("audio/mpeg")
         {
             Ok(part) => part,
             Err(_) => return CapabilityProbeResponse::Unknown(ProbeOutcome::Inconclusive),
@@ -993,10 +1057,15 @@ impl AIChatService {
                     let transcription = self
                         .run_transcription_probe_request(&route.provider, &route.model)
                         .await;
-                    let transcription_validated = validate_endpoint_acceptance(&transcription);
+                    let transcription_validated = validate_transcription_probe(&transcription);
                     if transcription_validated == Some(true) {
                         return Ok(format!(
-                            "Audio route {target} passed the transcription sample"
+                            "Audio route {target} passed the semantic spoken transcription sample"
+                        ));
+                    }
+                    if transcription_validated == Some(false) {
+                        return Err(format!(
+                            "Audio route {target} rejected transcription as unsupported"
                         ));
                     }
 
@@ -1009,10 +1078,14 @@ impl AIChatService {
                     let transcription = self
                         .run_transcription_probe_request(&route.provider, &route.model)
                         .await;
-                    let validated = validate_endpoint_acceptance(&transcription);
+                    let validated = validate_transcription_probe(&transcription);
                     if validated == Some(true) {
                         Ok(format!(
-                            "Audio STT route {target} passed the transcription sample"
+                            "Audio STT route {target} passed the semantic spoken transcription sample"
+                        ))
+                    } else if validated == Some(false) {
+                        Err(format!(
+                            "Audio STT route {target} rejected transcription as unsupported"
                         ))
                     } else {
                         Err(format!(
@@ -1118,181 +1191,16 @@ impl AIChatService {
         }
     }
 
-    pub async fn probe_model_capabilities_with_observer<F>(
+    pub async fn probe_model_capabilities_with_plan_and_observer<F>(
         &self,
         provider: &ProviderConfig,
         model: &str,
+        plan: ProbePlan,
         mut observer: F,
     ) -> CapabilityRecord
     where
         F: FnMut(ProbeEvent),
     {
-        observer(ProbeEvent::Progress {
-            capability: CapabilityKind::TextChat,
-            message: "Checking provider metadata...".to_string(),
-        });
-
-        observer(ProbeEvent::Started {
-            capability: CapabilityKind::TextChat,
-        });
-        observer(ProbeEvent::Progress {
-            capability: CapabilityKind::TextChat,
-            message: "Probing text chat...".to_string(),
-        });
-        let text_probe = self
-            .run_capability_probe_request(
-                provider,
-                json!({
-                    "model": model,
-                    "messages": [{"role": "user", "content": "Reply with exactly OK."}],
-                    "stream": false,
-                    "max_tokens": 4
-                }),
-            )
-            .await;
-        let text = validate_text_probe(&text_probe);
-        observer(ProbeEvent::Completed {
-            capability: CapabilityKind::TextChat,
-            outcome: text_probe.outcome(text),
-        });
-
-        observer(ProbeEvent::Started {
-            capability: CapabilityKind::Tools,
-        });
-        observer(ProbeEvent::Progress {
-            capability: CapabilityKind::Tools,
-            message: "Probing function call...".to_string(),
-        });
-        let tools_probe = self
-            .run_capability_probe_request(
-                provider,
-                json!({
-                    "model": model,
-                    "messages": [{
-                        "role": "user",
-                        "content": "Call the xiao_capability_probe function now. Do not answer with normal text."
-                    }],
-                    "stream": false,
-                    "max_tokens": 16,
-                    "tools": [{
-                        "type": "function",
-                        "function": {
-                            "name": "xiao_capability_probe",
-                            "description": "No-op capability probe",
-                            "parameters": {
-                                "type": "object",
-                                "properties": {},
-                                "additionalProperties": false
-                            }
-                        }
-                    }],
-                    "tool_choice": {
-                        "type": "function",
-                        "function": {"name": "xiao_capability_probe"}
-                    }
-                }),
-            )
-            .await;
-        let tools = validate_tools_probe(&tools_probe);
-        observer(ProbeEvent::Completed {
-            capability: CapabilityKind::Tools,
-            outcome: tools_probe.outcome(tools),
-        });
-
-        observer(ProbeEvent::Started {
-            capability: CapabilityKind::StructuredOutput,
-        });
-        observer(ProbeEvent::Progress {
-            capability: CapabilityKind::StructuredOutput,
-            message: "Probing JSON structured output...".to_string(),
-        });
-        let structured_probe = self
-            .run_capability_probe_request(
-                provider,
-                json!({
-                    "model": model,
-                    "messages": [{
-                        "role": "user",
-                        "content": "Return exactly this JSON object: {\"xiao_probe\":true}"
-                    }],
-                    "stream": false,
-                    "max_tokens": 16,
-                    "response_format": {"type": "json_object"}
-                }),
-            )
-            .await;
-        let structured = validate_structured_probe(&structured_probe);
-        observer(ProbeEvent::Completed {
-            capability: CapabilityKind::StructuredOutput,
-            outcome: structured_probe.outcome(structured),
-        });
-
-        observer(ProbeEvent::Started {
-            capability: CapabilityKind::ImageInput,
-        });
-        observer(ProbeEvent::Progress {
-            capability: CapabilityKind::ImageInput,
-            message: "Vision 1/2: identifying red image...".to_string(),
-        });
-        let red_probe = self
-            .run_capability_probe_request(provider, vision_probe_payload(model, RED_PNG_BASE64))
-            .await;
-        observer(ProbeEvent::Progress {
-            capability: CapabilityKind::ImageInput,
-            message: "Vision 2/2: identifying blue image...".to_string(),
-        });
-        let blue_probe = self
-            .run_capability_probe_request(provider, vision_probe_payload(model, BLUE_PNG_BASE64))
-            .await;
-        let image = combine_vision_probe_results(
-            validate_color_probe(&red_probe, "red"),
-            validate_color_probe(&blue_probe, "blue"),
-        );
-        let vision_outcome = if image == Some(true) {
-            ProbeOutcome::Supported
-        } else if image == Some(false) {
-            ProbeOutcome::Unsupported
-        } else {
-            match (&red_probe, &blue_probe) {
-                (CapabilityProbeResponse::Unknown(outcome), _) => *outcome,
-                (_, CapabilityProbeResponse::Unknown(outcome)) => *outcome,
-                _ => ProbeOutcome::Inconclusive,
-            }
-        };
-        observer(ProbeEvent::Completed {
-            capability: CapabilityKind::ImageInput,
-            outcome: vision_outcome,
-        });
-
-        observer(ProbeEvent::Started {
-            capability: CapabilityKind::AudioInput,
-        });
-        observer(ProbeEvent::Progress {
-            capability: CapabilityKind::AudioInput,
-            message: "Probing native Main-compatible audio input with a bounded WAV sample..."
-                .to_string(),
-        });
-        let audio_input_probe = self.run_audio_input_probe_request(provider, model).await;
-        let probed_audio_input = validate_text_probe(&audio_input_probe);
-        observer(ProbeEvent::Completed {
-            capability: CapabilityKind::AudioInput,
-            outcome: audio_input_probe.outcome(probed_audio_input),
-        });
-
-        observer(ProbeEvent::Started {
-            capability: CapabilityKind::AudioTranscription,
-        });
-        observer(ProbeEvent::Progress {
-            capability: CapabilityKind::AudioTranscription,
-            message: "Probing audio/transcriptions with a tiny bounded WAV sample...".to_string(),
-        });
-        let transcription_probe = self.run_transcription_probe_request(provider, model).await;
-        let audio_transcription = validate_endpoint_acceptance(&transcription_probe);
-        observer(ProbeEvent::Completed {
-            capability: CapabilityKind::AudioTranscription,
-            outcome: transcription_probe.outcome(audio_transcription),
-        });
-
         let provider_id = provider.endpoint.trim_end_matches('/').to_string();
         let metadata = self
             .model_metadata
@@ -1306,109 +1214,185 @@ impl AIChatService {
             .unwrap_or("")
             .to_ascii_lowercase();
         let checked_at = Local::now().to_rfc3339();
-        let metadata_image_input = (modalities.contains("image")
-            || modalities.contains("vision")
-            || modalities.contains("multimodal"))
-        .then_some(true);
-        let metadata_audio_input = modalities.contains("audio").then_some(true);
-        let metadata_video_input = modalities.contains("video").then_some(true);
-        let native_file_input =
-            (modalities.contains("file") || modalities.contains("document")).then_some(true);
-        let image_input = image.or(metadata_image_input);
-        let audio_input = probed_audio_input.or(metadata_audio_input);
 
-        observer(ProbeEvent::Started {
-            capability: CapabilityKind::VideoInput,
+        let previous = self.capability_record(&provider.endpoint, model).await;
+        let mut record = previous.unwrap_or_else(|| CapabilityRecord {
+            provider_id: provider_id.clone(),
+            provider_name: provider.name.clone(),
+            model: model.to_string(),
+            context_window: metadata.as_ref().and_then(|meta| meta.context_length),
+            ..CapabilityRecord::default()
         });
-        observer(ProbeEvent::Progress {
-            capability: CapabilityKind::VideoInput,
-            message: "Probing video input with a tiny bounded red MP4 sample...".to_string(),
-        });
-        let video_probe = self
-            .run_capability_probe_request(provider, video_probe_payload(model))
-            .await;
-        let probed_video_input = validate_color_probe(&video_probe, "red");
-        let video_input = probed_video_input.or(metadata_video_input);
-        observer(ProbeEvent::Completed {
-            capability: CapabilityKind::VideoInput,
-            outcome: video_probe.outcome(probed_video_input),
-        });
-        observer(ProbeEvent::Skipped {
-            capability: CapabilityKind::ImageGeneration,
-            reason: "Active image-generation probe can spend credits and is never run automatically; passive evidence only.".to_string(),
-        });
+        record.provider_id = provider_id.clone();
+        record.provider_name = provider.name.clone();
+        record.model = model.to_string();
+        if let Some(ctx) = metadata.as_ref().and_then(|meta| meta.context_length) {
+            record.context_window = Some(ctx);
+        }
 
-        let mut evidence = vec![
-            CapabilityEvidence {
+        let probe_text = matches!(plan, ProbePlan::FullSafe | ProbePlan::Role(ModelRole::Main));
+        let probe_vision = matches!(
+            plan,
+            ProbePlan::FullSafe | ProbePlan::Role(ModelRole::Vision)
+        );
+        let probe_audio = matches!(
+            plan,
+            ProbePlan::FullSafe | ProbePlan::Role(ModelRole::AudioStt)
+        );
+        let probe_video = matches!(
+            plan,
+            ProbePlan::FullSafe | ProbePlan::Role(ModelRole::Video)
+        );
+        let probe_image_gen = matches!(
+            plan,
+            ProbePlan::FullSafe | ProbePlan::Role(ModelRole::ImageGeneration)
+        );
+
+        if probe_text {
+            observer(ProbeEvent::Progress {
+                capability: CapabilityKind::TextChat,
+                message: "Checking provider metadata...".to_string(),
+            });
+
+            observer(ProbeEvent::Started {
+                capability: CapabilityKind::TextChat,
+            });
+            observer(ProbeEvent::Progress {
+                capability: CapabilityKind::TextChat,
+                message: "Probing text chat...".to_string(),
+            });
+            let text_probe = self
+                .run_capability_probe_request(
+                    provider,
+                    json!({
+                        "model": model,
+                        "messages": [{"role": "user", "content": "Reply with exactly OK."}],
+                        "stream": false,
+                        "max_tokens": 4
+                    }),
+                )
+                .await;
+            let text = validate_text_probe(&text_probe);
+            observer(ProbeEvent::Completed {
+                capability: CapabilityKind::TextChat,
+                outcome: text_probe.outcome(text),
+            });
+            record.supports_text_chat = text;
+            record
+                .evidence
+                .retain(|e| e.capability != CapabilityKind::TextChat);
+            record.evidence.push(CapabilityEvidence {
                 capability: CapabilityKind::TextChat,
                 source: CapabilityEvidenceSource::ActiveProbe,
                 outcome: capability_state(text),
                 checked_at: checked_at.clone(),
                 detail: Some(format!("probe={:?}", text_probe.outcome(text))),
-            },
-            CapabilityEvidence {
-                capability: CapabilityKind::ImageInput,
-                source: CapabilityEvidenceSource::ActiveProbe,
-                outcome: capability_state(image),
-                checked_at: checked_at.clone(),
-                detail: Some("two-image red/blue semantic probe".to_string()),
-            },
-            CapabilityEvidence {
+            });
+
+            observer(ProbeEvent::Started {
+                capability: CapabilityKind::Tools,
+            });
+            observer(ProbeEvent::Progress {
+                capability: CapabilityKind::Tools,
+                message: "Probing function call...".to_string(),
+            });
+            let tools_probe = self
+                .run_capability_probe_request(
+                    provider,
+                    json!({
+                        "model": model,
+                        "messages": [{
+                            "role": "user",
+                            "content": "Call the xiao_capability_probe function now. Do not answer with normal text."
+                        }],
+                        "stream": false,
+                        "max_tokens": 16,
+                        "tools": [{
+                            "type": "function",
+                            "function": {
+                                "name": "xiao_capability_probe",
+                                "description": "No-op capability probe",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {},
+                                    "additionalProperties": false
+                                }
+                            }
+                        }],
+                        "tool_choice": {
+                            "type": "function",
+                            "function": {"name": "xiao_capability_probe"}
+                        }
+                    }),
+                )
+                .await;
+            let tools = validate_tools_probe(&tools_probe);
+            observer(ProbeEvent::Completed {
+                capability: CapabilityKind::Tools,
+                outcome: tools_probe.outcome(tools),
+            });
+            record.supports_tools = tools;
+            record
+                .evidence
+                .retain(|e| e.capability != CapabilityKind::Tools);
+            record.evidence.push(CapabilityEvidence {
                 capability: CapabilityKind::Tools,
                 source: CapabilityEvidenceSource::ActiveProbe,
                 outcome: capability_state(tools),
                 checked_at: checked_at.clone(),
                 detail: Some(format!("probe={:?}", tools_probe.outcome(tools))),
-            },
-            CapabilityEvidence {
+            });
+
+            observer(ProbeEvent::Started {
+                capability: CapabilityKind::StructuredOutput,
+            });
+            observer(ProbeEvent::Progress {
+                capability: CapabilityKind::StructuredOutput,
+                message: "Probing JSON structured output...".to_string(),
+            });
+            let structured_probe = self
+                .run_capability_probe_request(
+                    provider,
+                    json!({
+                        "model": model,
+                        "messages": [{
+                            "role": "user",
+                            "content": "Return exactly this JSON object: {\"xiao_probe\":true}"
+                        }],
+                        "stream": false,
+                        "max_tokens": 16,
+                        "response_format": {"type": "json_object"}
+                    }),
+                )
+                .await;
+            let structured = validate_structured_probe(&structured_probe);
+            observer(ProbeEvent::Completed {
+                capability: CapabilityKind::StructuredOutput,
+                outcome: structured_probe.outcome(structured),
+            });
+            record.supports_structured_output = structured;
+            record
+                .evidence
+                .retain(|e| e.capability != CapabilityKind::StructuredOutput);
+            record.evidence.push(CapabilityEvidence {
                 capability: CapabilityKind::StructuredOutput,
                 source: CapabilityEvidenceSource::ActiveProbe,
                 outcome: capability_state(structured),
                 checked_at: checked_at.clone(),
                 detail: Some(format!("probe={:?}", structured_probe.outcome(structured))),
-            },
-            CapabilityEvidence {
-                capability: CapabilityKind::AudioInput,
-                source: CapabilityEvidenceSource::ActiveProbe,
-                outcome: capability_state(probed_audio_input),
-                checked_at: checked_at.clone(),
-                detail: Some(format!(
-                    "probe={:?}",
-                    audio_input_probe.outcome(probed_audio_input)
-                )),
-            },
-            CapabilityEvidence {
-                capability: CapabilityKind::AudioTranscription,
-                source: CapabilityEvidenceSource::ActiveProbe,
-                outcome: capability_state(audio_transcription),
-                checked_at: checked_at.clone(),
-                detail: Some(format!(
-                    "probe={:?}",
-                    transcription_probe.outcome(audio_transcription)
-                )),
-            },
-            CapabilityEvidence {
-                capability: CapabilityKind::VideoInput,
-                source: CapabilityEvidenceSource::ActiveProbe,
-                outcome: capability_state(probed_video_input),
-                checked_at: checked_at.clone(),
-                detail: Some(format!(
-                    "tiny red MP4 semantic probe={:?}",
-                    video_probe.outcome(probed_video_input)
-                )),
-            },
-        ];
-        for (capability, value) in [
-            (CapabilityKind::ImageInput, metadata_image_input),
-            (CapabilityKind::AudioInput, metadata_audio_input),
-            (CapabilityKind::VideoInput, metadata_video_input),
-            (CapabilityKind::NativeFileInput, native_file_input),
-        ] {
-            if let Some(value) = value {
-                evidence.push(CapabilityEvidence {
-                    capability,
+            });
+
+            let native_file_input =
+                (modalities.contains("file") || modalities.contains("document")).then_some(true);
+            if let Some(val) = native_file_input {
+                record.supports_native_file_input = Some(val);
+                record
+                    .evidence
+                    .retain(|e| e.capability != CapabilityKind::NativeFileInput);
+                record.evidence.push(CapabilityEvidence {
+                    capability: CapabilityKind::NativeFileInput,
                     source: CapabilityEvidenceSource::ProviderMetadata,
-                    outcome: if value {
+                    outcome: if val {
                         CapabilityState::Supported
                     } else {
                         CapabilityState::Unsupported
@@ -1419,56 +1403,208 @@ impl AIChatService {
             }
         }
 
-        let mut record = CapabilityRecord {
-            provider_id: provider_id.clone(),
-            provider_name: provider.name.clone(),
-            model: model.to_string(),
-            context_window: metadata.as_ref().and_then(|meta| meta.context_length),
-            supports_text_chat: text,
-            supports_image_input: image_input,
-            supports_image_generation: None,
-            supports_image_editing: None,
-            supports_audio_input: audio_input,
-            supports_audio_transcription: audio_transcription,
-            supports_video_input: video_input,
-            supports_native_file_input: native_file_input,
-            supports_reasoning: None,
-            supports_tools: tools,
-            supports_structured_output: structured,
-            evidence,
-            source: "active capability probe + provider metadata".to_string(),
-            details: vec![
-                format!("text={text:?}"),
-                format!("vision={image:?}"),
-                format!("tools={tools:?}"),
-                format!("structured_output={structured:?}"),
-                format!("video={video_input:?}"),
-                if modalities.is_empty() {
-                    "modalities=unknown".to_string()
-                } else {
-                    format!("modalities={modalities}")
-                },
-                "image_generation=unknown (active probe is explicit only)".to_string(),
-                format!("audio_transcription={audio_transcription:?}"),
-            ],
-            checked_at,
-        };
-
-        if let Some(previous) = self.capability_record(&provider.endpoint, model).await {
-            record.supports_image_generation = previous.supports_image_generation;
-            record.supports_image_editing = previous.supports_image_editing;
-            record.supports_reasoning = previous.supports_reasoning;
+        if probe_vision {
+            observer(ProbeEvent::Started {
+                capability: CapabilityKind::ImageInput,
+            });
+            observer(ProbeEvent::Progress {
+                capability: CapabilityKind::ImageInput,
+                message: "Vision 1/2: identifying red image...".to_string(),
+            });
+            let red_probe = self
+                .run_capability_probe_request(provider, vision_probe_payload(model, RED_PNG_BASE64))
+                .await;
+            observer(ProbeEvent::Progress {
+                capability: CapabilityKind::ImageInput,
+                message: "Vision 2/2: identifying blue image...".to_string(),
+            });
+            let blue_probe = self
+                .run_capability_probe_request(
+                    provider,
+                    vision_probe_payload(model, BLUE_PNG_BASE64),
+                )
+                .await;
+            let image = combine_vision_probe_results(
+                validate_color_probe(&red_probe, "red"),
+                validate_color_probe(&blue_probe, "blue"),
+            );
+            let vision_outcome = if image == Some(true) {
+                ProbeOutcome::Supported
+            } else if image == Some(false) {
+                ProbeOutcome::Unsupported
+            } else {
+                match (&red_probe, &blue_probe) {
+                    (CapabilityProbeResponse::Unknown(outcome), _) => *outcome,
+                    (_, CapabilityProbeResponse::Unknown(outcome)) => *outcome,
+                    _ => ProbeOutcome::Inconclusive,
+                }
+            };
+            observer(ProbeEvent::Completed {
+                capability: CapabilityKind::ImageInput,
+                outcome: vision_outcome,
+            });
+            let metadata_image_input = (modalities.contains("image")
+                || modalities.contains("vision")
+                || modalities.contains("multimodal"))
+            .then_some(true);
+            let final_image = image.or(metadata_image_input);
+            record.supports_image_input = final_image;
             record
                 .evidence
-                .extend(previous.evidence.into_iter().filter(|evidence| {
-                    matches!(
-                        evidence.capability,
-                        CapabilityKind::ImageGeneration
-                            | CapabilityKind::ImageEditing
-                            | CapabilityKind::Reasoning
-                    )
-                }));
+                .retain(|e| e.capability != CapabilityKind::ImageInput);
+            record.evidence.push(CapabilityEvidence {
+                capability: CapabilityKind::ImageInput,
+                source: CapabilityEvidenceSource::ActiveProbe,
+                outcome: capability_state(image),
+                checked_at: checked_at.clone(),
+                detail: Some("two-image red/blue semantic probe".to_string()),
+            });
+            if let Some(val) = metadata_image_input {
+                record.evidence.push(CapabilityEvidence {
+                    capability: CapabilityKind::ImageInput,
+                    source: CapabilityEvidenceSource::ProviderMetadata,
+                    outcome: if val {
+                        CapabilityState::Supported
+                    } else {
+                        CapabilityState::Unsupported
+                    },
+                    checked_at: checked_at.clone(),
+                    detail: Some(format!("modalities={modalities}")),
+                });
+            }
         }
+
+        if probe_audio {
+            observer(ProbeEvent::Started {
+                capability: CapabilityKind::AudioInput,
+            });
+            observer(ProbeEvent::Progress {
+                capability: CapabilityKind::AudioInput,
+                message: "Probing native Main-compatible audio input with a bounded WAV sample..."
+                    .to_string(),
+            });
+            let audio_input_probe = self.run_audio_input_probe_request(provider, model).await;
+            let probed_audio_input = validate_text_probe(&audio_input_probe);
+            observer(ProbeEvent::Completed {
+                capability: CapabilityKind::AudioInput,
+                outcome: audio_input_probe.outcome(probed_audio_input),
+            });
+            let metadata_audio_input = modalities.contains("audio").then_some(true);
+            let final_audio_input = probed_audio_input.or(metadata_audio_input);
+            record.supports_audio_input = final_audio_input;
+            record
+                .evidence
+                .retain(|e| e.capability != CapabilityKind::AudioInput);
+            record.evidence.push(CapabilityEvidence {
+                capability: CapabilityKind::AudioInput,
+                source: CapabilityEvidenceSource::ActiveProbe,
+                outcome: capability_state(probed_audio_input),
+                checked_at: checked_at.clone(),
+                detail: Some(format!(
+                    "probe={:?}",
+                    audio_input_probe.outcome(probed_audio_input)
+                )),
+            });
+            if let Some(val) = metadata_audio_input {
+                record.evidence.push(CapabilityEvidence {
+                    capability: CapabilityKind::AudioInput,
+                    source: CapabilityEvidenceSource::ProviderMetadata,
+                    outcome: if val {
+                        CapabilityState::Supported
+                    } else {
+                        CapabilityState::Unsupported
+                    },
+                    checked_at: checked_at.clone(),
+                    detail: Some(format!("modalities={modalities}")),
+                });
+            }
+
+            observer(ProbeEvent::Started {
+                capability: CapabilityKind::AudioTranscription,
+            });
+            observer(ProbeEvent::Progress {
+                capability: CapabilityKind::AudioTranscription,
+                message: "Probing audio/transcriptions with a tiny spoken audio sample..."
+                    .to_string(),
+            });
+            let transcription_probe = self.run_transcription_probe_request(provider, model).await;
+            let audio_transcription = validate_transcription_probe(&transcription_probe);
+            observer(ProbeEvent::Completed {
+                capability: CapabilityKind::AudioTranscription,
+                outcome: transcription_probe.outcome(audio_transcription),
+            });
+            record.supports_audio_transcription = audio_transcription;
+            record
+                .evidence
+                .retain(|e| e.capability != CapabilityKind::AudioTranscription);
+            record.evidence.push(CapabilityEvidence {
+                capability: CapabilityKind::AudioTranscription,
+                source: CapabilityEvidenceSource::ActiveProbe,
+                outcome: capability_state(audio_transcription),
+                checked_at: checked_at.clone(),
+                detail: Some(format!(
+                    "probe={:?}",
+                    transcription_probe.outcome(audio_transcription)
+                )),
+            });
+        }
+
+        if probe_video {
+            observer(ProbeEvent::Started {
+                capability: CapabilityKind::VideoInput,
+            });
+            observer(ProbeEvent::Progress {
+                capability: CapabilityKind::VideoInput,
+                message: "Probing video input with a tiny bounded red MP4 sample...".to_string(),
+            });
+            let video_probe = self
+                .run_capability_probe_request(provider, video_probe_payload(model))
+                .await;
+            let probed_video_input = validate_color_probe(&video_probe, "red");
+            let metadata_video_input = modalities.contains("video").then_some(true);
+            let final_video_input = probed_video_input.or(metadata_video_input);
+            observer(ProbeEvent::Completed {
+                capability: CapabilityKind::VideoInput,
+                outcome: video_probe.outcome(probed_video_input),
+            });
+            record.supports_video_input = final_video_input;
+            record
+                .evidence
+                .retain(|e| e.capability != CapabilityKind::VideoInput);
+            record.evidence.push(CapabilityEvidence {
+                capability: CapabilityKind::VideoInput,
+                source: CapabilityEvidenceSource::ActiveProbe,
+                outcome: capability_state(probed_video_input),
+                checked_at: checked_at.clone(),
+                detail: Some(format!(
+                    "tiny red MP4 semantic probe={:?}",
+                    video_probe.outcome(probed_video_input)
+                )),
+            });
+            if let Some(val) = metadata_video_input {
+                record.evidence.push(CapabilityEvidence {
+                    capability: CapabilityKind::VideoInput,
+                    source: CapabilityEvidenceSource::ProviderMetadata,
+                    outcome: if val {
+                        CapabilityState::Supported
+                    } else {
+                        CapabilityState::Unsupported
+                    },
+                    checked_at: checked_at.clone(),
+                    detail: Some(format!("modalities={modalities}")),
+                });
+            }
+        }
+
+        if probe_image_gen {
+            observer(ProbeEvent::Skipped {
+                capability: CapabilityKind::ImageGeneration,
+                reason: "Active image-generation probe can spend credits and is never run automatically; passive evidence only.".to_string(),
+            });
+        }
+
+        record.checked_at = checked_at;
+        record.source = "capability probe + provider metadata".to_string();
 
         observer(ProbeEvent::Progress {
             capability: CapabilityKind::TextChat,
@@ -1499,6 +1635,44 @@ impl AIChatService {
         observer(ProbeEvent::Persistence { saved: published });
         observer(ProbeEvent::Finished);
         record
+    }
+
+    pub async fn probe_model_capabilities_with_observer<F>(
+        &self,
+        provider: &ProviderConfig,
+        model: &str,
+        observer: F,
+    ) -> CapabilityRecord
+    where
+        F: FnMut(ProbeEvent),
+    {
+        self.probe_model_capabilities_with_plan_and_observer(
+            provider,
+            model,
+            ProbePlan::FullSafe,
+            observer,
+        )
+        .await
+    }
+
+    pub async fn probe_addon_role_with_observer<F>(
+        &self,
+        role: ModelRole,
+        observer: F,
+    ) -> Result<CapabilityRecord, String>
+    where
+        F: FnMut(ProbeEvent),
+    {
+        let route = self.resolve_model_route_unchecked(role).await?;
+        let record = self
+            .probe_model_capabilities_with_plan_and_observer(
+                &route.provider,
+                &route.model,
+                ProbePlan::Role(role),
+                observer,
+            )
+            .await;
+        Ok(record)
     }
 
     pub async fn capability_record(&self, endpoint: &str, model: &str) -> Option<CapabilityRecord> {
@@ -1629,6 +1803,46 @@ impl AIChatService {
                                         .and_then(|m| m.modalities.as_deref())
                                         .unwrap_or("")
                                         .to_ascii_lowercase();
+                                    let record_checked_at = Local::now().to_rfc3339();
+                                    let mut metadata_evidence = Vec::new();
+                                    for (cap, val) in [
+                                        (
+                                            CapabilityKind::ImageInput,
+                                            (modalities.contains("image")
+                                                || modalities.contains("vision")
+                                                || modalities.contains("multimodal"))
+                                            .then_some(true),
+                                        ),
+                                        (
+                                            CapabilityKind::AudioInput,
+                                            modalities.contains("audio").then_some(true),
+                                        ),
+                                        (
+                                            CapabilityKind::VideoInput,
+                                            modalities.contains("video").then_some(true),
+                                        ),
+                                        (
+                                            CapabilityKind::NativeFileInput,
+                                            (modalities.contains("file")
+                                                || modalities.contains("document"))
+                                            .then_some(true),
+                                        ),
+                                    ] {
+                                        if let Some(supported) = val {
+                                            metadata_evidence.push(CapabilityEvidence {
+                                                capability: cap,
+                                                source: CapabilityEvidenceSource::ProviderMetadata,
+                                                outcome: if supported {
+                                                    CapabilityState::Supported
+                                                } else {
+                                                    CapabilityState::Unsupported
+                                                },
+                                                checked_at: record_checked_at.clone(),
+                                                detail: Some(format!("modalities: {modalities}")),
+                                            });
+                                        }
+                                    }
+
                                     let record = CapabilityRecord {
                                         provider_id: provider_id.clone(),
                                         provider_name: provider_id.clone(),
@@ -1655,7 +1869,7 @@ impl AIChatService {
                                         supports_native_file_input: (modalities.contains("file")
                                             || modalities.contains("document"))
                                         .then_some(true),
-                                        evidence: Vec::new(),
+                                        evidence: metadata_evidence.clone(),
                                         source: "provider /models metadata".to_string(),
                                         details: if modalities.is_empty() {
                                             vec!["Input modality tidak dipublikasikan endpoint"
@@ -1663,7 +1877,7 @@ impl AIChatService {
                                         } else {
                                             vec![format!("modalities: {modalities}")]
                                         },
-                                        checked_at: Local::now().to_rfc3339(),
+                                        checked_at: record_checked_at.clone(),
                                     };
                                     if let Some(existing) =
                                         candidate.models.iter_mut().find(|entry| {
@@ -1685,6 +1899,13 @@ impl AIChatService {
                                         if existing.supports_video_input.is_none() {
                                             existing.supports_video_input =
                                                 record.supports_video_input;
+                                        }
+                                        for ev in metadata_evidence {
+                                            existing.evidence.retain(|e| {
+                                                e.capability != ev.capability
+                                                    || e.source != CapabilityEvidenceSource::ProviderMetadata
+                                            });
+                                            existing.evidence.push(ev);
                                         }
                                         existing.checked_at = record.checked_at;
                                         if !record.details.is_empty() {
@@ -2062,20 +2283,78 @@ mod tests {
     }
 
     #[test]
-    fn transient_probe_failures_remain_unknown_outcomes() {
-        for outcome in [
-            ProbeOutcome::Timeout,
-            ProbeOutcome::RateLimited,
-            ProbeOutcome::ProviderError,
-            ProbeOutcome::AuthFailed,
-            ProbeOutcome::ProtocolMismatch,
-            ProbeOutcome::NetworkError,
-            ProbeOutcome::Inconclusive,
-        ] {
-            assert_eq!(
-                CapabilityProbeResponse::Unknown(outcome).outcome(None),
-                outcome
-            );
-        }
+    fn semantic_stt_probe_success_supported() {
+        let response = CapabilityProbeResponse::Success(json!({
+            "text": "xiao capability probe"
+        }));
+        assert_eq!(validate_transcription_probe(&response), Some(true));
+        assert_eq!(response.outcome(Some(true)), ProbeOutcome::Supported);
+    }
+
+    #[test]
+    fn semantic_stt_probe_normalized_case_and_punctuation_supported() {
+        let response = CapabilityProbeResponse::Success(json!({
+            "text": "Xiao capability probe."
+        }));
+        assert_eq!(validate_transcription_probe(&response), Some(true));
+    }
+
+    #[test]
+    fn semantic_stt_probe_empty_transcript_unknown() {
+        let response = CapabilityProbeResponse::Success(json!({
+            "text": ""
+        }));
+        assert_eq!(validate_transcription_probe(&response), None);
+        assert_eq!(response.outcome(None), ProbeOutcome::Inconclusive);
+    }
+
+    #[test]
+    fn semantic_stt_probe_wrong_phrase_unknown() {
+        let response = CapabilityProbeResponse::Success(json!({
+            "text": "hello world"
+        }));
+        assert_eq!(validate_transcription_probe(&response), None);
+        assert_eq!(response.outcome(None), ProbeOutcome::Inconclusive);
+    }
+
+    #[test]
+    fn semantic_stt_probe_http_200_without_text_unknown() {
+        let response = CapabilityProbeResponse::Success(json!({
+            "status": "ok"
+        }));
+        assert_eq!(validate_transcription_probe(&response), None);
+        assert_eq!(response.outcome(None), ProbeOutcome::Inconclusive);
+    }
+
+    #[test]
+    fn semantic_stt_probe_explicit_unsupported_rejected() {
+        let response = CapabilityProbeResponse::Rejected;
+        assert_eq!(validate_transcription_probe(&response), Some(false));
+        assert_eq!(response.outcome(Some(false)), ProbeOutcome::Unsupported);
+    }
+
+    #[test]
+    fn semantic_stt_probe_transient_status_unknown() {
+        let timeout = CapabilityProbeResponse::Unknown(ProbeOutcome::Timeout);
+        assert_eq!(validate_transcription_probe(&timeout), None);
+        assert_eq!(timeout.outcome(None), ProbeOutcome::Timeout);
+
+        let rate_limited = CapabilityProbeResponse::Unknown(ProbeOutcome::RateLimited);
+        assert_eq!(validate_transcription_probe(&rate_limited), None);
+        assert_eq!(rate_limited.outcome(None), ProbeOutcome::RateLimited);
+
+        let server_error = CapabilityProbeResponse::Unknown(ProbeOutcome::ProviderError);
+        assert_eq!(validate_transcription_probe(&server_error), None);
+        assert_eq!(server_error.outcome(None), ProbeOutcome::ProviderError);
+    }
+
+    #[test]
+    fn role_scoped_probe_plan_variants_are_distinct() {
+        assert_eq!(ProbePlan::FullSafe, ProbePlan::FullSafe);
+        assert_ne!(ProbePlan::FullSafe, ProbePlan::Role(ModelRole::Vision));
+        assert_ne!(
+            ProbePlan::Role(ModelRole::Vision),
+            ProbePlan::Role(ModelRole::AudioStt)
+        );
     }
 }
