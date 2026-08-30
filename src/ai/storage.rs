@@ -1322,6 +1322,26 @@ pub enum ProbeEvent {
     Finished,
 }
 
+impl ProbeEvent {
+    pub fn run_status(&self) -> ProbeRunStatus {
+        match self {
+            Self::Progress { message, .. }
+                if message.starts_with("Checking provider metadata") =>
+            {
+                ProbeRunStatus::CheckingMetadata
+            }
+            Self::Progress { message, .. } if message.starts_with("Persisting") => {
+                ProbeRunStatus::Waiting
+            }
+            Self::Started { .. } | Self::Progress { .. } => ProbeRunStatus::Probing,
+            Self::Completed { .. } | Self::Finished => ProbeRunStatus::Completed,
+            Self::Skipped { .. } => ProbeRunStatus::Skipped,
+            Self::Persistence { saved: false } => ProbeRunStatus::Failed,
+            Self::Persistence { saved: true } => ProbeRunStatus::Completed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CapabilityRecord {
     pub provider_id: String,
@@ -1371,10 +1391,6 @@ impl CapabilityRecord {
         } else {
             EvidenceFreshness::Stale
         }
-    }
-
-    pub fn freshness(&self, ttl: std::time::Duration) -> EvidenceFreshness {
-        Self::timestamp_freshness(&self.checked_at, ttl)
     }
 
     pub fn freshness_for(
