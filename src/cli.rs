@@ -467,18 +467,19 @@ pub(crate) async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Opt
         return None;
     }
     println!("\n\x1b[38;5;244mChecking Main Model capabilities...\x1b[0m");
-    let probe = ai_service
-        .probe_model_capabilities_with_observer(&provider, &active_model, print_probe_event)
-        .await;
-    println!(
-        "\x1b[38;5;244mMain capability state: text={:?}, vision={:?}, video={:?}, audio={:?}, stt={:?}, image_gen={:?}\x1b[0m",
-        probe.supports_text_chat,
-        probe.supports_image_input,
-        probe.supports_video_input,
-        probe.supports_audio_input,
-        probe.supports_audio_transcription,
-        probe.supports_image_generation,
-    );
+    if let Some(probe) =
+        run_persisted_capability_probe(ai_service, &provider, &active_model).await
+    {
+        println!(
+            "\x1b[38;5;244mSaved Main capability state: text={:?}, vision={:?}, video={:?}, audio={:?}, stt={:?}, image_gen={:?}\x1b[0m",
+            probe.supports_text_chat,
+            probe.supports_image_input,
+            probe.supports_video_input,
+            probe.supports_audio_input,
+            probe.supports_audio_transcription,
+            probe.supports_image_generation,
+        );
+    }
 
     println!(
         "\x1b[1;32m[OK] AI Provider '{}' configured with Main Model '{}'!\x1b[0m",
@@ -798,13 +799,14 @@ pub(crate) async fn run_cli_provider_add(ai_service: &AIChatService) {
         return;
     }
     println!("  Checking model capabilities...");
-    let probe = ai_service
-        .probe_model_capabilities_with_observer(&provider, &active_model, print_probe_event)
-        .await;
-    println!(
-        "  \x1b[38;5;244mCapability probe: vision={:?}, tools={:?}, structured={:?}\x1b[0m",
-        probe.supports_image_input, probe.supports_tools, probe.supports_structured_output
-    );
+    if let Some(probe) =
+        run_persisted_capability_probe(ai_service, &provider, &active_model).await
+    {
+        println!(
+            "  \x1b[38;5;244mSaved capability probe: vision={:?}, tools={:?}, structured={:?}\x1b[0m",
+            probe.supports_image_input, probe.supports_tools, probe.supports_structured_output
+        );
+    }
 
     println!(
         "\n\x1b[1;32m[SUCCESS] Provider '{}' added and activated!\x1b[0m",
@@ -1189,6 +1191,26 @@ fn print_probe_event(event: ProbeEvent) {
     }
 }
 
+async fn run_persisted_capability_probe(
+    ai_service: &AIChatService,
+    provider: &ProviderConfig,
+    model: &str,
+) -> Option<crate::ai::service::CapabilityRecord> {
+    let candidate = ai_service
+        .probe_model_capabilities_with_observer(provider, model, print_probe_event)
+        .await;
+    let persisted = ai_service.capability_record(&provider.endpoint, model).await;
+    match persisted {
+        Some(record) if record.checked_at == candidate.checked_at => Some(record),
+        _ => {
+            println!(
+                "[WARN] Probe completed, but its capability candidate was not published durably. Previous saved evidence remains authoritative."
+            );
+            None
+        }
+    }
+}
+
 async fn probe_addon_role(ai_service: &AIChatService, role: ModelRole) {
     let route = match ai_service.resolve_model_route_unchecked(role).await {
         Ok(route) => route,
@@ -1203,11 +1225,13 @@ async fn probe_addon_role(ai_service: &AIChatService, role: ModelRole) {
         route.provider.name,
         route.model
     );
-    let record = ai_service
-        .probe_model_capabilities_with_observer(&route.provider, &route.model, print_probe_event)
-        .await;
+    let Some(record) =
+        run_persisted_capability_probe(ai_service, &route.provider, &route.model).await
+    else {
+        return;
+    };
     println!(
-        "Result: text={:?}, vision={:?}, video={:?}, audio={:?}, stt={:?}, image_gen={:?}",
+        "Saved result: text={:?}, vision={:?}, video={:?}, audio={:?}, stt={:?}, image_gen={:?}",
         record.supports_text_chat,
         record.supports_image_input,
         record.supports_video_input,
@@ -1453,22 +1477,19 @@ pub(crate) async fn run_cli_model_probe(ai_service: &AIChatService) {
                     models.first().cloned().unwrap_or_default()
                 };
                 if !model.is_empty() {
-                    let record = ai_service
-                        .probe_model_capabilities_with_observer(
-                            &provider,
-                            &model,
-                            print_probe_event,
-                        )
-                        .await;
-                    println!(
-                        "  active {}: text={:?} image={:?} tools={:?} structured={:?} files={:?}",
-                        record.model,
-                        record.supports_text_chat,
-                        record.supports_image_input,
-                        record.supports_tools,
-                        record.supports_structured_output,
-                        record.supports_native_file_input,
-                    );
+                    if let Some(record) =
+                        run_persisted_capability_probe(ai_service, &provider, &model).await
+                    {
+                        println!(
+                            "  saved active {}: text={:?} image={:?} tools={:?} structured={:?} files={:?}",
+                            record.model,
+                            record.supports_text_chat,
+                            record.supports_image_input,
+                            record.supports_tools,
+                            record.supports_structured_output,
+                            record.supports_native_file_input,
+                        );
+                    }
                 }
             }
             Ok(_) | Err(_) => println!("{}: capability discovery failed", provider.name),
