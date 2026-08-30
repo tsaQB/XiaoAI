@@ -445,15 +445,15 @@ async fn build_session_manager_ui(
         let status = if is_active {
             format!("Active · {} msgs", session.messages.len())
         } else {
-            format!("{} msgs · {}", session.messages.len(), session_last_activity(session))
+            format!(
+                "{} msgs · {}",
+                session.messages.len(),
+                session_last_activity(session)
+            )
         };
         table_rows.push(vec![
             RichBlockTableCell::text_only(&(global_idx + 1).to_string(), false, Some("center")),
-            RichBlockTableCell::text_only(
-                &truncate_session_name(&name, 28),
-                false,
-                Some("left"),
-            ),
+            RichBlockTableCell::text_only(&truncate_session_name(&name, 28), false, Some("left")),
             RichBlockTableCell::text_only(&status, false, Some("left")),
         ]);
         session_buttons.push(if is_active {
@@ -711,11 +711,21 @@ async fn build_start_menu_ui(ai_service: &AIChatService, user_id: i64) -> InputR
 
 fn build_help_ui() -> InputRichMessage {
     let input_items = vec![
-        RichBlockListItem::bullet(vec![json!({"type":"paragraph","text":"Text — ordinary chat and instructions."})]),
-        RichBlockListItem::bullet(vec![json!({"type":"paragraph","text":"Images — routed through the verified Vision role."})]),
-        RichBlockListItem::bullet(vec![json!({"type":"paragraph","text":"Documents — local extraction; scanned PDF pages route through Vision."})]),
-        RichBlockListItem::bullet(vec![json!({"type":"paragraph","text":"Voice/audio — native Main audio or the configured Audio STT role."})]),
-        RichBlockListItem::bullet(vec![json!({"type":"paragraph","text":"Video — direct Main or the configured Video specialist when verified."})]),
+        RichBlockListItem::bullet(vec![
+            json!({"type":"paragraph","text":"Text — ordinary chat and instructions."}),
+        ]),
+        RichBlockListItem::bullet(vec![
+            json!({"type":"paragraph","text":"Images — routed through the verified Vision role."}),
+        ]),
+        RichBlockListItem::bullet(vec![
+            json!({"type":"paragraph","text":"Documents — local extraction; scanned PDF pages route through Vision."}),
+        ]),
+        RichBlockListItem::bullet(vec![
+            json!({"type":"paragraph","text":"Voice/audio — native Main audio or the configured Audio STT role."}),
+        ]),
+        RichBlockListItem::bullet(vec![
+            json!({"type":"paragraph","text":"Video — direct Main or the configured Video specialist when verified."}),
+        ]),
     ];
     let command_rows = vec![
         vec![
@@ -900,7 +910,10 @@ async fn run_observable_main_capability_probe(
                 vec![
                     RichBlockTableCell::text_only("Text chat", false, Some("left")),
                     RichBlockTableCell::text_only(
-                        effective_capability_state_label(&record, ai::service::CapabilityKind::TextChat),
+                        effective_capability_state_label(
+                            &record,
+                            ai::service::CapabilityKind::TextChat,
+                        ),
                         false,
                         Some("left"),
                     ),
@@ -908,7 +921,10 @@ async fn run_observable_main_capability_probe(
                 vec![
                     RichBlockTableCell::text_only("Vision", false, Some("left")),
                     RichBlockTableCell::text_only(
-                        effective_capability_state_label(&record, ai::service::CapabilityKind::ImageInput),
+                        effective_capability_state_label(
+                            &record,
+                            ai::service::CapabilityKind::ImageInput,
+                        ),
                         false,
                         Some("left"),
                     ),
@@ -916,7 +932,10 @@ async fn run_observable_main_capability_probe(
                 vec![
                     RichBlockTableCell::text_only("Audio input", false, Some("left")),
                     RichBlockTableCell::text_only(
-                        effective_capability_state_label(&record, ai::service::CapabilityKind::AudioInput),
+                        effective_capability_state_label(
+                            &record,
+                            ai::service::CapabilityKind::AudioInput,
+                        ),
                         false,
                         Some("left"),
                     ),
@@ -924,7 +943,10 @@ async fn run_observable_main_capability_probe(
                 vec![
                     RichBlockTableCell::text_only("Audio STT", false, Some("left")),
                     RichBlockTableCell::text_only(
-                        effective_capability_state_label(&record, ai::service::CapabilityKind::AudioTranscription),
+                        effective_capability_state_label(
+                            &record,
+                            ai::service::CapabilityKind::AudioTranscription,
+                        ),
                         false,
                         Some("left"),
                     ),
@@ -932,7 +954,10 @@ async fn run_observable_main_capability_probe(
                 vec![
                     RichBlockTableCell::text_only("Video", false, Some("left")),
                     RichBlockTableCell::text_only(
-                        effective_capability_state_label(&record, ai::service::CapabilityKind::VideoInput),
+                        effective_capability_state_label(
+                            &record,
+                            ai::service::CapabilityKind::VideoInput,
+                        ),
                         false,
                         Some("left"),
                     ),
@@ -940,7 +965,10 @@ async fn run_observable_main_capability_probe(
                 vec![
                     RichBlockTableCell::text_only("Image generation", false, Some("left")),
                     RichBlockTableCell::text_only(
-                        effective_capability_state_label(&record, ai::service::CapabilityKind::ImageGeneration),
+                        effective_capability_state_label(
+                            &record,
+                            ai::service::CapabilityKind::ImageGeneration,
+                        ),
                         false,
                         Some("left"),
                     ),
@@ -982,12 +1010,8 @@ async fn build_model_dashboard_ui(ai_service: &AIChatService, user_id: i64) -> I
             "Unavailable"
         };
         let cap = &route.capability;
-        let effective = |kind| {
-            format!(
-                "{:?}",
-                AIChatService::effective_capability_state(cap, kind)
-            )
-        };
+        let effective =
+            |kind| format!("{:?}", AIChatService::effective_capability_state(cap, kind));
         (
             route.provider.name.clone(),
             route.model.clone(),
@@ -1211,19 +1235,13 @@ async fn build_main_model_picker_rich(
         blocks.push(RichBlock::Buttons {
             buttons: vec![
                 if curr_page > 1 {
-                    RichMessageButton::callback(
-                        "‹",
-                        format!("model_main_page:{}", curr_page - 1),
-                    )
+                    RichMessageButton::callback("‹", format!("model_main_page:{}", curr_page - 1))
                 } else {
                     RichMessageButton::disabled("‹")
                 },
                 RichMessageButton::disabled(format!("{curr_page}/{total_pages}")),
                 if curr_page < total_pages {
-                    RichMessageButton::callback(
-                        "›",
-                        format!("model_main_page:{}", curr_page + 1),
-                    )
+                    RichMessageButton::callback("›", format!("model_main_page:{}", curr_page + 1))
                 } else {
                     RichMessageButton::disabled("›")
                 },
@@ -1362,11 +1380,7 @@ async fn build_context_monitor_ui(ai_service: &AIChatService, user_id: i64) -> I
                 ],
                 vec![
                     RichBlockTableCell::text_only("Used", false, Some("left")),
-                    RichBlockTableCell::text_only(
-                        &format!("~{used} tokens"),
-                        false,
-                        Some("left"),
-                    ),
+                    RichBlockTableCell::text_only(&format!("~{used} tokens"), false, Some("left")),
                 ],
                 vec![
                     RichBlockTableCell::text_only("Available", false, Some("left")),
@@ -2652,8 +2666,7 @@ async fn handle_update(
                 RichBlock::Paragraph {
                     text: Value::String(format!(
                         "Session #{} · {} is active. Canonical history is empty.",
-                        new_session.id,
-                        new_session.name
+                        new_session.id, new_session.name
                     )),
                 },
             ]);
@@ -3276,7 +3289,12 @@ async fn handle_update(
             let _ = bot.send_rich_message(chat_id, &rich, None, None).await;
         } else if let Some(page) = cq_data.strip_prefix("model_main_page:") {
             let page = page.parse::<usize>().unwrap_or(1);
-            let query = ai_service.model_picker_query.read().await.get(&user_id).cloned();
+            let query = ai_service
+                .model_picker_query
+                .read()
+                .await
+                .get(&user_id)
+                .cloned();
             let rich =
                 build_main_model_picker_rich(ai_service, user_id, query.as_deref(), page).await;
             let _ = bot.answer_callback_query(&cq_id, None, false).await;
@@ -3294,7 +3312,11 @@ async fn handle_update(
             let _ = bot.answer_callback_query(&cq_id, None, false).await;
             let rich = build_help_ui();
             if let Some(mid) = msg_id {
-                if bot.edit_rich_message(chat_id, mid, &rich, None).await.is_ok() {
+                if bot
+                    .edit_rich_message(chat_id, mid, &rich, None)
+                    .await
+                    .is_ok()
+                {
                     return;
                 }
             }
