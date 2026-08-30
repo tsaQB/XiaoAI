@@ -30,16 +30,15 @@ pub use super::routing::{
 
 use super::storage::{
     append_session_messages_db_async, create_session_and_activate_db_async,
-    ensure_session_identity_v2_db_async, load_active_session_id_db_async, load_app_setting_async,
-    load_sessions_db_async, remove_session_transaction_db_async,
+    ensure_session_identity_v2_db_async, load_active_session_id_db_async, load_sessions_db_async,
+    remove_session_transaction_db_async,
     replace_session_messages_if_revision_db_async, save_session_metadata_db_async,
     switch_active_session_db_async,
 };
 pub use super::storage::{
     load_app_setting, load_capability_registry, load_model_routing, load_provider_store,
-    save_app_setting, save_model_routing, save_provider_store, CapabilityKind, CapabilityRecord,
-    CapabilityRegistry, CapabilityState, ChatMessage, ChatSession, EvidenceFreshness, ProbeEvent,
-    ProbeOutcome, ProviderConfig, ProviderStore,
+    save_app_setting, save_provider_store, CapabilityKind, CapabilityRecord, CapabilityRegistry,
+    ChatMessage, ChatSession, ProbeEvent, ProviderConfig, ProviderStore,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +48,15 @@ pub struct ContextMessageItem {
     pub preview: String,
     pub chars: usize,
     pub tokens: usize,
+}
+
+struct SpecialistObservationInput<'a> {
+    prompt: &'a str,
+    image_bytes: Option<&'a [u8]>,
+    document_images: Option<&'a [Vec<u8>]>,
+    mime_type: Option<&'a str>,
+    video_bytes: Option<&'a [u8]>,
+    video_mime: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1149,14 +1157,18 @@ impl AIChatService {
     async fn run_specialist_observation(
         &self,
         route: &ResolvedModelRoute,
-        prompt: &str,
-        image_bytes: Option<&[u8]>,
-        document_images: Option<&[Vec<u8>]>,
-        mime_type: Option<&str>,
-        video_bytes: Option<&[u8]>,
-        video_mime: Option<&str>,
+        input: SpecialistObservationInput<'_>,
     ) -> Result<String, String> {
         use base64::Engine;
+
+        let SpecialistObservationInput {
+            prompt,
+            image_bytes,
+            document_images,
+            mime_type,
+            video_bytes,
+            video_mime,
+        } = input;
 
         let mut content = vec![json!({
             "type": "text",
@@ -1489,12 +1501,14 @@ impl AIChatService {
         let observation = match self
             .run_specialist_observation(
                 &specialist,
-                prompt,
-                image_bytes.as_deref(),
-                document_images.as_deref(),
-                mime_type,
-                video_bytes.as_deref(),
-                video_mime,
+                SpecialistObservationInput {
+                    prompt,
+                    image_bytes: image_bytes.as_deref(),
+                    document_images: document_images.as_deref(),
+                    mime_type,
+                    video_bytes: video_bytes.as_deref(),
+                    video_mime,
+                },
             )
             .await
         {
