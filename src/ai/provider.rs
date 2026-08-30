@@ -435,6 +435,17 @@ impl AIChatService {
             == EvidenceFreshness::Fresh
     }
 
+    pub(crate) fn effective_capability_state(
+        record: &CapabilityRecord,
+        capability: CapabilityKind,
+    ) -> CapabilityState {
+        if Self::capability_is_fresh(record, capability) {
+            record.state_for(capability)
+        } else {
+            CapabilityState::Unknown
+        }
+    }
+
     fn required_capability_is_fresh(
         role: ModelRole,
         record: &CapabilityRecord,
@@ -1824,6 +1835,19 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(metadata.modalities.as_deref(), Some("text,audio,video"));
+    }
+
+    #[test]
+    fn stale_supported_capability_is_effectively_unknown() {
+        let record = CapabilityRecord {
+            supports_image_input: Some(true),
+            checked_at: "2000-01-01T00:00:00+00:00".to_string(),
+            ..CapabilityRecord::default()
+        };
+        assert_eq!(
+            AIChatService::effective_capability_state(&record, CapabilityKind::ImageInput),
+            CapabilityState::Unknown
+        );
     }
 
     #[test]
