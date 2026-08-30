@@ -13,6 +13,18 @@ use super::models::{
 
 const MAX_TELEGRAM_DOWNLOAD_BYTES: usize = 20 * 1024 * 1024;
 
+#[derive(Debug, Clone, Default)]
+pub struct TelegramDeliveryContext {
+    pub message_thread_id: Option<i64>,
+    pub receiver_user_id: Option<i64>,
+    pub source_ephemeral_message_id: Option<i64>,
+    pub callback_query_id: Option<String>,
+}
+
+tokio::task_local! {
+    static TELEGRAM_DELIVERY_CONTEXT: TelegramDeliveryContext;
+}
+
 fn reqwest_error_kind(error: &reqwest::Error) -> &'static str {
     if error.is_timeout() {
         "timeout"
@@ -37,6 +49,52 @@ pub struct TelegramBotClient {
 }
 
 impl TelegramBotClient {
+    pub async fn with_delivery_context<F, T>(
+        context: TelegramDeliveryContext,
+        future: F,
+    ) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        TELEGRAM_DELIVERY_CONTEXT.scope(context, future).await
+    }
+
+    pub fn current_delivery_context() -> TelegramDeliveryContext {
+        TELEGRAM_DELIVERY_CONTEXT
+            .try_with(Clone::clone)
+            .unwrap_or_default()
+    }
+
+    fn apply_delivery_context(payload: &mut Value, include_ephemeral: bool) {
+        let context = Self::current_delivery_context();
+        if payload.get("message_thread_id").is_none() {
+            if let Some(thread_id) = context.message_thread_id {
+                payload["message_thread_id"] = json!(thread_id);
+            }
+        }
+        if include_ephemeral
+            && payload.get("ephemeral_message_parameters").is_none()
+            && context.receiver_user_id.is_some()
+        {
+            payload["ephemeral_message_parameters"] =
+                serde_json::to_value(EphemeralMessageParameters {
+                    receiver_user_id: context.receiver_user_id.unwrap_or_default(),
+                    callback_query_id: context.callback_query_id.clone(),
+                    replace_callback_query_message: None,
+                })
+                .unwrap_or(json!({}));
+        }
+        if include_ephemeral
+            && payload.get("reply_parameters").is_none()
+            && context.source_ephemeral_message_id.is_some()
+        {
+            payload["reply_parameters"] = serde_json::to_value(ReplyParameters::ephemeral(
+                context.source_ephemeral_message_id.unwrap_or_default(),
+            ))
+            .unwrap_or(json!({}));
+        }
+    }
+
     pub fn new(token: impl Into<String>) -> Self {
         let token_str = token.into().trim().to_string();
         let base_url = format!("https://api.telegram.org/bot{}", token_str);
@@ -258,6 +316,7 @@ impl TelegramBotClient {
                 serde_json::to_value(ReplyParameters::new(rep)).unwrap_or(json!({}));
                     }
                 }
+                Self::apply_delivery_context(&mut payload, true);
                 last_res = self.post_json("sendMessage", payload).await?;
             }
             return Ok(last_res);
@@ -287,6 +346,7 @@ impl TelegramBotClient {
                             serde_json::to_value(ReplyParameters::new(rep)).unwrap_or(json!({}));
         }
 
+        Self::apply_delivery_context(&mut payload, true);
         self.post_json("sendMessage", payload).await
     }
 
@@ -329,10 +389,31 @@ impl TelegramBotClient {
         if let Some(pm) = parse_mode {
             form = form.text("parse_mode", pm.to_string());
         }
-        if let Some(rep) = reply_to_message_id {
-            let reply_parameters =
-                serde_json::to_string(&ReplyParameters::new(rep)).map_err(|e| e.to_string())?;
-            form = form.text("reply_parameters", reply_parameters);
+        let delivery = Self::current_delivery_context();
+        if let Some(thread_id) = delivery.message_thread_id {
+            form = form.text("message_thread_id", thread_id.to_string());
+        }
+        if let Some(receiver_user_id) = delivery.receiver_user_id {
+            let ephemeral = serde_json::to_string(&EphemeralMessageParameters {
+                receiver_user_id,
+                callback_query_id: delivery.callback_query_id.clone(),
+                replace_callback_query_message: None,
+            })
+            .map_err(|e| e.to_string())?;
+            form = form.text("ephemeral_message_parameters", ephemeral);
+        }
+        let reply_parameters = if let Some(ephemeral_message_id) =
+            delivery.source_ephemeral_message_id
+        {
+            Some(ReplyParameters::ephemeral(ephemeral_message_id))
+        } else {
+            reply_to_message_id.map(ReplyParameters::new)
+        };
+        if let Some(reply_parameters) = reply_parameters {
+            form = form.text(
+                "reply_parameters",
+                serde_json::to_string(&reply_parameters).map_err(|e| e.to_string())?,
+            );
         }
         if let Some(rm) = reply_markup {
             form = form.text("reply_markup", rm.to_string());
@@ -367,13 +448,27 @@ impl TelegramBotClient {
         parse_mode: Option<&str>,
         reply_markup: Option<Value>,
     ) -> Result<Value, String> {
+        let delivery = Self::current_delivery_context();
+        let ephemeral_target = delivery
+            .receiver_user_id
+            .zip(delivery.source_ephemeral_message_id);
         let mut payload = json!({ "text": text });
-        if let Some(cid) = chat_id {
+        let method = if let (Some(cid), Some((receiver_user_id, ephemeral_message_id))) =
+            (chat_id, ephemeral_target)
+        {
             payload["chat_id"] = json!(cid);
-        }
-        if let Some(mid) = message_id {
-            payload["message_id"] = json!(mid);
-        }
+            payload["receiver_user_id"] = json!(receiver_user_id);
+            payload["ephemeral_message_id"] = json!(ephemeral_message_id);
+            "editEphemeralMessageText"
+        } else {
+            if let Some(cid) = chat_id {
+                payload["chat_id"] = json!(cid);
+            }
+            if let Some(mid) = message_id {
+                payload["message_id"] = json!(mid);
+            }
+            "editMessageText"
+        };
         if let Some(pm) = parse_mode {
             payload["parse_mode"] = json!(pm);
         }
@@ -381,7 +476,7 @@ impl TelegramBotClient {
             payload["reply_markup"] = rm;
         }
 
-        self.post_json("editMessageText", payload).await
+        self.post_json(method, payload).await
     }
 
     pub async fn edit_rich_message(
@@ -392,16 +487,36 @@ impl TelegramBotClient {
         reply_markup: Option<Value>,
     ) -> Result<Value, String> {
         let rich_json = serde_json::to_value(rich_message).unwrap_or(json!({}));
-        let mut payload = json!({
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "rich_message": rich_json,
-        });
+        let delivery = Self::current_delivery_context();
+        let ephemeral_target = delivery
+            .receiver_user_id
+            .zip(delivery.source_ephemeral_message_id);
+        let (method, mut payload) =
+            if let Some((receiver_user_id, ephemeral_message_id)) = ephemeral_target {
+                (
+                    "editEphemeralMessageText",
+                    json!({
+                        "chat_id": chat_id,
+                        "receiver_user_id": receiver_user_id,
+                        "ephemeral_message_id": ephemeral_message_id,
+                        "rich_message": rich_json,
+                    }),
+                )
+            } else {
+                (
+                    "editMessageText",
+                    json!({
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "rich_message": rich_json,
+                    }),
+                )
+            };
         if let Some(ref rm) = reply_markup {
             payload["reply_markup"] = rm.clone();
         }
 
-        let res = self.post_json_raw("editMessageText", payload).await?;
+        let res = self.post_json_raw(method, payload).await?;
         if res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
             return Ok(res);
         }
@@ -427,6 +542,22 @@ impl TelegramBotClient {
     }
 
     pub async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<Value, String> {
+        let delivery = Self::current_delivery_context();
+        if let Some((receiver_user_id, ephemeral_message_id)) = delivery
+            .receiver_user_id
+            .zip(delivery.source_ephemeral_message_id)
+        {
+            return self
+                .post_json(
+                    "deleteEphemeralMessage",
+                    json!({
+                        "chat_id": chat_id,
+                        "receiver_user_id": receiver_user_id,
+                        "ephemeral_message_id": ephemeral_message_id,
+                    }),
+                )
+                .await;
+        }
         let payload = json!({
             "chat_id": chat_id,
             "message_id": message_id,
@@ -451,10 +582,11 @@ impl TelegramBotClient {
     }
 
     pub async fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<Value, String> {
-        let payload = json!({
+        let mut payload = json!({
             "chat_id": chat_id,
             "action": action,
         });
+        Self::apply_delivery_context(&mut payload, false);
         self.post_json("sendChatAction", payload).await
     }
 
@@ -471,13 +603,14 @@ impl TelegramBotClient {
         keep_on_stop: bool,
     ) -> Result<Value, String> {
         let rich_json = serde_json::to_value(rich_message).unwrap_or(json!({}));
-        let payload = json!({
+        let mut payload = json!({
             "chat_id": chat_id,
             "draft_id": draft_id,
             "rich_message": rich_json,
             "can_stop": can_stop,
             "keep_on_stop": keep_on_stop,
         });
+        Self::apply_delivery_context(&mut payload, false);
 
         let res = self.post_json_raw("sendRichMessageDraft", payload).await?;
         let is_ok = res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -525,6 +658,7 @@ impl TelegramBotClient {
         if let Some(pm) = parse_mode {
             payload["parse_mode"] = json!(pm);
         }
+        Self::apply_delivery_context(&mut payload, false);
         self.post_json("sendMessageDraft", payload).await
     }
 
@@ -547,11 +681,12 @@ impl TelegramBotClient {
             payload["ephemeral_message_parameters"] =
                 serde_json::to_value(EphemeralMessageParameters {
                     receiver_user_id: recv,
-                    callback_query_id: None,
+                    callback_query_id: Self::current_delivery_context().callback_query_id,
                     replace_callback_query_message: None,
                 })
                 .unwrap_or(json!({}));
         }
+        Self::apply_delivery_context(&mut payload, true);
 
         let res = self.post_json_raw("sendRichMessage", payload).await?;
         if res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
