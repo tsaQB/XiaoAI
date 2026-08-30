@@ -834,7 +834,10 @@ impl TelegramBotClient {
                 // Never split raw Telegram HTML in the middle of a tag/entity.
                 // Oversized single blocks degrade to escaped plain text chunks;
                 // correctness is preferable to a parse-mode rejection.
-                let stripped = tag_clean_re.replace_all(&b_html, "").into_owned();
+                let stripped = tag_clean_re
+                    .as_ref()
+                    .map(|regex| regex.replace_all(&b_html, "").into_owned())
+                    .unwrap_or_else(|| b_html.clone());
                 let plain = html_escape::decode_html_entities(&stripped).into_owned();
                 let mut escaped_chunk = String::new();
                 let mut escaped_len = 0usize;
