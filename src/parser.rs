@@ -352,12 +352,14 @@ fn try_parse_table(
     }
 
     // 3. Plain Underline Table: Header \n ---------------- \n Data
-    let underline_match = Regex::new(r"^-{3,}$")
-        .ok()
+    let underline_re = Regex::new(r"^-{3,}$").ok();
+    let space_split_re = Regex::new(r"\s{2,}|\t+").ok();
+    let underline_match = underline_re
+        .as_ref()
         .is_some_and(|regex| i + 1 < n && regex.is_match(lines[i + 1].trim()));
     if underline_match {
-        let cols_hdr: Vec<&str> = Regex::new(r"\s{2,}|\t+")
-            .ok()
+        let cols_hdr: Vec<&str> = space_split_re
+            .as_ref()
             .map(|regex| regex.split(line).collect())
             .unwrap_or_else(|| line.split_whitespace().collect());
         let cols_hdr: Vec<&str> = cols_hdr
@@ -379,12 +381,19 @@ fn try_parse_table(
                 if curr.is_empty() {
                     break;
                 }
-                if underline_re.is_match(curr) {
+                if underline_re
+                    .as_ref()
+                    .is_some_and(|regex| regex.is_match(curr))
+                {
                     curr_i += 1;
                     continue;
                 }
                 let data_cols: Vec<&str> = space_split_re
-                    .split(curr)
+                    .as_ref()
+                    .map(|regex| regex.split(curr).collect())
+                    .unwrap_or_else(|| curr.split_whitespace().collect());
+                let data_cols: Vec<&str> = data_cols
+                    .into_iter()
                     .map(|c| c.trim())
                     .filter(|c| !c.is_empty())
                     .collect();
