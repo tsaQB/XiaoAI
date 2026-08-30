@@ -1450,9 +1450,7 @@ pub struct CapabilityRegistry {
     pub models: Vec<CapabilityRecord>,
 }
 
-fn decode_model_routing(
-    value: Option<&str>,
-) -> (crate::ai::routing::ModelRoutingConfig, bool) {
+fn decode_model_routing(value: Option<&str>) -> (crate::ai::routing::ModelRoutingConfig, bool) {
     match value.and_then(|value| {
         serde_json::from_str::<crate::ai::routing::ModelRoutingConfig>(value).ok()
     }) {
@@ -2075,7 +2073,8 @@ mod tests {
 
     #[test]
     fn valid_model_routing_does_not_request_rewrite() {
-        let json = serde_json::to_string(&crate::ai::routing::ModelRoutingConfig::default()).unwrap();
+        let json =
+            serde_json::to_string(&crate::ai::routing::ModelRoutingConfig::default()).unwrap();
         let (_, needs_persist) = decode_model_routing(Some(&json));
         assert!(!needs_persist);
     }
