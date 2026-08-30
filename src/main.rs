@@ -21,7 +21,7 @@ use tracing::{error, info, warn};
 
 use ai::service::ProviderConfig;
 use ai::AIChatService;
-use bot::client::TelegramBotClient;
+use bot::client::{TelegramBotClient, TelegramDeliveryContext};
 use bot::models::{
     BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputRichMessage, ReplyKeyboardMarkup,
     RichBlock, RichBlockTableCell, RichMessageButton, Update,
@@ -1180,6 +1180,38 @@ async fn handle_ai_chat(
 // ==========================================
 // Update Router
 // ==========================================
+
+fn delivery_context_for_update(update: &Update) -> TelegramDeliveryContext {
+    if let Some(message) = update.message.as_ref() {
+        return TelegramDeliveryContext {
+            message_thread_id: message.message_thread_id,
+            receiver_user_id: message
+                .ephemeral_message_id
+                .and_then(|_| message.from.as_ref().map(|user| user.id)),
+            source_ephemeral_message_id: message.ephemeral_message_id,
+            callback_query_id: None,
+        };
+    }
+    if let Some(callback) = update.callback_query.as_ref() {
+        let message = callback.message.as_deref();
+        let source_ephemeral_message_id =
+            message.and_then(|message| message.ephemeral_message_id);
+        return TelegramDeliveryContext {
+            message_thread_id: message.and_then(|message| message.message_thread_id),
+            receiver_user_id: source_ephemeral_message_id.map(|_| callback.from.id),
+            source_ephemeral_message_id,
+            callback_query_id: source_ephemeral_message_id
+                .map(|_| callback.id.clone()),
+        };
+    }
+    if let Some(stopped) = update.stopped_message_generation.as_ref() {
+        return TelegramDeliveryContext {
+            message_thread_id: stopped.message_thread_id,
+            ..TelegramDeliveryContext::default()
+        };
+    }
+    TelegramDeliveryContext::default()
+}
 
 async fn handle_update(
     bot: &TelegramBotClient,
@@ -2552,12 +2584,16 @@ async fn main() {
             if !ai::storage::mark_telegram_processing_async(update_id).await {
                 continue;
             }
-            handle_update(
-                &worker_bot,
-                &worker_ai,
-                &worker_last_image,
-                &worker_access,
-                update,
+            let delivery_context = delivery_context_for_update(&update);
+            TelegramBotClient::with_delivery_context(
+                delivery_context,
+                handle_update(
+                    &worker_bot,
+                    &worker_ai,
+                    &worker_last_image,
+                    &worker_access,
+                    update,
+                ),
             )
             .await;
             if !ai::storage::mark_telegram_processed_async(update_id).await {
@@ -2638,12 +2674,17 @@ async fn main() {
                                     // responsive, but it still crosses the same durable claim
                                     // boundary before any cancellation side effect.
                                     if ai::storage::mark_telegram_processing_async(update_id).await {
-                                        handle_update(
-                                            &bot,
-                                            &ai_service,
-                                            &user_last_image_prompt,
-                                            &access,
-                                            update,
+                                        let delivery_context =
+                                            delivery_context_for_update(&update);
+                                        TelegramBotClient::with_delivery_context(
+                                            delivery_context,
+                                            handle_update(
+                                                &bot,
+                                                &ai_service,
+                                                &user_last_image_prompt,
+                                                &access,
+                                                update,
+                                            ),
                                         )
                                         .await;
                                         let _ =
