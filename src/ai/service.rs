@@ -463,6 +463,7 @@ pub struct GeneratedImage {
     pub provider_name: String,
     pub model: String,
     pub used_external_fallback: bool,
+    pub primary_failure: Option<String>,
 }
 
 fn timeout_from_env(key: &str, default_secs: u64) -> Duration {
@@ -2502,13 +2503,14 @@ impl AIChatService {
                             provider_name: route.provider.name.clone(),
                             model: route.model.clone(),
                             used_external_fallback: false,
+                            primary_failure: None,
                         })
                     }
                 }
             }
         };
 
-        match provider_result {
+        let primary_failure = match provider_result {
             Ok(image) => return Ok(image),
             Err(error) if error.kind == ImageGenerationErrorKind::Cancelled => return Err(error),
             Err(error) if error.kind == ImageGenerationErrorKind::Timeout => return Err(error),
@@ -2518,8 +2520,9 @@ impl AIChatService {
                 if !external_image_fallback_enabled(&fallback) {
                     return Err(provider_error);
                 }
+                truncate_chars(&provider_error.message, 240)
             }
-        }
+        };
 
         let encoded_prompt = urlencoding::encode(clean_prompt);
         let fallback_model = "flux";
@@ -2595,6 +2598,7 @@ impl AIChatService {
             provider_name: "Pollinations fallback".to_string(),
             model: fallback_model.to_string(),
             used_external_fallback: true,
+            primary_failure: Some(primary_failure),
         })
     }
 }
@@ -2718,6 +2722,22 @@ mod tests {
         assert_eq!(bounded_timeout_secs(Some("0"), 120), 120);
         assert_eq!(bounded_timeout_secs(Some("75"), 120), 75);
         assert_eq!(bounded_timeout_secs(Some("99999"), 120), 600);
+    }
+
+    #[test]
+    fn fallback_result_retains_primary_failure_provenance() {
+        let image = GeneratedImage {
+            bytes: b"\x89PNG\r\n\x1a\nrest".to_vec(),
+            provider_name: "Pollinations fallback".to_string(),
+            model: "flux".to_string(),
+            used_external_fallback: true,
+            primary_failure: Some("Primary provider returned HTTP 503".to_string()),
+        };
+        assert!(image.used_external_fallback);
+        assert_eq!(
+            image.primary_failure.as_deref(),
+            Some("Primary provider returned HTTP 503")
+        );
     }
 
     #[test]
