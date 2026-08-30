@@ -1885,14 +1885,7 @@ async fn handle_update(
                 "⚠️ <b>Session tidak dihapus.</b> Penyimpanan gagal; session lama tetap utuh."
             };
             let _ = bot
-                .send_message(
-                    chat_id,
-                    notice,
-                    Some("HTML"),
-                    None,
-                    None,
-                    None,
-                )
+                .send_message(chat_id, notice, Some("HTML"), None, None, None)
                 .await;
             send_or_update_session_manager(bot, ai_service, chat_id, user_id, None, target_page)
                 .await;
@@ -2688,14 +2681,7 @@ async fn handle_update(
                 "⚠️ <b>Riwayat tetap dipertahankan.</b> Penyimpanan gagal sehingga reset dibatalkan."
             };
             let _ = bot
-                .send_message(
-                    chat_id,
-                    notice,
-                    Some("HTML"),
-                    None,
-                    None,
-                    None,
-                )
+                .send_message(chat_id, notice, Some("HTML"), None, None, None)
                 .await;
         } else if cq_data == "action_menu" {
             let _ = bot.answer_callback_query(&cq_id, None, false).await;

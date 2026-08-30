@@ -9,11 +9,10 @@ pub fn parse_inline(input_str: &str) -> Value {
     }
 
     // Clean leaked HTML tags
-    let cleaned = Regex::new(
-        r"(?i)</?(?:b|i|s|u|code|pre|blockquote|a|tg-spoiler|span|p|div)(?:\s+[^>]*)?>",
-    )
-    .map(|regex| regex.replace_all(input_str, "").into_owned())
-    .unwrap_or_else(|_| input_str.to_string());
+    let cleaned =
+        Regex::new(r"(?i)</?(?:b|i|s|u|code|pre|blockquote|a|tg-spoiler|span|p|div)(?:\s+[^>]*)?>")
+            .map(|regex| regex.replace_all(input_str, "").into_owned())
+            .unwrap_or_else(|_| input_str.to_string());
     let unescaped = html_escape::decode_html_entities(&cleaned).to_string();
 
     let mut out: Vec<Value> = Vec::new();
@@ -408,7 +407,6 @@ fn try_parse_table(
     (None, false, i)
 }
 
-
 /// Parse an accumulated streaming Markdown buffer without exposing syntax that
 /// is still provisional. Completed syntax is rendered through the canonical
 /// Rich Message parser; an incomplete tail is reduced to safe semantic text.
@@ -482,12 +480,19 @@ fn provisional_markdown_start(text: &str) -> Option<usize> {
         if *ch != '_' {
             continue;
         }
-        let prev = position.checked_sub(1).and_then(|p| chars.get(p)).map(|(_, c)| *c);
+        let prev = position
+            .checked_sub(1)
+            .and_then(|p| chars.get(p))
+            .map(|(_, c)| *c);
         let next = chars.get(position + 1).map(|(_, c)| *c);
         let delimiter_like = prev.is_none_or(|c| c.is_whitespace() || "([{>".contains(c))
             || next.is_none_or(|c| c.is_whitespace() || ".,!?;:)]}".contains(c));
         if delimiter_like {
-            underscore_open = if underscore_open.is_some() { None } else { Some(*index) };
+            underscore_open = if underscore_open.is_some() {
+                None
+            } else {
+                Some(*index)
+            };
         }
     }
     if let Some(index) = underscore_open {
@@ -502,17 +507,17 @@ fn provisional_markdown_start(text: &str) -> Option<usize> {
     let leading_ws = current_line.len() - current_line.trim_start().len();
     let marker_start = line_start + leading_ws;
     let marker = current_line.trim();
-    let incomplete_heading = !marker.is_empty()
-        && marker.chars().all(|ch| ch == '#')
-        && marker.chars().count() <= 6;
+    let incomplete_heading =
+        !marker.is_empty() && marker.chars().all(|ch| ch == '#') && marker.chars().count() <= 6;
     let incomplete_divider = matches!(marker, "-" | "--" | "*" | "**" | "_" | "__");
     let numeric_list_prefix = marker
         .strip_suffix('.')
         .or_else(|| marker.strip_suffix(')'));
     let incomplete_list = marker == "-"
         || marker == "*"
-        || numeric_list_prefix
-            .is_some_and(|prefix| !prefix.is_empty() && prefix.chars().all(|ch| ch.is_ascii_digit()));
+        || numeric_list_prefix.is_some_and(|prefix| {
+            !prefix.is_empty() && prefix.chars().all(|ch| ch.is_ascii_digit())
+        });
     if incomplete_heading || incomplete_divider || incomplete_list {
         openings.push(marker_start);
     }
@@ -564,7 +569,9 @@ fn sanitize_provisional_markdown(tail: &str) -> String {
 
     // Remove only obvious unmatched edge delimiters; do not blanket-delete
     // underscores from identifiers or ordinary punctuation.
-    let trimmed = safe.trim_start_matches(['_', '*', '[']).trim_end_matches(['_', '*', '[', ']']);
+    let trimmed = safe
+        .trim_start_matches(['_', '*', '['])
+        .trim_end_matches(['_', '*', '[', ']']);
     trimmed.to_string()
 }
 
@@ -711,14 +718,20 @@ pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
         }
 
         // 4. Horizontal Divider (---, ***, ___, ───)
-        if divider_re.as_ref().is_some_and(|regex| regex.is_match(stripped)) {
+        if divider_re
+            .as_ref()
+            .is_some_and(|regex| regex.is_match(stripped))
+        {
             blocks.push(RichBlock::Divider {});
             i += 1;
             continue;
         }
 
         // 5. Section Heading (# Heading, ## Subheading, etc.)
-        if let Some(caps) = heading_re.as_ref().and_then(|regex| regex.captures(stripped)) {
+        if let Some(caps) = heading_re
+            .as_ref()
+            .and_then(|regex| regex.captures(stripped))
+        {
             let level = caps.get(1).map(|m| m.as_str().len()).unwrap_or(1);
             let heading_text = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
             blocks.push(RichBlock::SectionHeading {
@@ -763,8 +776,12 @@ pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
         }
 
         // 8. List Items (- item, * item, 1. item)
-        let is_bullet = bullet_re.as_ref().is_some_and(|regex| regex.is_match(stripped));
-        let is_numbered = numbered_re.as_ref().is_some_and(|regex| regex.is_match(stripped));
+        let is_bullet = bullet_re
+            .as_ref()
+            .is_some_and(|regex| regex.is_match(stripped));
+        let is_numbered = numbered_re
+            .as_ref()
+            .is_some_and(|regex| regex.is_match(stripped));
 
         if is_bullet || is_numbered {
             let mut list_items = Vec::new();
@@ -917,7 +934,8 @@ mod tests {
         ];
 
         for source in cases {
-            let mut boundaries: Vec<usize> = source.char_indices().map(|(index, _)| index).collect();
+            let mut boundaries: Vec<usize> =
+                source.char_indices().map(|(index, _)| index).collect();
             boundaries.push(source.len());
             boundaries.sort_unstable();
             boundaries.dedup();
@@ -925,15 +943,33 @@ mod tests {
                 let prefix = &source[..end];
                 let blocks = parse_streaming_markdown_to_rich_blocks(prefix);
                 let wire = serde_json::to_string(&blocks).unwrap();
-                assert!(!wire.contains("**"), "bold marker leaked for {prefix:?}: {wire}");
-                assert!(!wire.contains("__"), "emphasis marker leaked for {prefix:?}: {wire}");
-                assert!(!wire.contains("```"), "fence marker leaked for {prefix:?}: {wire}");
-                assert!(!wire.contains("]("), "link serialization leaked for {prefix:?}: {wire}");
+                assert!(
+                    !wire.contains("**"),
+                    "bold marker leaked for {prefix:?}: {wire}"
+                );
+                assert!(
+                    !wire.contains("__"),
+                    "emphasis marker leaked for {prefix:?}: {wire}"
+                );
+                assert!(
+                    !wire.contains("```"),
+                    "fence marker leaked for {prefix:?}: {wire}"
+                );
+                assert!(
+                    !wire.contains("]("),
+                    "link serialization leaked for {prefix:?}: {wire}"
+                );
                 if prefix.trim().chars().all(|ch| ch == '#') {
-                    assert!(!wire.contains('#'), "heading marker leaked for {prefix:?}: {wire}");
+                    assert!(
+                        !wire.contains('#'),
+                        "heading marker leaked for {prefix:?}: {wire}"
+                    );
                 }
                 if matches!(prefix.trim(), "-" | "--") {
-                    assert!(!wire.contains(prefix.trim()), "divider marker leaked for {prefix:?}: {wire}");
+                    assert!(
+                        !wire.contains(prefix.trim()),
+                        "divider marker leaked for {prefix:?}: {wire}"
+                    );
                 }
             }
         }

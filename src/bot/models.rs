@@ -533,7 +533,11 @@ impl InputRichMessage {
             ));
         }
 
-        if self.media.as_ref().is_some_and(|media| media.len() > RICH_MESSAGE_MAX_MEDIA) {
+        if self
+            .media
+            .as_ref()
+            .is_some_and(|media| media.len() > RICH_MESSAGE_MAX_MEDIA)
+        {
             return Err(format!(
                 "Rich Message media count exceeds Telegram limit of {RICH_MESSAGE_MAX_MEDIA}"
             ));
@@ -590,7 +594,10 @@ impl InputRichMessage {
                     if !cells.is_empty() {
                         stats.max_depth = stats.max_depth.max(2);
                     }
-                    if cells.iter().any(|row| row.len() > RICH_MESSAGE_MAX_TABLE_COLUMNS) {
+                    if cells
+                        .iter()
+                        .any(|row| row.len() > RICH_MESSAGE_MAX_TABLE_COLUMNS)
+                    {
                         return Err(format!(
                             "Rich Message table exceeds Telegram limit of {RICH_MESSAGE_MAX_TABLE_COLUMNS} columns"
                         ));
@@ -621,7 +628,9 @@ impl InputRichMessage {
                         stats.text_chars += value_text_chars(caption);
                     }
                 }
-                RichBlock::Details { summary, blocks, .. } => {
+                RichBlock::Details {
+                    summary, blocks, ..
+                } => {
                     stats.text_chars += value_text_chars(summary);
                     for value in blocks {
                         stats.text_chars += value_text_chars(value);
@@ -941,10 +950,14 @@ mod tests {
 
     #[test]
     fn rich_message_block_limit_is_enforced_at_boundary() {
-        let paragraph = || RichBlock::Paragraph { text: Value::String("x".to_string()) };
-        let at_limit = InputRichMessage::new((0..RICH_MESSAGE_MAX_BLOCKS).map(|_| paragraph()).collect());
+        let paragraph = || RichBlock::Paragraph {
+            text: Value::String("x".to_string()),
+        };
+        let at_limit =
+            InputRichMessage::new((0..RICH_MESSAGE_MAX_BLOCKS).map(|_| paragraph()).collect());
         assert!(at_limit.validate().is_ok());
-        let over = InputRichMessage::new((0..=RICH_MESSAGE_MAX_BLOCKS).map(|_| paragraph()).collect());
+        let over =
+            InputRichMessage::new((0..=RICH_MESSAGE_MAX_BLOCKS).map(|_| paragraph()).collect());
         assert!(over.validate().is_err());
     }
 
@@ -953,32 +966,46 @@ mod tests {
         let mut message = InputRichMessage::new(vec![RichBlock::Paragraph {
             text: Value::String("ok".to_string()),
         }]);
-        message.media = Some((0..RICH_MESSAGE_MAX_MEDIA).map(|_| serde_json::json!({})).collect());
+        message.media = Some(
+            (0..RICH_MESSAGE_MAX_MEDIA)
+                .map(|_| serde_json::json!({}))
+                .collect(),
+        );
         assert!(message.validate().is_ok());
         message.media.as_mut().unwrap().push(serde_json::json!({}));
         assert!(message.validate().is_err());
 
-        let table = |columns: usize| InputRichMessage::new(vec![RichBlock::Table {
-            cells: vec![(0..columns)
-                .map(|_| RichBlockTableCell::text_only("x", false, None))
-                .collect()],
-            has_header: false,
-            is_bordered: true,
-            is_striped: false,
-            is_compact: true,
-            caption: None,
-        }]);
+        let table = |columns: usize| {
+            InputRichMessage::new(vec![RichBlock::Table {
+                cells: vec![(0..columns)
+                    .map(|_| RichBlockTableCell::text_only("x", false, None))
+                    .collect()],
+                has_header: false,
+                is_bordered: true,
+                is_striped: false,
+                is_compact: true,
+                caption: None,
+            }])
+        };
         assert!(table(RICH_MESSAGE_MAX_TABLE_COLUMNS).validate().is_ok());
-        assert!(table(RICH_MESSAGE_MAX_TABLE_COLUMNS + 1).validate().is_err());
+        assert!(table(RICH_MESSAGE_MAX_TABLE_COLUMNS + 1)
+            .validate()
+            .is_err());
 
-        let buttons = |count: usize| InputRichMessage::new(vec![RichBlock::Buttons {
-            buttons: (0..count)
-                .map(|index| RichMessageButton::callback(format!("b{index}"), format!("c{index}")))
-                .collect(),
-            align: None,
-        }]);
+        let buttons = |count: usize| {
+            InputRichMessage::new(vec![RichBlock::Buttons {
+                buttons: (0..count)
+                    .map(|index| {
+                        RichMessageButton::callback(format!("b{index}"), format!("c{index}"))
+                    })
+                    .collect(),
+                align: None,
+            }])
+        };
         assert!(buttons(RICH_MESSAGE_MAX_BUTTONS_PER_ROW).validate().is_ok());
-        assert!(buttons(RICH_MESSAGE_MAX_BUTTONS_PER_ROW + 1).validate().is_err());
+        assert!(buttons(RICH_MESSAGE_MAX_BUTTONS_PER_ROW + 1)
+            .validate()
+            .is_err());
     }
 
     fn nested_details(depth: usize) -> Value {

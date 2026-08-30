@@ -515,7 +515,9 @@ pub(crate) async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Opt
                 );
 
                 if let Err(error) = save_token_to_env(&user_token) {
-                    println!("\x1b[1;31m[ERROR] Token valid but could not be saved: {error}\x1b[0m");
+                    println!(
+                        "\x1b[1;31m[ERROR] Token valid but could not be saved: {error}\x1b[0m"
+                    );
                     return None;
                 }
                 break (user_token, username);
@@ -912,7 +914,9 @@ pub(crate) async fn run_cli_provider_menu(ai_service: &AIChatService, action: Op
                     let mut updated_store = load_provider_store();
                     updated_store.active_id = Some(target_prov.id.clone());
                     if let Err(error) = save_provider_store(&updated_store) {
-                        println!("\n\x1b[1;31m[ERROR] Active provider was not changed: {error}\x1b[0m\n");
+                        println!(
+                            "\n\x1b[1;31m[ERROR] Active provider was not changed: {error}\x1b[0m\n"
+                        );
                         continue;
                     }
                     println!(
@@ -979,7 +983,9 @@ pub(crate) async fn run_cli_provider_menu(ai_service: &AIChatService, action: Op
                                 .map(|provider| provider.id.clone());
                         }
                         if let Err(error) = save_provider_store(&updated_store) {
-                            println!("\n\x1b[1;31m[ERROR] Provider was not deleted: {error}\x1b[0m\n");
+                            println!(
+                                "\n\x1b[1;31m[ERROR] Provider was not deleted: {error}\x1b[0m\n"
+                            );
                             continue;
                         }
                         println!(

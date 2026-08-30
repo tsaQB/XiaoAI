@@ -693,7 +693,9 @@ impl TelegramBotClient {
                     return Ok(res);
                 }
                 Ok(_) => info!("Telegram rejected Rich Message; degrading to safe HTML."),
-                Err(error) => info!("Rich Message request failed ({error}); degrading to safe HTML."),
+                Err(error) => {
+                    info!("Rich Message request failed ({error}); degrading to safe HTML.")
+                }
             }
         } else if rich_message.blocks.is_empty() {
             return Err(validation.unwrap_err());
@@ -957,7 +959,9 @@ impl TelegramBotClient {
             }
             RichBlock::Divider {} => "────────────────────────".to_string(),
             RichBlock::MathematicalExpression { expression } => expression.clone(),
-            RichBlock::Table { cells, has_header, .. } => self.render_table_to_ascii(cells, *has_header),
+            RichBlock::Table {
+                cells, has_header, ..
+            } => self.render_table_to_ascii(cells, *has_header),
             RichBlock::Buttons { buttons, .. } => buttons
                 .iter()
                 .map(|button| self.rich_value_to_plain(&button.text))
@@ -978,7 +982,9 @@ impl TelegramBotClient {
                     format!("Document: {label}\n{caption}")
                 }
             }
-            RichBlock::Details { summary, blocks, .. } => {
+            RichBlock::Details {
+                summary, blocks, ..
+            } => {
                 let body = blocks
                     .iter()
                     .map(|value| self.rich_value_to_plain(value))
@@ -1352,7 +1358,9 @@ mod tests {
         let client = TelegramBotClient::new("test-token");
         let source = "### Heading\n\n**bold** and `code`\n\n---\n\n[link](https://example.com)";
         let blocks = crate::parser::parse_markdown_to_rich_blocks(source);
-        let plain = client.render_blocks_to_plain_chunks(&blocks, 4000).join("\n");
+        let plain = client
+            .render_blocks_to_plain_chunks(&blocks, 4000)
+            .join("\n");
         assert!(plain.contains("Heading"));
         assert!(plain.contains("bold"));
         assert!(plain.contains("code"));

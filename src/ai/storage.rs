@@ -68,10 +68,7 @@ fn secret_store_dir() -> std::path::PathBuf {
     xiao_data_dir().join("secrets")
 }
 
-fn secret_path_in_dir(
-    dir: &std::path::Path,
-    secret_ref: &str,
-) -> io::Result<std::path::PathBuf> {
+fn secret_path_in_dir(dir: &std::path::Path, secret_ref: &str) -> io::Result<std::path::PathBuf> {
     if !secret_ref.starts_with(SECRET_SCHEME_PREFIX) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -104,11 +101,7 @@ fn create_secret_ref(namespace: &str, id: &str) -> String {
     format!("secret://{namespace}/{safe_id}/{now:x}-{nonce:x}")
 }
 
-fn write_secret_in_dir(
-    dir: &std::path::Path,
-    secret_ref: &str,
-    value: &str,
-) -> io::Result<()> {
+fn write_secret_in_dir(dir: &std::path::Path, secret_ref: &str, value: &str) -> io::Result<()> {
     std::fs::create_dir_all(dir)?;
     harden_dir_mode(dir);
     let final_path = secret_path_in_dir(dir, secret_ref)?;
@@ -247,7 +240,11 @@ fn save_provider_state_db(store: &ProviderStore) -> std::io::Result<()> {
     let existing_refs: HashMap<String, String> = existing_store
         .providers
         .into_iter()
-        .filter_map(|provider| provider.api_key_ref.map(|secret_ref| (provider.id, secret_ref)))
+        .filter_map(|provider| {
+            provider
+                .api_key_ref
+                .map(|secret_ref| (provider.id, secret_ref))
+        })
         .collect();
 
     let mut sanitized = store.clone();
@@ -325,11 +322,22 @@ fn save_provider_state_db(store: &ProviderStore) -> std::io::Result<()> {
         let active = sanitized
             .active_id
             .as_deref()
-            .and_then(|id| sanitized.providers.iter().find(|provider| provider.id == id))
+            .and_then(|id| {
+                sanitized
+                    .providers
+                    .iter()
+                    .find(|provider| provider.id == id)
+            })
             .or_else(|| sanitized.providers.first());
         for (key, value) in [
-            ("AI_ENDPOINT", active.map(|p| p.endpoint.as_str()).unwrap_or("")),
-            ("AI_MODEL", active.map(|p| p.active_model.as_str()).unwrap_or("")),
+            (
+                "AI_ENDPOINT",
+                active.map(|p| p.endpoint.as_str()).unwrap_or(""),
+            ),
+            (
+                "AI_MODEL",
+                active.map(|p| p.active_model.as_str()).unwrap_or(""),
+            ),
         ] {
             tx.execute(
                 "INSERT INTO settings(key,value) VALUES(?1,?2)
@@ -1093,7 +1101,10 @@ pub(crate) async fn pending_telegram_updates_async(limit: usize) -> Vec<Telegram
 }
 
 pub(crate) async fn recover_telegram_processing_async() -> usize {
-    run_db("recover_telegram_processing", recover_telegram_processing_db)
+    run_db(
+        "recover_telegram_processing",
+        recover_telegram_processing_db,
+    )
     .await
     .unwrap_or_default()
 }
@@ -1151,7 +1162,10 @@ pub(super) async fn append_session_messages_db_async(
     .await
 }
 
-pub(super) async fn switch_active_session_db_async(user_id: i64, session_id: usize) -> Option<bool> {
+pub(super) async fn switch_active_session_db_async(
+    user_id: i64,
+    session_id: usize,
+) -> Option<bool> {
     run_db("switch_active_session", move || {
         switch_active_session_db(user_id, session_id)
     })
@@ -1343,9 +1357,7 @@ fn migrate_legacy_secret_setting_on_conn(
             if let Err(cleanup_error) =
                 conn.execute("DELETE FROM settings WHERE key=?1", params![&ref_key])
             {
-                warn!(
-                    "Failed to roll back unverified secret reference {ref_key}: {cleanup_error}"
-                );
+                warn!("Failed to roll back unverified secret reference {ref_key}: {cleanup_error}");
             }
             remove_secret_in_dir(secret_dir, &secret_ref);
             return Err(io::Error::other("secret migration verification mismatch"));
@@ -1354,9 +1366,7 @@ fn migrate_legacy_secret_setting_on_conn(
             if let Err(cleanup_error) =
                 conn.execute("DELETE FROM settings WHERE key=?1", params![&ref_key])
             {
-                warn!(
-                    "Failed to roll back unreadable secret reference {ref_key}: {cleanup_error}"
-                );
+                warn!("Failed to roll back unreadable secret reference {ref_key}: {cleanup_error}");
             }
             remove_secret_in_dir(secret_dir, &secret_ref);
             return Err(error);
@@ -1465,7 +1475,8 @@ fn save_secret_app_setting(key: &str, namespace: &str, value: &str) -> io::Resul
         }
         tx.execute("DELETE FROM settings WHERE key=?1", params![&raw_key])
             .map_err(|error| io::Error::other(error.to_string()))?;
-        tx.commit().map_err(|error| io::Error::other(error.to_string()))
+        tx.commit()
+            .map_err(|error| io::Error::other(error.to_string()))
     })();
     if let Err(error) = commit_result {
         if new_ref.as_deref() != old_ref.as_deref() {
@@ -1662,15 +1673,27 @@ mod tests {
              BEGIN SELECT RAISE(ABORT, 'delete failpoint'); END;",
         )
         .unwrap();
-        assert!(remove_session_transaction_on_conn(&mut conn, 7, 3, "Replacement", "later").is_err());
+        assert!(
+            remove_session_transaction_on_conn(&mut conn, 7, 3, "Replacement", "later").is_err()
+        );
         let session_count: usize = conn
-            .query_row("SELECT COUNT(*) FROM sessions WHERE user_id=7", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM sessions WHERE user_id=7", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         let active: usize = conn
-            .query_row("SELECT session_id FROM active_sessions WHERE user_id=7", [], |row| row.get(0))
+            .query_row(
+                "SELECT session_id FROM active_sessions WHERE user_id=7",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         let next_id: usize = conn
-            .query_row("SELECT next_session_id FROM session_counters WHERE user_id=7", [], |row| row.get(0))
+            .query_row(
+                "SELECT next_session_id FROM session_counters WHERE user_id=7",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(session_count, 1);
         assert_eq!(active, 3);
@@ -1758,14 +1781,9 @@ mod tests {
             std::process::id(),
             rand::random::<u64>()
         ));
-        let migrated = migrate_legacy_secret_setting_on_conn(
-            &mut conn,
-            &dir,
-            "BOT_TOKEN",
-            "telegram",
-            token,
-        )
-        .unwrap();
+        let migrated =
+            migrate_legacy_secret_setting_on_conn(&mut conn, &dir, "BOT_TOKEN", "telegram", token)
+                .unwrap();
         assert_eq!(migrated, token);
 
         let raw_count: usize = conn

@@ -318,7 +318,9 @@ impl AIChatService {
                 if let Ok(value) = std::env::var(key) {
                     if !value.trim().is_empty() {
                         if let Err(error) = save_app_setting(key, &value) {
-                            eprintln!("[WARN] Failed to migrate environment setting {key}: {error}");
+                            eprintln!(
+                                "[WARN] Failed to migrate environment setting {key}: {error}"
+                            );
                         }
                     }
                 }
@@ -764,7 +766,9 @@ impl AIChatService {
                 {
                     *session = candidate;
                 } else {
-                    warn!("Durable history clear committed while RAM cache changed; evicting cache");
+                    warn!(
+                        "Durable history clear committed while RAM cache changed; evicting cache"
+                    );
                     sessions_map.remove(&user_id);
                 }
                 drop(sessions_map);
@@ -1602,8 +1606,9 @@ impl AIChatService {
             }
         } else if stream_bounded {
             if answer_text.trim().is_empty() {
-                answer_text = "⚠️ Respons provider melewati batas ukuran aman XiaoAI dan dihentikan."
-                    .to_string();
+                answer_text =
+                    "⚠️ Respons provider melewati batas ukuran aman XiaoAI dan dihentikan."
+                        .to_string();
             } else {
                 answer_text.push_str(
                     "\n\n_⚠️ Respons dihentikan karena melewati batas ukuran aman XiaoAI._",
@@ -1632,7 +1637,7 @@ impl AIChatService {
                 } else {
                     "Provider stream interrupted".to_string()
                 })
-                    .await;
+                .await;
                 tl.sync_draft(true).await;
             } else {
                 if !has_started_answer {
@@ -1924,7 +1929,10 @@ impl AIChatService {
                 let status = resp.status();
                 if status.is_success() {
                     match read_bounded_response_bytes(resp, MAX_GENERATED_IMAGE_BYTES).await {
-                        Ok(bytes) if bytes.len() > 1000 && validate_generated_image_bytes(&bytes).is_ok() => {
+                        Ok(bytes)
+                            if bytes.len() > 1000
+                                && validate_generated_image_bytes(&bytes).is_ok() =>
+                        {
                             (true, Some(bytes), "FLUX.1 (Ultra HD)".to_string())
                         }
                         _ => (
@@ -2005,7 +2013,11 @@ mod tests {
         let origin = session(7);
         let active_after_switch = session(9);
         assert!(!generation_revision_matches(None, 7, 0));
-        assert!(!generation_revision_matches(Some(&active_after_switch), 7, 0));
+        assert!(!generation_revision_matches(
+            Some(&active_after_switch),
+            7,
+            0
+        ));
         assert!(generation_revision_matches(Some(&origin), 7, 0));
     }
 
@@ -2013,13 +2025,19 @@ mod tests {
     fn multimodal_unknown_fails_closed() {
         let mut supported = CapabilityRecord::default();
         supported.supports_image = Some(true);
-        assert!(require_verified_capability(Some(&supported), "image", |r| r.supports_image).is_ok());
+        assert!(
+            require_verified_capability(Some(&supported), "image", |r| r.supports_image).is_ok()
+        );
 
         supported.supports_image = Some(false);
-        assert!(require_verified_capability(Some(&supported), "image", |r| r.supports_image).is_err());
+        assert!(
+            require_verified_capability(Some(&supported), "image", |r| r.supports_image).is_err()
+        );
 
         supported.supports_image = None;
-        assert!(require_verified_capability(Some(&supported), "image", |r| r.supports_image).is_err());
+        assert!(
+            require_verified_capability(Some(&supported), "image", |r| r.supports_image).is_err()
+        );
         assert!(require_verified_capability(None, "image", |r| r.supports_image).is_err());
     }
 

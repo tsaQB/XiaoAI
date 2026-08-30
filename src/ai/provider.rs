@@ -24,7 +24,8 @@ async fn read_bounded_provider_json(response: reqwest::Response) -> Result<Value
         }
         bytes.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&bytes).map_err(|error| format!("invalid provider metadata JSON: {error}"))
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid provider metadata JSON: {error}"))
 }
 
 async fn read_bounded_provider_text(response: reqwest::Response, max_bytes: usize) -> String {
