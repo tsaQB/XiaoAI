@@ -482,7 +482,8 @@ impl TelegramBotClient {
         rich_message: &InputRichMessage,
         reply_markup: Option<Value>,
     ) -> Result<Value, String> {
-        let rich_json = serde_json::to_value(rich_message).unwrap_or(json!({}));
+        rich_message.validate()?;
+        let rich_json = serde_json::to_value(rich_message).map_err(|e| e.to_string())?;
         let delivery = Self::current_delivery_context();
         let ephemeral_target = delivery
             .receiver_user_id
@@ -598,7 +599,8 @@ impl TelegramBotClient {
         can_stop: bool,
         keep_on_stop: bool,
     ) -> Result<Value, String> {
-        let rich_json = serde_json::to_value(rich_message).unwrap_or(json!({}));
+        rich_message.validate()?;
+        let rich_json = serde_json::to_value(rich_message).map_err(|e| e.to_string())?;
         let mut payload = json!({
             "chat_id": chat_id,
             "draft_id": draft_id,
@@ -665,7 +667,8 @@ impl TelegramBotClient {
         reply_markup: Option<Value>,
         receiver_user_id: Option<i64>,
     ) -> Result<Value, String> {
-        let rich_json = serde_json::to_value(rich_message).unwrap_or(json!({}));
+        rich_message.validate()?;
+        let rich_json = serde_json::to_value(rich_message).map_err(|e| e.to_string())?;
         let mut payload = json!({
             "chat_id": chat_id,
             "rich_message": rich_json,
