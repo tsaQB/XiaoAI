@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::warn;
 
+#[derive(Debug, Clone)]
+pub(crate) struct TelegramInboxRecord {
+    pub update_id: i64,
+    pub payload_json: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub id: String,
@@ -199,6 +205,17 @@ fn open_session_db() -> rusqlite::Result<Connection> {
         );
         CREATE TABLE IF NOT EXISTS session_counters (
             user_id INTEGER PRIMARY KEY, next_session_id INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS telegram_state (
+            key TEXT PRIMARY KEY, value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS telegram_inbox (
+            update_id INTEGER PRIMARY KEY,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            received_at TEXT NOT NULL,
+            last_error TEXT
         );",
     )?;
     // WAL/SHM files may be created lazily. The private 0700 parent directory
@@ -433,6 +450,145 @@ where
             None
         }
     }
+}
+
+fn load_telegram_offset_db() -> rusqlite::Result<Option<i64>> {
+    let conn = open_session_db()?;
+    let value = conn
+        .query_row(
+            "SELECT value FROM telegram_state WHERE key='offset'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    Ok(value.and_then(|value| value.parse::<i64>().ok()))
+}
+
+fn enqueue_telegram_update_db(update_id: i64, payload_json: &str) -> rusqlite::Result<bool> {
+    let mut conn = open_session_db()?;
+    let tx = conn.transaction()?;
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO telegram_inbox(update_id,payload_json,status,attempts,received_at)
+         VALUES(?1,?2,'pending',0,?3)",
+        params![update_id, payload_json, Local::now().to_rfc3339()],
+    )? == 1;
+    tx.execute(
+        "INSERT INTO telegram_state(key,value) VALUES('offset',?1)
+         ON CONFLICT(key) DO UPDATE SET value=
+           CASE
+             WHEN CAST(excluded.value AS INTEGER) > CAST(value AS INTEGER)
+             THEN excluded.value ELSE value
+           END",
+        params![update_id.saturating_add(1).to_string()],
+    )?;
+    tx.commit()?;
+    Ok(inserted)
+}
+
+fn pending_telegram_updates_db(limit: usize) -> rusqlite::Result<Vec<TelegramInboxRecord>> {
+    let conn = open_session_db()?;
+    let mut stmt = conn.prepare(
+        "SELECT update_id,payload_json
+         FROM telegram_inbox
+         WHERE status='pending'
+         ORDER BY update_id
+         LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit as i64], |row| {
+            Ok(TelegramInboxRecord {
+                update_id: row.get(0)?,
+                payload_json: row.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn quarantine_telegram_processing_db() -> rusqlite::Result<usize> {
+    let conn = open_session_db()?;
+    conn.execute(
+        "UPDATE telegram_inbox
+         SET status='interrupted',last_error='daemon stopped while update was processing'
+         WHERE status='processing'",
+        [],
+    )
+}
+
+fn mark_telegram_processing_db(update_id: i64) -> rusqlite::Result<bool> {
+    let conn = open_session_db()?;
+    // Once an update is claimed, XiaoAI never automatically replays it after
+    // a crash because the handler may already have committed side effects.
+    // Scrub the raw payload at this boundary so API keys or other sensitive
+    // command text do not remain in the durable inbox longer than necessary.
+    let scrubbed = serde_json::json!({
+        "update_id": update_id,
+        "payload": "redacted_after_claim"
+    })
+    .to_string();
+    Ok(conn.execute(
+        "UPDATE telegram_inbox
+         SET status='processing',attempts=attempts+1,payload_json=?2,last_error=NULL
+         WHERE update_id=?1 AND status='pending'",
+        params![update_id, scrubbed],
+    )? == 1)
+}
+
+fn mark_telegram_processed_db(update_id: i64) -> rusqlite::Result<()> {
+    let conn = open_session_db()?;
+    conn.execute(
+        "DELETE FROM telegram_inbox WHERE update_id=?1 AND status='processing'",
+        params![update_id],
+    )?;
+    Ok(())
+}
+
+pub(crate) async fn load_telegram_offset_async() -> Option<i64> {
+    run_db("load_telegram_offset", load_telegram_offset_db)
+        .await
+        .flatten()
+}
+
+pub(crate) async fn enqueue_telegram_update_async(
+    update_id: i64,
+    payload_json: String,
+) -> Option<bool> {
+    run_db("enqueue_telegram_update", move || {
+        enqueue_telegram_update_db(update_id, &payload_json)
+    })
+    .await
+}
+
+pub(crate) async fn pending_telegram_updates_async(
+    limit: usize,
+) -> Vec<TelegramInboxRecord> {
+    run_db("pending_telegram_updates", move || {
+        pending_telegram_updates_db(limit)
+    })
+    .await
+    .unwrap_or_default()
+}
+
+pub(crate) async fn quarantine_telegram_processing_async() -> usize {
+    run_db("quarantine_telegram_processing", quarantine_telegram_processing_db)
+        .await
+        .unwrap_or_default()
+}
+
+pub(crate) async fn mark_telegram_processing_async(update_id: i64) -> bool {
+    run_db("mark_telegram_processing", move || {
+        mark_telegram_processing_db(update_id)
+    })
+    .await
+    .unwrap_or(false)
+}
+
+pub(crate) async fn mark_telegram_processed_async(update_id: i64) -> bool {
+    run_db("mark_telegram_processed", move || {
+        mark_telegram_processed_db(update_id)
+    })
+    .await
+    .is_some()
 }
 
 pub(super) async fn load_sessions_db_async(user_id: i64) -> Vec<ChatSession> {
