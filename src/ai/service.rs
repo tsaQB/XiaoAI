@@ -2023,8 +2023,10 @@ mod tests {
 
     #[test]
     fn multimodal_unknown_fails_closed() {
-        let mut supported = CapabilityRecord::default();
-        supported.supports_image = Some(true);
+        let mut supported = CapabilityRecord {
+            supports_image: Some(true),
+            ..CapabilityRecord::default()
+        };
         assert!(
             require_verified_capability(Some(&supported), "image", |r| r.supports_image).is_ok()
         );
