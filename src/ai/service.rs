@@ -79,6 +79,109 @@ fn estimate_stored_content_tokens(content: &Value) -> usize {
     }
 }
 
+const MAX_GENERATED_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
+fn is_unsafe_remote_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+        }
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+        }
+    }
+}
+
+fn validate_generated_image_bytes(bytes: &[u8]) -> Result<(), String> {
+    if bytes.is_empty() || bytes.len() > MAX_GENERATED_IMAGE_BYTES {
+        return Err("generated image exceeded XiaoAI byte limits".to_string());
+    }
+    let supported = bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || bytes.starts_with(&[0xff, 0xd8, 0xff])
+        || bytes.starts_with(b"GIF87a")
+        || bytes.starts_with(b"GIF89a")
+        || (bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP");
+    if !supported {
+        return Err("generated image response has an unsupported file signature".to_string());
+    }
+    Ok(())
+}
+
+async fn download_generated_image(url: &str) -> Result<Vec<u8>, String> {
+    let parsed = url::Url::parse(url).map_err(|_| "provider returned an invalid image URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("provider image URL must use http or https".to_string());
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "provider image URL has no host".to_string())?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "provider image URL has no usable port".to_string())?;
+
+    let resolved = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|_| "provider image host could not be resolved".to_string())?
+        .collect::<Vec<_>>();
+    if resolved.is_empty() || resolved.iter().any(|addr| is_unsafe_remote_ip(addr.ip())) {
+        return Err("provider image URL resolved to a blocked network address".to_string());
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(host, resolved[0])
+        .build()
+        .map_err(|_| "failed to build bounded image downloader".to_string())?;
+    let response = client
+        .get(parsed)
+        .send()
+        .await
+        .map_err(|_| "provider image download failed".to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "provider image download returned status {}",
+            response.status().as_u16()
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_GENERATED_IMAGE_BYTES as u64)
+    {
+        return Err("provider image exceeded XiaoAI byte limits".to_string());
+    }
+    if !response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().starts_with("image/"))
+    {
+        return Err("provider image URL did not return an image content type".to_string());
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| "provider image stream failed".to_string())?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_GENERATED_IMAGE_BYTES {
+            return Err("provider image exceeded XiaoAI byte limits".to_string());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    validate_generated_image_bytes(&bytes)?;
+    Ok(bytes)
+}
+
 fn provider_url(endpoint: &str, path: &str) -> String {
     format!(
         "{}/{}",
@@ -1498,24 +1601,27 @@ impl AIChatService {
                                     if let Ok(bytes) =
                                         base64::engine::general_purpose::STANDARD.decode(b64_str)
                                     {
-                                        return (
-                                            true,
-                                            Some(bytes),
-                                            format!("OpenAI Compatible ({})", p.name),
-                                        );
+                                        if validate_generated_image_bytes(&bytes).is_ok() {
+                                            return (
+                                                true,
+                                                Some(bytes),
+                                                format!("OpenAI Compatible ({})", p.name),
+                                            );
+                                        }
                                     }
                                 } else if let Some(img_url) =
                                     data.get("url").and_then(|s| s.as_str())
                                 {
-                                    if let Ok(img_resp) = self.client.get(img_url).send().await {
-                                        if img_resp.status().is_success() {
-                                            if let Ok(bytes) = img_resp.bytes().await {
-                                                return (
-                                                    true,
-                                                    Some(bytes.to_vec()),
-                                                    format!("OpenAI Compatible ({})", p.name),
-                                                );
-                                            }
+                                    match download_generated_image(img_url).await {
+                                        Ok(bytes) => {
+                                            return (
+                                                true,
+                                                Some(bytes),
+                                                format!("OpenAI Compatible ({})", p.name),
+                                            );
+                                        }
+                                        Err(error) => {
+                                            warn!("Rejected provider image URL: {error}");
                                         }
                                     }
                                 }
