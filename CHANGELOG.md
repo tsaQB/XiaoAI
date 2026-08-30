@@ -11,7 +11,7 @@
 ### Capability discovery
 - Split image input from image generation and audio input from transcription; migrate legacy fields without granting new capabilities.
 - Stop treating `/models` catalog presence as proof of text-chat support.
-- Add per-capability evidence/freshness, observable typed probe outcomes, two-step semantic Vision probing, bounded audio/STT probes, and explicit credit-consuming image-generation tests.
+- Add per-capability evidence/freshness, observable typed probe outcomes, two-step semantic Vision probing, a bounded semantic Video MP4 probe, bounded audio/STT probes, and explicit credit-consuming image-generation tests whose returned image must pass the runtime validator.
 - Keep Unknown/stale capability fail-closed and persist probe candidates before runtime publication.
 
 ### Multimodal execution
