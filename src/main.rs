@@ -587,15 +587,12 @@ async fn send_or_update_session_manager(
     }
 }
 
-async fn build_start_menu_ui(ai_service: &AIChatService, user_id: i64) -> InputRichMessage {
+async fn build_start_ui(ai_service: &AIChatService, user_id: i64) -> InputRichMessage {
     let main = ai_service
         .resolve_model_route_unchecked(ai::service::ModelRole::Main)
         .await
         .ok();
     let stats = ai_service.get_context_stats(user_id).await;
-    let routing = ai_service.model_routing_config().await;
-    let providers = ai_service.get_user_providers(user_id).await;
-
     let main_model = main
         .as_ref()
         .map(|route| route.model.clone())
@@ -605,42 +602,18 @@ async fn build_start_menu_ui(ai_service: &AIChatService, user_id: i64) -> InputR
         .map(|route| route.provider.name.clone())
         .unwrap_or_else(|| "Not configured".to_string());
     let session_name = if stats.session_name.trim().is_empty() {
-        format!("#{}", stats.session_id)
+        format!("Session #{}", stats.session_id)
     } else {
-        format!(
-            "#{} · {}",
-            stats.session_id,
-            truncate_session_name(&stats.session_name, 28)
-        )
+        truncate_session_name(&stats.session_name, 32)
     };
-    let context = format!(
-        "~{} / ~{} tokens ({:.1}%)",
-        stats.total_tokens, stats.limit_tokens, stats.usage_pct
-    );
-
-    let addon_summary = ai::service::ModelRole::addon_roles()
-        .into_iter()
-        .map(|role| {
-            let route = routing
-                .route(role)
-                .cloned()
-                .unwrap_or(ai::service::ModelRoute::MainModel);
-            let value = match route {
-                ai::service::ModelRoute::MainModel => "Main Model".to_string(),
-                ai::service::ModelRoute::Disabled => "Disabled".to_string(),
-                ai::service::ModelRoute::Specific { provider_id, model } => {
-                    let name = providers
-                        .iter()
-                        .find(|provider| provider.id == provider_id)
-                        .map(|provider| provider.name.as_str())
-                        .unwrap_or(provider_id.as_str());
-                    format!("{name} / {model}")
-                }
-            };
-            format!("{}: {}", role.display_name(), value)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let context = if main.is_some() {
+        format!(
+            "Ready · ~{} / ~{} tokens",
+            stats.total_tokens, stats.limit_tokens
+        )
+    } else {
+        "Setup required".to_string()
+    };
 
     InputRichMessage::new(vec![
         RichBlock::SectionHeading {
@@ -653,7 +626,7 @@ async fn build_start_menu_ui(ai_service: &AIChatService, user_id: i64) -> InputR
         RichBlock::Table {
             cells: vec![
                 vec![
-                    RichBlockTableCell::text_only("Item", true, Some("left")),
+                    RichBlockTableCell::text_only("Status", true, Some("left")),
                     RichBlockTableCell::text_only("Current", true, Some("left")),
                 ],
                 vec![
@@ -679,16 +652,82 @@ async fn build_start_menu_ui(ai_service: &AIChatService, user_id: i64) -> InputR
             is_compact: true,
             caption: None,
         },
-        RichBlock::Details {
-            summary: Value::String("Model Routing".to_string()),
-            blocks: vec![json!({"type":"paragraph","text": addon_summary})],
-            is_open: Some(false),
+        RichBlock::BlockQuotation {
+            blocks: vec![json!({
+                "type":"paragraph",
+                "text":"Kirim teks, gambar, dokumen, video, atau voice note untuk mulai berbicara dengan Xiao."
+            })],
         },
         RichBlock::Buttons {
             buttons: vec![
                 RichMessageButton::callback_styled("New Chat", "session_new", "primary"),
                 RichMessageButton::callback("Model", "model_dashboard"),
+            ],
+            align: Some("center".to_string()),
+        },
+        RichBlock::Buttons {
+            buttons: vec![
                 RichMessageButton::callback("Session", "open_session"),
+                RichMessageButton::callback("Context", "open_context"),
+            ],
+            align: Some("center".to_string()),
+        },
+        RichBlock::Paragraph {
+            text: Value::String(
+                "Addon Models dan provider dikelola melalui Xiao CLI.".to_string(),
+            ),
+        },
+    ])
+}
+
+async fn build_menu_ui(ai_service: &AIChatService, user_id: i64) -> InputRichMessage {
+    let main = ai_service
+        .resolve_model_route_unchecked(ai::service::ModelRole::Main)
+        .await
+        .ok();
+    let stats = ai_service.get_context_stats(user_id).await;
+    let main_model = main
+        .as_ref()
+        .map(|route| format!("{} / {}", route.provider.name, route.model))
+        .unwrap_or_else(|| "Not configured".to_string());
+    let session_name = if stats.session_name.trim().is_empty() {
+        format!("Session #{}", stats.session_id)
+    } else {
+        truncate_session_name(&stats.session_name, 36)
+    };
+
+    InputRichMessage::new(vec![
+        RichBlock::SectionHeading {
+            text: Value::String("MENU".to_string()),
+            level: 1,
+        },
+        RichBlock::Table {
+            cells: vec![
+                vec![
+                    RichBlockTableCell::text_only("Main Model", true, Some("left")),
+                    RichBlockTableCell::text_only("Session", true, Some("left")),
+                ],
+                vec![
+                    RichBlockTableCell::text_only(&main_model, false, Some("left")),
+                    RichBlockTableCell::text_only(&session_name, false, Some("left")),
+                ],
+            ],
+            has_header: true,
+            is_bordered: true,
+            is_striped: true,
+            is_compact: true,
+            caption: None,
+        },
+        RichBlock::Buttons {
+            buttons: vec![
+                RichMessageButton::callback_styled("New Chat", "session_new", "primary"),
+                RichMessageButton::callback("Session", "open_session"),
+            ],
+            align: Some("center".to_string()),
+        },
+        RichBlock::Buttons {
+            buttons: vec![
+                RichMessageButton::callback("Model", "model_dashboard"),
                 RichMessageButton::callback("Context", "open_context"),
             ],
             align: Some("center".to_string()),
@@ -699,12 +738,6 @@ async fn build_start_menu_ui(ai_service: &AIChatService, user_id: i64) -> InputR
                 RichMessageButton::callback("Help", "action_help"),
             ],
             align: Some("center".to_string()),
-        },
-        RichBlock::Paragraph {
-            text: Value::String(
-                "Provider and addon routing are administered from CLI; Telegram edits Main Model only."
-                    .to_string(),
-            ),
         },
     ])
 }
@@ -1328,45 +1361,97 @@ async fn build_context_monitor_ui(ai_service: &AIChatService, user_id: i64) -> I
         stats.progress_bar, stats.usage_pct, used, limit
     );
 
-    let mut specialist_lines = Vec::new();
-    let mut cross_provider = Vec::new();
+    let routing = ai_service.model_routing_config().await;
+    let providers = ai_service.get_user_providers(user_id).await;
+    let mut specialist_rows = vec![vec![
+        RichBlockTableCell::text_only("Role", true, Some("left")),
+        RichBlockTableCell::text_only("Route", true, Some("left")),
+        RichBlockTableCell::text_only("Policy", true, Some("left")),
+    ]];
+    let mut provider_context = Vec::new();
+
     for role in ai::service::ModelRole::addon_roles() {
-        match ai_service.resolve_model_route_unchecked(role).await {
-            Ok(route) => {
-                let relationship = specialist_context_policy(role, route.route_origin);
-                specialist_lines.push(format!(
-                    "{}: {} / {} — {}",
-                    role.display_name(),
-                    route.provider.name,
-                    route.model,
-                    relationship
-                ));
-                if route.route_origin == ai::service::RouteOrigin::Specific {
-                    cross_provider.push(format!(
-                        "{} -> {} / {}: {}",
-                        role.display_name(),
-                        route.provider.name,
-                        route.model,
-                        relationship
-                    ));
-                }
+        let route = routing
+            .route(role)
+            .cloned()
+            .unwrap_or(ai::service::ModelRoute::MainModel);
+        let (route_text, policy) = match route {
+            ai::service::ModelRoute::MainModel => (
+                "Main Model".to_string(),
+                specialist_context_policy(role, ai::service::RouteOrigin::MainModel).to_string(),
+            ),
+            ai::service::ModelRoute::Disabled => {
+                ("Disabled".to_string(), "Disabled".to_string())
             }
-            Err(error) => specialist_lines.push(format!("{}: {}", role.display_name(), error)),
-        }
+            ai::service::ModelRoute::Specific { provider_id, model } => {
+                let provider_name = providers
+                    .iter()
+                    .find(|provider| provider.id == provider_id)
+                    .map(|provider| provider.name.as_str())
+                    .unwrap_or(provider_id.as_str());
+                let resolved = format!("{provider_name} / {model}");
+                let policy =
+                    specialist_context_policy(role, ai::service::RouteOrigin::Specific).to_string();
+                let sent = match role {
+                    ai::service::ModelRole::Vision | ai::service::ModelRole::Video => {
+                        "current media + current question"
+                    }
+                    ai::service::ModelRole::AudioStt => "current audio only",
+                    ai::service::ModelRole::ImageGeneration => "prompt/config only",
+                    ai::service::ModelRole::Main => "canonical Main context",
+                };
+                provider_context.push(format!(
+                    "{} — {}\nSent: {}\nNot sent: full session history\nPolicy: Minimal",
+                    role.display_name(),
+                    resolved,
+                    sent
+                ));
+                (resolved, policy)
+            }
+        };
+        specialist_rows.push(vec![
+            RichBlockTableCell::text_only(
+                role.display_name().trim_end_matches(" Model"),
+                false,
+                Some("left"),
+            ),
+            RichBlockTableCell::text_only(&route_text, false, Some("left")),
+            RichBlockTableCell::text_only(&policy, false, Some("left")),
+        ]);
     }
 
-    let mut blocks = vec![
+    let specialist_table = serde_json::to_value(RichBlock::Table {
+        cells: specialist_rows,
+        has_header: true,
+        is_bordered: true,
+        is_striped: true,
+        is_compact: true,
+        caption: None,
+    })
+    .unwrap_or_else(|_| json!({"type":"paragraph","text":"Specialist routing unavailable."}));
+
+    let health_text = if stats.usage_pct >= 80.0 {
+        "Context warning: Main Model context is near/full. Xiao will compact provider context before the next request when necessary; stored history is not silently deleted."
+    } else {
+        "✓ Context healthy"
+    };
+
+    InputRichMessage::new(vec![
         RichBlock::SectionHeading {
             text: Value::String("CONTEXT".to_string()),
             level: 1,
         },
         RichBlock::Paragraph {
             text: Value::String(format!(
-                "Session #{} · {}\nMain Model: {}",
+                "Session #{} — {}\nMain: {}",
                 stats.session_id,
                 truncate_session_name(&stats.session_name, 36),
                 main_name
             )),
+        },
+        RichBlock::Preformatted {
+            text: progress,
+            language: None,
         },
         RichBlock::Table {
             cells: vec![
@@ -1417,51 +1502,37 @@ async fn build_context_monitor_ui(ai_service: &AIChatService, user_id: i64) -> I
             is_compact: true,
             caption: None,
         },
-        RichBlock::Preformatted {
-            text: progress,
-            language: None,
-        },
         RichBlock::BlockQuotation {
-            blocks: vec![json!({
-                "type":"paragraph",
-                "text":"Context windows are never added together. Main Model owns canonical history; specialist observations/transcripts are transient execution artifacts."
-            })],
+            blocks: vec![json!({"type":"paragraph","text":health_text})],
         },
         RichBlock::Details {
-            summary: Value::String("Specialist Routing".to_string()),
-            blocks: vec![json!({"type":"paragraph","text": specialist_lines.join("\n")})],
+            summary: Value::String("Specialist Routing & Context".to_string()),
+            blocks: vec![specialist_table],
             is_open: Some(false),
         },
         RichBlock::Details {
-            summary: Value::String("Cross-provider Context Policy".to_string()),
+            summary: Value::String("Provider Context".to_string()),
             blocks: vec![json!({
                 "type":"paragraph",
-                "text": if cross_provider.is_empty() {
-                    "No Specific cross-provider addon is active. Main Model routes execute directly when verified.".to_string()
+                "text": if provider_context.is_empty() {
+                    "No Specific cross-provider addon is active. Main Model routes execute directly when verified. Context windows are never added together.".to_string()
                 } else {
-                    cross_provider.join("\n")
+                    format!(
+                        "{}\n\nContext windows are never added together.",
+                        provider_context.join("\n\n")
+                    )
                 }
             })],
             is_open: Some(false),
         },
-    ];
-
-    if stats.usage_pct >= 80.0 {
-        blocks.push(RichBlock::BlockQuotation {
-            blocks: vec![json!({
-                "type":"paragraph",
-                "text":"Canonical Main context is near/full. Xiao compacts the provider context before the next request when necessary; stored history is not silently deleted."
-            })],
-        });
-    }
-    blocks.push(RichBlock::Buttons {
-        buttons: vec![
-            RichMessageButton::callback_styled("Refresh", "context_refresh", "primary"),
-            RichMessageButton::callback("Close", "context_close"),
-        ],
-        align: Some("center".to_string()),
-    });
-    InputRichMessage::new(blocks)
+        RichBlock::Buttons {
+            buttons: vec![
+                RichMessageButton::callback_styled("Refresh", "context_refresh", "primary"),
+                RichMessageButton::callback("Close", "context_close"),
+            ],
+            align: Some("center".to_string()),
+        },
+    ])
 }
 
 async fn send_or_update_context_monitor(
@@ -1490,7 +1561,17 @@ async fn send_welcome(
     chat_id: i64,
     user_id: i64,
 ) {
-    let rich = build_start_menu_ui(ai_service, user_id).await;
+    let rich = build_start_ui(ai_service, user_id).await;
+    let _ = bot.send_rich_message(chat_id, &rich, None, None).await;
+}
+
+async fn send_menu(
+    bot: &TelegramBotClient,
+    ai_service: &AIChatService,
+    chat_id: i64,
+    user_id: i64,
+) {
+    let rich = build_menu_ui(ai_service, user_id).await;
     let _ = bot.send_rich_message(chat_id, &rich, None, None).await;
 }
 
@@ -2625,21 +2706,22 @@ async fn handle_update(
         }
 
         // Navigation Commands
-        if text.starts_with("/start")
-            || [
-                "📱 Menu",
-                "Menu",
-                "/menu",
-                "🔙 Menu Utama",
-                "🔙 Kembali ke Menu Utama",
-                "Menu Utama",
-                "Main Menu",
-                "main menu",
-                "Main menu",
-            ]
-            .contains(&text.as_str())
-        {
+        if text.starts_with("/start") {
             send_welcome(bot, ai_service, chat_id, user_id).await;
+        } else if [
+            "📱 Menu",
+            "Menu",
+            "/menu",
+            "🔙 Menu Utama",
+            "🔙 Kembali ke Menu Utama",
+            "Menu Utama",
+            "Main Menu",
+            "main menu",
+            "Main menu",
+        ]
+        .contains(&text.as_str())
+        {
+            send_menu(bot, ai_service, chat_id, user_id).await;
         } else if text.starts_with("/new")
             || [
                 "ɴᴇᴡ",
@@ -2677,8 +2759,14 @@ async fn handle_update(
                 },
                 RichBlock::Paragraph {
                     text: Value::String(format!(
-                        "Session #{} · {} is active. Canonical history is empty.",
-                        new_session.id, new_session.name
+                        "✓ Session #{} created and activated.",
+                        new_session.id
+                    )),
+                },
+                RichBlock::Paragraph {
+                    text: Value::String(format!(
+                        "{}\nCanonical history is empty.",
+                        new_session.name
                     )),
                 },
             ]);
@@ -3568,7 +3656,7 @@ async fn handle_update(
             let _ = bot.send_rich_message(chat_id, &rich, None, None).await;
         } else if cq_data == "action_menu" {
             let _ = bot.answer_callback_query(&cq_id, None, false).await;
-            send_welcome(bot, ai_service, chat_id, user_id).await;
+            send_menu(bot, ai_service, chat_id, user_id).await;
         }
     }
 }
@@ -3946,6 +4034,14 @@ mod update_lane_tests {
     fn smaller_main_context_warns_only_when_history_exceeds_usable_budget() {
         assert!(main_context_overflow_warning("small-model", 80_000, 64_000).is_some());
         assert!(main_context_overflow_warning("large-model", 40_000, 64_000).is_none());
+    }
+
+    #[test]
+    fn start_and_menu_contracts_remain_distinct() {
+        let start_buttons = ["New Chat", "Model", "Session", "Context"];
+        let menu_extra = ["Generate Image", "Help"];
+        assert_eq!(start_buttons.len(), 4);
+        assert_eq!(menu_extra.len(), 2);
     }
 
     #[test]
