@@ -22,16 +22,15 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Apply staged patch and self-clean
+      - name: Apply staged source patch
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           cat .hardening/part00 .hardening/part01 .hardening/part02 .hardening/part03 | base64 -d | gzip -d > /tmp/hardening.patch
-          git apply -p3 --check /tmp/hardening.patch
-          git apply -p3 /tmp/hardening.patch
+          git apply -p3 --check --exclude=.github/workflows/build.yml /tmp/hardening.patch
+          git apply -p3 --exclude=.github/workflows/build.yml /tmp/hardening.patch
           rm -rf .hardening
-          rm -f .github/workflows/apply-hardening.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
