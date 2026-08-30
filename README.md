@@ -95,7 +95,7 @@ Mengaktifkannya berarti prompt image dapat dikirim ke provider eksternal tersebu
 - PDF text-native diekstrak lokal; DOCX dan XLSX diekstrak dari container XML dengan batas entry/worksheet untuk mencegah resource exhaustion.
 - PDF scan/image-only dirender maksimal 6 halaman melalui `pdftoppm` dan dianalisis oleh vision model. Pada Linux, instal `poppler-utils` untuk jalur ini.
 - Attachment image/audio/video dan halaman PDF scan dipersist per-session dengan permission ketat, lalu dapat direhidrasi pada turn berikutnya sesuai capability model dan budget context.
-- Capability memakai state `Supported / Unsupported / Unknown` dengan freshness per capability. `/models` hanya merupakan catalog/metadata evidence dan **tidak** otomatis membuktikan text-chat. Probe aman mencakup text, Vision merah/biru, tools, structured output, native audio/STT; active image-generation probe hanya dijalankan secara eksplisit karena dapat memakai kredit. Semua media baru maupun rehidrasi tetap fail-closed bila capability Unknown/stale.
+- Capability memakai state `Supported / Unsupported / Unknown` dengan freshness per capability. `/models` hanya merupakan catalog/metadata evidence dan **tidak** otomatis membuktikan text-chat. Probe aman mencakup text, Vision merah/biru, Video MP4 kecil, tools, structured output, dan native audio/STT; active image-generation probe hanya dijalankan secara eksplisit karena dapat memakai kredit dan hasilnya harus lolos validator gambar runtime. Semua media baru maupun rehidrasi tetap fail-closed bila capability Unknown/stale.
 
 ## Struktur Direktori
 
@@ -148,6 +148,8 @@ xiao model addon test <role>
 xiao status
 xiao help
 ```
+
+`xiao model addon probe [role]` memperbarui dan menyimpan evidence capability yang aman; active image-generation probe tidak dijalankan oleh command ini. `xiao model addon test <role>` mengirim sample fungsional ke route yang sudah tersimpan tanpa mengubah routing; khusus Image Generation, test eksplisit dapat memakai kredit dan menyimpan evidence hasilnya.
 
 `xiao model pick` mengelola whitelist model Telegram di SQLite. File JSON legacy hanya digunakan sebagai sumber migrasi kompatibilitas bila masih ditemukan. Environment/.env dapat menjadi bootstrap input, tetapi SQLite adalah runtime source of truth.
 
