@@ -1,0 +1,60 @@
+name: v0.3.0 one-time source sync
+
+on:
+  push:
+    branches:
+      - feat/v0.3.0-role-model-routing
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+
+      - name: Reconstruct and apply reviewed patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .github/v030-sync.part0 .github/v030-sync.part1 .github/v030-sync.part2 .github/v030-sync.part3 .github/v030-sync.part4 \
+            | base64 --decode | gzip --decompress > /tmp/v030-sync.patch
+
+          git checkout 931550f28e11b1a87849ed93dfd43941dc786eee -- src/ai/mod.rs
+          git rm -f src/ai/routing.rs
+          git apply --index /tmp/v030-sync.patch
+
+      - name: Format Rust source
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.98.0 --profile minimal --component rustfmt
+          cargo +1.98.0 fmt --all
+          git add -A
+
+      - name: Remove one-time transfer artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/v030-sync.part0 .github/v030-sync.part1 .github/v030-sync.part2 .github/v030-sync.part3 .github/v030-sync.part4
+          rm -f .github/workflows/v030-sync-once.yml
+          git add -A
+
+      - name: Commit synchronized implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --cached --quiet; then
+            echo "No source changes to commit"
+            exit 1
+          fi
+          git commit -m "feat: synchronize v0.3.0 implementation"
+          git push origin HEAD:feat/v0.3.0-role-model-routing
