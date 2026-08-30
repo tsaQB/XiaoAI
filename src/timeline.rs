@@ -6,7 +6,7 @@ use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 use tracing::debug;
 
-use crate::bot::client::TelegramBotClient;
+use crate::bot::client::{TelegramBotClient, TelegramDeliveryContext};
 use crate::bot::models::{InputRichMessage, RichBlock};
 use crate::parser::parse_markdown_to_rich_blocks;
 use serde_json::Value;
@@ -108,6 +108,7 @@ pub struct ExecutionTimeline {
     sync_lock: Arc<Mutex<()>>,
     stopped: Arc<AtomicBool>,
     partial_answer: Arc<RwLock<String>>,
+    delivery_context: TelegramDeliveryContext,
 }
 
 impl ExecutionTimeline {
@@ -132,6 +133,7 @@ impl ExecutionTimeline {
             sync_lock: Arc::new(Mutex::new(())),
             stopped: Arc::new(AtomicBool::new(false)),
             partial_answer: Arc::new(RwLock::new(String::new())),
+            delivery_context: TelegramBotClient::current_delivery_context(),
         }
     }
 
@@ -210,7 +212,11 @@ impl ExecutionTimeline {
                 if timeline.stopped.load(Ordering::SeqCst) {
                     break;
                 }
-                timeline.sync_draft(false).await;
+                TelegramBotClient::with_delivery_context(
+                    timeline.delivery_context.clone(),
+                    timeline.sync_draft(false),
+                )
+                .await;
             }
         });
     }
