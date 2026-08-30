@@ -2888,10 +2888,25 @@ mod tests {
         assert!(history_attachment_authorized(Some(&fresh), "image"));
         assert!(history_attachment_authorized(Some(&fresh), "document_page"));
 
-        let stale = evidence_record(
+        let mut stale = evidence_record(
             CapabilityKind::ImageInput,
             CapabilityState::Supported,
             chrono::Duration::days(8),
+        );
+        stale.evidence.push(crate::ai::storage::CapabilityEvidence {
+            capability: CapabilityKind::TextChat,
+            source: crate::ai::storage::CapabilityEvidenceSource::ActiveProbe,
+            outcome: CapabilityState::Supported,
+            checked_at: chrono::Utc::now().to_rfc3339(),
+            detail: None,
+        });
+        assert_eq!(
+            stale.effective_state_for(CapabilityKind::TextChat),
+            CapabilityState::Supported
+        );
+        assert_eq!(
+            stale.effective_state_for(CapabilityKind::ImageInput),
+            CapabilityState::Unknown
         );
         assert!(
             require_verified_capability(Some(&stale), CapabilityKind::ImageInput, "image",)

@@ -2209,6 +2209,34 @@ mod tests {
     }
 
     #[test]
+    fn fresh_active_probe_remains_authoritative_when_metadata_is_stale() {
+        let now = chrono::Utc::now();
+        let record = CapabilityRecord {
+            evidence: vec![
+                CapabilityEvidence {
+                    capability: CapabilityKind::ImageInput,
+                    source: CapabilityEvidenceSource::ActiveProbe,
+                    outcome: CapabilityState::Supported,
+                    checked_at: (now - chrono::Duration::days(1)).to_rfc3339(),
+                    detail: None,
+                },
+                CapabilityEvidence {
+                    capability: CapabilityKind::ImageInput,
+                    source: CapabilityEvidenceSource::ProviderMetadata,
+                    outcome: CapabilityState::Unsupported,
+                    checked_at: (now - chrono::Duration::hours(7)).to_rfc3339(),
+                    detail: None,
+                },
+            ],
+            ..CapabilityRecord::default()
+        };
+        assert_eq!(
+            record.effective_state_for(CapabilityKind::ImageInput),
+            CapabilityState::Supported
+        );
+    }
+
+    #[test]
     fn fresh_active_probe_overrides_fresh_metadata_deterministically() {
         let now = chrono::Utc::now().to_rfc3339();
         let record = CapabilityRecord {
