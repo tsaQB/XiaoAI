@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use ai::service::{ImageGenerationErrorKind, ProviderConfig};
+use ai::service::{ImageGenerationErrorKind, ProbeEvent, ProviderConfig};
 use ai::AIChatService;
 use bot::client::{TelegramBotClient, TelegramDeliveryContext};
 use bot::models::{
@@ -827,11 +827,14 @@ fn main_context_overflow_warning(model: &str, used: usize, usable_limit: usize) 
     })
 }
 
-fn capability_state_label(value: Option<bool>) -> &'static str {
-    match value {
-        Some(true) => "Supported",
-        Some(false) => "Unsupported",
-        None => "Unknown",
+fn effective_capability_state_label(
+    record: &ai::service::CapabilityRecord,
+    capability: ai::service::CapabilityKind,
+) -> &'static str {
+    match AIChatService::effective_capability_state(record, capability) {
+        ai::storage::CapabilityState::Supported => "Supported",
+        ai::storage::CapabilityState::Unsupported => "Unsupported",
+        ai::storage::CapabilityState::Unknown => "Unknown",
     }
 }
 
@@ -859,7 +862,30 @@ async fn run_observable_main_capability_probe(
     ]);
     let _ = bot.send_rich_message(chat_id, &checking, None, None).await;
 
-    let record = ai_service.probe_model_capabilities(provider, model).await;
+    let mut persisted = false;
+    let record = ai_service
+        .probe_model_capabilities_with_observer(provider, model, |event| {
+            if let ProbeEvent::Persistence { saved } = event {
+                persisted = saved;
+            }
+        })
+        .await;
+    if !persisted {
+        let failed = InputRichMessage::new(vec![
+            RichBlock::SectionHeading {
+                text: Value::String("CAPABILITY CHECK NOT SAVED".to_string()),
+                level: 1,
+            },
+            RichBlock::BlockQuotation {
+                blocks: vec![json!({
+                    "type":"paragraph",
+                    "text":"The probe candidate could not be persisted, so Xiao did not publish it to runtime. Previous durable capability state remains authoritative."
+                })],
+            },
+        ]);
+        let _ = bot.send_rich_message(chat_id, &failed, None, None).await;
+        return;
+    }
     let completed = InputRichMessage::new(vec![
         RichBlock::SectionHeading {
             text: Value::String("CAPABILITY CHECK COMPLETE".to_string()),
@@ -874,7 +900,7 @@ async fn run_observable_main_capability_probe(
                 vec![
                     RichBlockTableCell::text_only("Text chat", false, Some("left")),
                     RichBlockTableCell::text_only(
-                        capability_state_label(record.supports_text_chat),
+                        effective_capability_state_label(&record, ai::service::CapabilityKind::TextChat),
                         false,
                         Some("left"),
                     ),
@@ -882,7 +908,7 @@ async fn run_observable_main_capability_probe(
                 vec![
                     RichBlockTableCell::text_only("Vision", false, Some("left")),
                     RichBlockTableCell::text_only(
-                        capability_state_label(record.supports_image_input),
+                        effective_capability_state_label(&record, ai::service::CapabilityKind::ImageInput),
                         false,
                         Some("left"),
                     ),
@@ -890,7 +916,7 @@ async fn run_observable_main_capability_probe(
                 vec![
                     RichBlockTableCell::text_only("Audio input", false, Some("left")),
                     RichBlockTableCell::text_only(
-                        capability_state_label(record.supports_audio_input),
+                        effective_capability_state_label(&record, ai::service::CapabilityKind::AudioInput),
                         false,
                         Some("left"),
                     ),
@@ -898,7 +924,7 @@ async fn run_observable_main_capability_probe(
                 vec![
                     RichBlockTableCell::text_only("Audio STT", false, Some("left")),
                     RichBlockTableCell::text_only(
-                        capability_state_label(record.supports_audio_transcription),
+                        effective_capability_state_label(&record, ai::service::CapabilityKind::AudioTranscription),
                         false,
                         Some("left"),
                     ),
@@ -906,7 +932,7 @@ async fn run_observable_main_capability_probe(
                 vec![
                     RichBlockTableCell::text_only("Video", false, Some("left")),
                     RichBlockTableCell::text_only(
-                        capability_state_label(record.supports_video_input),
+                        effective_capability_state_label(&record, ai::service::CapabilityKind::VideoInput),
                         false,
                         Some("left"),
                     ),
@@ -914,7 +940,7 @@ async fn run_observable_main_capability_probe(
                 vec![
                     RichBlockTableCell::text_only("Image generation", false, Some("left")),
                     RichBlockTableCell::text_only(
-                        capability_state_label(record.supports_image_generation),
+                        effective_capability_state_label(&record, ai::service::CapabilityKind::ImageGeneration),
                         false,
                         Some("left"),
                     ),
