@@ -66,12 +66,15 @@ fn tiny_silent_wav() -> Vec<u8> {
 use super::capability::{
     get_model_capabilities_with_meta, model_metadata_key, ModelCapability, ModelMetadata,
 };
-use super::routing::{ModelRole, ModelRoute, ResolvedModelRoute, RouteOrigin};
+use super::routing::{
+    ModelRole, ModelRoute, ModelRoutingConfig, ResolvedModelRoute, RouteOrigin,
+};
 use super::service::AIChatService;
 use super::storage::{
     load_provider_store, persist_capability_registry, persist_model_routing,
     persist_provider_state, CapabilityEvidence, CapabilityEvidenceSource, CapabilityKind,
-    CapabilityRecord, CapabilityState, EvidenceFreshness, ProbeEvent, ProbeOutcome, ProviderConfig,
+    CapabilityRecord, CapabilityRegistry, CapabilityState, EvidenceFreshness, ProbeEvent,
+    ProbeOutcome, ProviderConfig, ProviderStore,
 };
 
 #[derive(Debug)]
@@ -277,6 +280,65 @@ fn vision_probe_payload(model: &str, png_base64: &str) -> Value {
     })
 }
 
+fn select_model_route(
+    store: &ProviderStore,
+    routing: &ModelRoutingConfig,
+    role: ModelRole,
+) -> Result<(ProviderConfig, String, RouteOrigin), String> {
+    let main_provider = store
+        .active_id
+        .as_deref()
+        .and_then(|id| store.providers.iter().find(|provider| provider.id == id))
+        .or_else(|| store.providers.first())
+        .cloned()
+        .ok_or_else(|| "No AI provider is configured".to_string())?;
+    let main_model = main_provider.active_model.trim().to_string();
+    if main_model.is_empty() {
+        return Err("Main Model is not selected".to_string());
+    }
+
+    if role == ModelRole::Main {
+        return Ok((main_provider, main_model, RouteOrigin::Main));
+    }
+
+    match routing
+        .route(role)
+        .cloned()
+        .unwrap_or(ModelRoute::MainModel)
+    {
+        ModelRoute::MainModel => Ok((main_provider, main_model, RouteOrigin::MainModel)),
+        ModelRoute::Disabled => Err(format!("{} is Disabled", role.display_name())),
+        ModelRoute::Specific { provider_id, model } => {
+            let provider = store
+                .providers
+                .iter()
+                .find(|provider| provider.id == provider_id)
+                .cloned()
+                .ok_or_else(|| format!("Provider '{provider_id}' not found"))?;
+            if provider.models.is_empty() || !provider.models.iter().any(|entry| entry == &model) {
+                return Err(format!(
+                    "Model '{model}' is no longer present in provider '{}' catalog",
+                    provider.name
+                ));
+            }
+            Ok((provider, model, RouteOrigin::Specific))
+        }
+    }
+}
+
+fn publish_capability_candidate(
+    runtime: &mut CapabilityRegistry,
+    candidate: CapabilityRegistry,
+    saved: bool,
+) -> bool {
+    if saved {
+        *runtime = candidate;
+        true
+    } else {
+        false
+    }
+}
+
 impl AIChatService {
     pub async fn reload_provider_store(&self) -> bool {
         let store = match tokio::task::spawn_blocking(load_provider_store).await {
@@ -439,50 +501,9 @@ impl AIChatService {
         &self,
         role: ModelRole,
     ) -> Result<ResolvedModelRoute, String> {
-        let store = self.provider_store.read().await;
-        let main_provider = store
-            .active_id
-            .as_deref()
-            .and_then(|id| store.providers.iter().find(|provider| provider.id == id))
-            .or_else(|| store.providers.first())
-            .cloned()
-            .ok_or_else(|| "No AI provider is configured".to_string())?;
-        let main_model = main_provider.active_model.trim().to_string();
-        if main_model.is_empty() {
-            return Err("Main Model is not selected".to_string());
-        }
-
-        let (provider, model, route_origin) = if role == ModelRole::Main {
-            (main_provider, main_model, RouteOrigin::Main)
-        } else {
-            let routing = self.model_routing.read().await;
-            match routing
-                .route(role)
-                .cloned()
-                .unwrap_or(ModelRoute::MainModel)
-            {
-                ModelRoute::MainModel => (main_provider, main_model, RouteOrigin::MainModel),
-                ModelRoute::Disabled => return Err(format!("{} is Disabled", role.display_name())),
-                ModelRoute::Specific { provider_id, model } => {
-                    let provider = store
-                        .providers
-                        .iter()
-                        .find(|provider| provider.id == provider_id)
-                        .cloned()
-                        .ok_or_else(|| format!("Provider '{provider_id}' not found"))?;
-                    if provider.models.is_empty()
-                        || !provider.models.iter().any(|entry| entry == &model)
-                    {
-                        return Err(format!(
-                            "Model '{model}' is no longer present in provider '{}' catalog",
-                            provider.name
-                        ));
-                    }
-                    (provider, model, RouteOrigin::Specific)
-                }
-            }
-        };
-        drop(store);
+        let store = self.provider_store.read().await.clone();
+        let routing = self.model_routing.read().await.clone();
+        let (provider, model, route_origin) = select_model_route(&store, &routing, role)?;
 
         let capability = self
             .capability_record(&provider.endpoint, &model)
@@ -927,10 +948,11 @@ impl AIChatService {
             candidate
         };
         let saved = persist_capability_registry(candidate.clone()).await;
-        if saved {
-            *self.capability_registry.write().await = candidate;
-        }
-        observer(ProbeEvent::Persistence { saved });
+        let published = {
+            let mut runtime = self.capability_registry.write().await;
+            publish_capability_candidate(&mut runtime, candidate, saved)
+        };
+        observer(ProbeEvent::Persistence { saved: published });
         observer(ProbeEvent::Finished);
         if saved {
             Ok(record)
@@ -1314,12 +1336,14 @@ impl AIChatService {
             candidate
         };
         let saved = persist_capability_registry(candidate.clone()).await;
-        if saved {
-            *self.capability_registry.write().await = candidate;
-        } else {
+        let published = {
+            let mut runtime = self.capability_registry.write().await;
+            publish_capability_candidate(&mut runtime, candidate, saved)
+        };
+        if !published {
             warn!("Capability probe result was not published because persistence failed");
         }
-        observer(ProbeEvent::Persistence { saved });
+        observer(ProbeEvent::Persistence { saved: published });
         observer(ProbeEvent::Finished);
         record
     }
@@ -1577,6 +1601,143 @@ mod tests {
         CapabilityProbeResponse::Success(json!({
             "choices": [{"message": message}]
         }))
+    }
+
+    fn provider(id: &str, model: &str) -> ProviderConfig {
+        ProviderConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            endpoint: format!("https://{id}.example/v1"),
+            api_key: String::new(),
+            api_key_ref: None,
+            models: vec![model.to_string()],
+            active_model: model.to_string(),
+        }
+    }
+
+    #[test]
+    fn main_model_route_resolves_dynamically_to_current_main() {
+        let mut store = ProviderStore {
+            active_id: Some("main-a".to_string()),
+            providers: vec![provider("main-a", "model-a"), provider("main-b", "model-b")],
+            telegram_models: Vec::new(),
+        };
+        let routing = ModelRoutingConfig::default();
+        let (_, model, origin) = select_model_route(&store, &routing, ModelRole::Vision).unwrap();
+        assert_eq!(model, "model-a");
+        assert_eq!(origin, RouteOrigin::MainModel);
+
+        store.active_id = Some("main-b".to_string());
+        let (_, model, origin) = select_model_route(&store, &routing, ModelRole::Vision).unwrap();
+        assert_eq!(model, "model-b");
+        assert_eq!(origin, RouteOrigin::MainModel);
+    }
+
+    #[test]
+    fn specific_route_rejects_missing_provider_and_model() {
+        let store = ProviderStore {
+            active_id: Some("main".to_string()),
+            providers: vec![provider("main", "main-model"), provider("vision", "vision-v1")],
+            telegram_models: Vec::new(),
+        };
+        let mut routing = ModelRoutingConfig::default();
+        routing
+            .set_route(
+                ModelRole::Vision,
+                ModelRoute::Specific {
+                    provider_id: "missing".to_string(),
+                    model: "vision-v1".to_string(),
+                },
+            )
+            .unwrap();
+        assert!(select_model_route(&store, &routing, ModelRole::Vision)
+            .unwrap_err()
+            .contains("not found"));
+
+        routing
+            .set_route(
+                ModelRole::Vision,
+                ModelRoute::Specific {
+                    provider_id: "vision".to_string(),
+                    model: "vision-v2".to_string(),
+                },
+            )
+            .unwrap();
+        assert!(select_model_route(&store, &routing, ModelRole::Vision)
+            .unwrap_err()
+            .contains("no longer present"));
+    }
+
+    #[test]
+    fn failed_capability_persistence_does_not_publish_candidate() {
+        let original = CapabilityRecord {
+            provider_id: "provider".to_string(),
+            model: "model".to_string(),
+            supports_image_input: Some(false),
+            ..CapabilityRecord::default()
+        };
+        let mut runtime = CapabilityRegistry {
+            models: vec![original.clone()],
+        };
+        let candidate = CapabilityRegistry {
+            models: vec![CapabilityRecord {
+                supports_image_input: Some(true),
+                ..original
+            }],
+        };
+        assert!(!publish_capability_candidate(&mut runtime, candidate, false));
+        assert_eq!(runtime.models[0].supports_image_input, Some(false));
+    }
+
+    #[test]
+    fn main_audio_route_accepts_native_audio_or_stt_and_rejects_neither() {
+        let native = CapabilityRecord {
+            supports_audio_input: Some(true),
+            supports_audio_transcription: None,
+            ..CapabilityRecord::default()
+        };
+        assert_eq!(
+            AIChatService::required_capability_state(
+                ModelRole::AudioStt,
+                &native,
+                RouteOrigin::MainModel
+            ),
+            CapabilityState::Supported
+        );
+
+        let stt = CapabilityRecord {
+            supports_audio_input: Some(false),
+            supports_audio_transcription: Some(true),
+            ..CapabilityRecord::default()
+        };
+        assert_eq!(
+            AIChatService::required_capability_state(
+                ModelRole::AudioStt,
+                &stt,
+                RouteOrigin::MainModel
+            ),
+            CapabilityState::Supported
+        );
+
+        let neither = CapabilityRecord {
+            supports_audio_input: Some(false),
+            supports_audio_transcription: Some(false),
+            ..CapabilityRecord::default()
+        };
+        assert_eq!(
+            AIChatService::required_capability_state(
+                ModelRole::AudioStt,
+                &neither,
+                RouteOrigin::MainModel
+            ),
+            CapabilityState::Unsupported
+        );
+    }
+
+    #[test]
+    fn functional_probe_success_is_supported() {
+        let response = CapabilityProbeResponse::Success(json!({"ok": true}));
+        assert_eq!(response.outcome(Some(true)), ProbeOutcome::Supported);
     }
 
     #[test]
