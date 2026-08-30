@@ -1395,8 +1395,15 @@ impl CapabilityRecord {
             .map(|(_, checked_at)| checked_at);
 
         // Legacy capability records did not carry per-capability evidence. The
-        // record timestamp remains a compatibility fallback only in that case.
-        Self::timestamp_freshness(latest.unwrap_or(&self.checked_at), ttl)
+        // record timestamp remains a compatibility fallback only when the
+        // entire record is legacy. Once any typed evidence exists, a missing
+        // capability-specific timestamp is Unknown/stale rather than borrowing
+        // freshness from an unrelated capability.
+        match latest {
+            Some(checked_at) => Self::timestamp_freshness(checked_at, ttl),
+            None if self.evidence.is_empty() => Self::timestamp_freshness(&self.checked_at, ttl),
+            None => EvidenceFreshness::Stale,
+        }
     }
 
     pub fn state_for(&self, capability: CapabilityKind) -> CapabilityState {
@@ -2065,6 +2072,10 @@ mod tests {
         );
         assert_eq!(
             record.freshness_for(CapabilityKind::ImageGeneration, ttl),
+            EvidenceFreshness::Stale
+        );
+        assert_eq!(
+            record.freshness_for(CapabilityKind::AudioTranscription, ttl),
             EvidenceFreshness::Stale
         );
     }
