@@ -1236,7 +1236,10 @@ fn is_control_message_text(text: &str) -> bool {
     let commands = [
         "/start", "/menu", "/new", "/session", "/context", "/model", "/clear", "/help",
     ];
-    if commands.iter().any(|command| command_matches(text, command)) {
+    if commands
+        .iter()
+        .any(|command| command_matches(text, command))
+    {
         return true;
     }
 
@@ -1391,13 +1394,7 @@ async fn process_durable_update(
     let delivery_context = delivery_context_for_update(&update);
     TelegramBotClient::with_delivery_context(
         delivery_context,
-        handle_update(
-            bot,
-            ai_service,
-            user_last_image_prompt,
-            access,
-            update,
-        ),
+        handle_update(bot, ai_service, user_last_image_prompt, access, update),
     )
     .await;
 
