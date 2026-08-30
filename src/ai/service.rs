@@ -122,7 +122,7 @@ pub fn resolve_audio_file_and_mime(
             ("audio/webm", "webm")
         } else {
             let lower_fn = suggested_filename.unwrap_or("").to_ascii_lowercase();
-            if lower_fn.ends_with(".ogg") {
+            if lower_fn.ends_with(".ogg") || lower_fn.ends_with(".oga") {
                 ("audio/ogg", "ogg")
             } else if lower_fn.ends_with(".opus") {
                 ("audio/opus", "opus")
@@ -2581,8 +2581,8 @@ impl AIChatService {
                 user_id,
                 request_session_id,
                 "audio",
-                audio_mime.unwrap_or("audio/ogg"),
-                None,
+                audio_mime.unwrap_or("application/octet-stream"),
+                doc_name,
                 bytes,
             )
             .await
