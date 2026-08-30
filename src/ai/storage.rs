@@ -1266,6 +1266,7 @@ pub struct CapabilityEvidence {
     pub detail: Option<String>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceFreshness {
@@ -1379,6 +1380,7 @@ pub struct CapabilityRecord {
 }
 
 impl CapabilityRecord {
+    #[cfg(test)]
     fn timestamp_freshness(checked_at: &str, ttl: std::time::Duration) -> EvidenceFreshness {
         let Ok(checked_at) = chrono::DateTime::parse_from_rfc3339(checked_at) else {
             return EvidenceFreshness::Stale;
@@ -1460,6 +1462,7 @@ impl CapabilityRecord {
             .unwrap_or(CapabilityState::Unknown)
     }
 
+    #[cfg(test)]
     pub fn freshness_for(
         &self,
         capability: CapabilityKind,
