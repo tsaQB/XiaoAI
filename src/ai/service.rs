@@ -173,8 +173,9 @@ fn decode_generated_image_base64(encoded: &str) -> Result<Vec<u8>, ImageGenerati
                 "Provider mengembalikan base64 gambar yang rusak.",
             )
         })?;
-    validate_generated_image_bytes(&bytes)
-        .map_err(|error| ImageGenerationError::new(ImageGenerationErrorKind::InvalidImage, error))?;
+    validate_generated_image_bytes(&bytes).map_err(|error| {
+        ImageGenerationError::new(ImageGenerationErrorKind::InvalidImage, error)
+    })?;
     Ok(bytes)
 }
 
@@ -2800,15 +2801,16 @@ mod tests {
         assert_eq!(error.kind, ImageGenerationErrorKind::InvalidBase64);
 
         use base64::Engine;
-        let encoded = base64::engine::general_purpose::STANDARD
-            .encode(b"\x89PNG\r\n\x1a\nrest");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nrest");
         assert!(decode_generated_image_base64(&encoded).is_ok());
     }
 
     #[test]
     fn generated_image_url_validation_rejects_unsafe_schemes_and_private_ips() {
         assert_eq!(
-            parse_generated_image_url("file:///etc/passwd").unwrap_err().kind,
+            parse_generated_image_url("file:///etc/passwd")
+                .unwrap_err()
+                .kind,
             ImageGenerationErrorKind::UnsafeImageUrl
         );
         assert!(parse_generated_image_url("https://example.com/image.png").is_ok());
