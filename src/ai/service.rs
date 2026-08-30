@@ -168,6 +168,102 @@ pub fn resolve_audio_file_and_mime(
     (mime_str, filename)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeAudioFormatError {
+    UnsupportedKnown(&'static str),
+    Unknown,
+}
+
+impl std::fmt::Display for NativeAudioFormatError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedKnown(format) => write!(
+                formatter,
+                "{format} is recognized, but Xiao's native OpenAI-compatible input_audio contract only represents mp3 or wav safely"
+            ),
+            Self::Unknown => write!(
+                formatter,
+                "audio format is unknown; Xiao will not guess a native input_audio format"
+            ),
+        }
+    }
+}
+
+fn native_audio_input_format(
+    mime_type: Option<&str>,
+    file_name: Option<&str>,
+) -> Result<&'static str, NativeAudioFormatError> {
+    let clean_mime = mime_type
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+
+    let mime_result = match clean_mime.as_str() {
+        "" => None,
+        "audio/mpeg" | "audio/mp3" => Some(Ok("mp3")),
+        "audio/wav" | "audio/x-wav" | "audio/wave" => Some(Ok("wav")),
+        "audio/ogg" | "application/ogg" => {
+            Some(Err(NativeAudioFormatError::UnsupportedKnown("ogg")))
+        }
+        "audio/opus" => Some(Err(NativeAudioFormatError::UnsupportedKnown("opus"))),
+        "audio/mp4" | "audio/m4a" | "audio/x-m4a" => {
+            Some(Err(NativeAudioFormatError::UnsupportedKnown("m4a/mp4")))
+        }
+        "audio/flac" | "audio/x-flac" => {
+            Some(Err(NativeAudioFormatError::UnsupportedKnown("flac")))
+        }
+        "audio/webm" => Some(Err(NativeAudioFormatError::UnsupportedKnown("webm"))),
+        _ => None,
+    };
+    if let Some(result) = mime_result {
+        return result;
+    }
+
+    let lower_name = file_name.unwrap_or("").trim().to_ascii_lowercase();
+    if lower_name.ends_with(".mp3") {
+        Ok("mp3")
+    } else if lower_name.ends_with(".wav") {
+        Ok("wav")
+    } else if lower_name.ends_with(".ogg") || lower_name.ends_with(".oga") {
+        Err(NativeAudioFormatError::UnsupportedKnown("ogg"))
+    } else if lower_name.ends_with(".opus") {
+        Err(NativeAudioFormatError::UnsupportedKnown("opus"))
+    } else if lower_name.ends_with(".m4a") || lower_name.ends_with(".mp4") {
+        Err(NativeAudioFormatError::UnsupportedKnown("m4a/mp4"))
+    } else if lower_name.ends_with(".flac") {
+        Err(NativeAudioFormatError::UnsupportedKnown("flac"))
+    } else if lower_name.ends_with(".webm") {
+        Err(NativeAudioFormatError::UnsupportedKnown("webm"))
+    } else {
+        Err(NativeAudioFormatError::Unknown)
+    }
+}
+
+fn native_audio_input_part(
+    bytes: &[u8],
+    mime_type: Option<&str>,
+    file_name: Option<&str>,
+) -> Result<Value, NativeAudioFormatError> {
+    use base64::Engine;
+    let format = native_audio_input_format(mime_type, file_name)?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(json!({
+        "type": "input_audio",
+        "input_audio": {"data": encoded, "format": format}
+    }))
+}
+
+fn historical_native_audio_input_part(
+    bytes: &[u8],
+    mime_type: &str,
+    file_name: Option<&str>,
+) -> Result<Value, NativeAudioFormatError> {
+    native_audio_input_part(bytes, Some(mime_type), file_name)
+}
+
 const AI_PROVIDER_CONNECT_TIMEOUT_ENV: &str = "AI_PROVIDER_CONNECT_TIMEOUT_SECS";
 const IMAGE_PROVIDER_CONNECT_TIMEOUT_ENV: &str = "IMAGE_PROVIDER_CONNECT_TIMEOUT_SECS";
 const IMAGE_GENERATION_TIMEOUT_ENV: &str = "IMAGE_GENERATION_TIMEOUT_SECS";
@@ -228,13 +324,25 @@ enum AudioExecutionMode {
 fn select_audio_execution_mode(
     capability: &CapabilityRecord,
     inherited_main: bool,
+    mime_type: Option<&str>,
+    file_name: Option<&str>,
 ) -> Result<AudioExecutionMode, String> {
     let native = capability.effective_state_for(CapabilityKind::AudioInput);
     let transcription = capability.effective_state_for(CapabilityKind::AudioTranscription);
-    if inherited_main && native == CapabilityState::Supported {
+    let native_format = native_audio_input_format(mime_type, file_name);
+
+    if inherited_main
+        && native == CapabilityState::Supported
+        && native_format.is_ok()
+    {
         Ok(AudioExecutionMode::Native)
     } else if transcription == CapabilityState::Supported {
         Ok(AudioExecutionMode::Transcription)
+    } else if inherited_main && native == CapabilityState::Supported {
+        Err(format!(
+            "Main Model supports native audio, but this file cannot be represented safely by Xiao's native input_audio contract ({}) and AudioTranscription is not fresh Supported.",
+            native_format.unwrap_err()
+        ))
     } else {
         Err(
             "Audio STT route has no fresh Supported native-audio or transcription capability."
@@ -773,18 +881,19 @@ impl AIChatService {
                     }));
                 }
                 "audio" => {
-                    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-                    let format = if attachment.mime_type.contains("ogg") {
-                        "ogg"
-                    } else if attachment.mime_type.contains("wav") {
-                        "wav"
-                    } else {
-                        "mp3"
-                    };
-                    parts.push(json!({
-                        "type": "input_audio",
-                        "input_audio": {"data": encoded, "format": format}
-                    }));
+                    match historical_native_audio_input_part(
+                        &bytes,
+                        &attachment.mime_type,
+                        attachment.name.as_deref(),
+                    ) {
+                        Ok(part) => parts.push(part),
+                        Err(error) => {
+                            text.push_str(&format!(
+                                "\n[Historical audio '{}' omitted from native history: {error}.]",
+                                attachment.name.as_deref().unwrap_or("audio")
+                            ));
+                        }
+                    }
                 }
                 "video" => {
                     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
@@ -1603,7 +1712,12 @@ impl AIChatService {
         if role == ModelRole::AudioStt {
             let inherited_main = same_as_main && specialist.route_origin == RouteOrigin::MainModel;
             let audio_mode =
-                match select_audio_execution_mode(&specialist.capability, inherited_main) {
+                match select_audio_execution_mode(
+                    &specialist.capability,
+                    inherited_main,
+                    audio_mime,
+                    doc_name,
+                ) {
                     Ok(mode) => mode,
                     Err(error) => return (None, error, false),
                 };
@@ -1971,20 +2085,25 @@ impl AIChatService {
                     ]
                 }));
             } else if let Some(a_bytes) = audio_bytes.as_ref() {
-                use base64::Engine;
-                let b64_audio = base64::engine::general_purpose::STANDARD.encode(a_bytes);
-                let fmt = if audio_mime.unwrap_or("").contains("ogg") {
-                    "ogg"
-                } else {
-                    "mp3"
+                let audio_part = match native_audio_input_part(a_bytes, audio_mime, doc_name) {
+                    Ok(part) => part,
+                    Err(error) => {
+                        return (
+                            None,
+                            format!(
+                                "Native audio payload was blocked because its format cannot be represented safely: {error}."
+                            ),
+                            false,
+                        )
+                    }
                 };
                 messages.push(json!({
-                "role": "user",
-                "content": [
-                    { "type": "text", "text": enhanced_prompt },
-                    { "type": "input_audio", "input_audio": { "data": b64_audio, "format": fmt } }
-                ]
-            }));
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": enhanced_prompt },
+                        audio_part
+                    ]
+                }));
             } else {
                 messages.push(json!({
                     "role": "user",
@@ -2945,7 +3064,87 @@ mod tests {
     }
 
     #[test]
-    fn audio_execution_uses_only_fresh_effective_capability() {
+    fn native_audio_format_mapping_is_protocol_safe() {
+        for mime in ["audio/mpeg", "audio/mp3"] {
+            assert_eq!(native_audio_input_format(Some(mime), None), Ok("mp3"));
+        }
+        for mime in ["audio/wav", "audio/x-wav", "audio/wave"] {
+            assert_eq!(native_audio_input_format(Some(mime), None), Ok("wav"));
+        }
+
+        for mime in [
+            "audio/ogg",
+            "application/ogg",
+            "audio/opus",
+            "audio/mp4",
+            "audio/m4a",
+            "audio/x-m4a",
+            "audio/flac",
+            "audio/x-flac",
+            "audio/webm",
+        ] {
+            assert!(matches!(
+                native_audio_input_format(Some(mime), None),
+                Err(NativeAudioFormatError::UnsupportedKnown(_))
+            ));
+        }
+
+        assert_eq!(
+            native_audio_input_format(None, Some("voice.wav")),
+            Ok("wav")
+        );
+        assert_eq!(
+            native_audio_input_format(Some("application/octet-stream"), Some("voice.mp3")),
+            Ok("mp3")
+        );
+        assert!(matches!(
+            native_audio_input_format(Some("application/octet-stream"), Some("voice.bin")),
+            Err(NativeAudioFormatError::Unknown)
+        ));
+        assert!(matches!(
+            native_audio_input_format(None, None),
+            Err(NativeAudioFormatError::Unknown)
+        ));
+    }
+
+    #[test]
+    fn current_and_historical_native_audio_parts_share_safe_mapping() {
+        let current = native_audio_input_part(b"audio", Some("audio/mpeg"), Some("clip.mp3"))
+            .expect("mp3 should be native-safe");
+        assert_eq!(
+            current
+                .get("input_audio")
+                .and_then(|value| value.get("format"))
+                .and_then(Value::as_str),
+            Some("mp3")
+        );
+
+        let historical =
+            historical_native_audio_input_part(b"audio", "audio/x-wav", Some("clip.wav"))
+                .expect("wav should be native-safe");
+        assert_eq!(
+            historical
+                .get("input_audio")
+                .and_then(|value| value.get("format"))
+                .and_then(Value::as_str),
+            Some("wav")
+        );
+
+        for mime in [
+            "audio/ogg",
+            "application/ogg",
+            "audio/opus",
+            "audio/mp4",
+            "audio/x-m4a",
+            "audio/flac",
+            "audio/webm",
+        ] {
+            assert!(historical_native_audio_input_part(b"audio", mime, None).is_err());
+        }
+    }
+
+    #[test]
+    fn audio_execution_uses_format_and_fresh_effective_capability() {
         fn combined(
             native: (CapabilityState, chrono::Duration),
             stt: (CapabilityState, chrono::Duration),
@@ -2967,9 +3166,37 @@ mod tests {
                     (CapabilityState::Supported, fresh),
                 ),
                 true,
+                Some("audio/mpeg"),
+                Some("clip.mp3"),
             ),
             Ok(AudioExecutionMode::Native)
         );
+
+        assert_eq!(
+            select_audio_execution_mode(
+                &combined(
+                    (CapabilityState::Supported, fresh),
+                    (CapabilityState::Supported, fresh),
+                ),
+                true,
+                Some("audio/ogg"),
+                Some("voice.ogg"),
+            ),
+            Ok(AudioExecutionMode::Transcription)
+        );
+
+        let unsupported_without_stt = select_audio_execution_mode(
+            &combined(
+                (CapabilityState::Supported, fresh),
+                (CapabilityState::Unsupported, fresh),
+            ),
+            true,
+            Some("audio/webm"),
+            Some("voice.webm"),
+        )
+        .unwrap_err();
+        assert!(unsupported_without_stt.contains("cannot be represented safely"));
+
         assert_eq!(
             select_audio_execution_mode(
                 &combined(
@@ -2977,9 +3204,12 @@ mod tests {
                     (CapabilityState::Supported, fresh),
                 ),
                 true,
+                Some("audio/mpeg"),
+                Some("clip.mp3"),
             ),
             Ok(AudioExecutionMode::Transcription)
         );
+
         assert_eq!(
             select_audio_execution_mode(
                 &combined(
@@ -2987,33 +3217,20 @@ mod tests {
                     (CapabilityState::Supported, fresh),
                 ),
                 true,
+                Some("audio/wav"),
+                Some("clip.wav"),
             ),
             Ok(AudioExecutionMode::Transcription)
         );
-        assert_eq!(
-            select_audio_execution_mode(
-                &combined(
-                    (CapabilityState::Supported, fresh),
-                    (CapabilityState::Supported, stale),
-                ),
-                true,
-            ),
-            Ok(AudioExecutionMode::Native)
-        );
+
         assert!(select_audio_execution_mode(
             &combined(
                 (CapabilityState::Supported, stale),
                 (CapabilityState::Supported, stale),
             ),
             true,
-        )
-        .is_err());
-        assert!(select_audio_execution_mode(
-            &combined(
-                (CapabilityState::Unsupported, fresh),
-                (CapabilityState::Unsupported, fresh),
-            ),
-            true,
+            Some("audio/mp3"),
+            Some("clip.mp3"),
         )
         .is_err());
     }
