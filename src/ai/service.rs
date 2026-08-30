@@ -69,7 +69,9 @@ pub struct ContextStats {
     pub limit_str: String,
     pub total_messages: usize,
     pub total_turns: usize,
+    pub attachment_count: usize,
     pub total_tokens: usize,
+    pub output_reserve_tokens: usize,
     pub total_chars: usize,
     pub usage_pct: f64,
     pub progress_bar: String,
@@ -165,6 +167,16 @@ fn validate_generated_image_bytes(bytes: &[u8]) -> Result<(), String> {
 
 fn decode_generated_image_base64(encoded: &str) -> Result<Vec<u8>, ImageGenerationError> {
     use base64::Engine;
+    let max_encoded_len = MAX_GENERATED_IMAGE_BYTES
+        .saturating_mul(4)
+        .div_ceil(3)
+        .saturating_add(8);
+    if encoded.len() > max_encoded_len {
+        return Err(ImageGenerationError::new(
+            ImageGenerationErrorKind::InvalidImage,
+            "Provider mengembalikan base64 gambar melebihi batas Xiao.",
+        ));
+    }
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .map_err(|_| {
@@ -521,6 +533,7 @@ pub struct AIChatService {
     pub(super) model_routing: Arc<RwLock<ModelRoutingConfig>>,
     pub user_wizard_state: Arc<RwLock<HashMap<i64, HashMap<String, String>>>>,
     pub model_metadata: Arc<RwLock<HashMap<String, ModelMetadata>>>,
+    pub model_picker_query: Arc<RwLock<HashMap<i64, String>>>,
 }
 
 impl AIChatService {
@@ -571,6 +584,7 @@ impl AIChatService {
             model_routing: Arc::new(RwLock::new(model_routing)),
             user_wizard_state: Arc::new(RwLock::new(HashMap::new())),
             model_metadata: Arc::new(RwLock::new(HashMap::new())),
+            model_picker_query: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -1114,11 +1128,29 @@ impl AIChatService {
             });
         }
 
+        let attachment_count = active_sess
+            .messages
+            .iter()
+            .filter_map(|message| decode_user_content(&message.content))
+            .map(|persisted| persisted.attachments.len())
+            .sum();
         let total_tokens = active_sess
             .messages
             .iter()
             .map(|message| estimate_stored_content_tokens(&message.content))
             .sum();
+        let mut output_reserve_tokens = max_output_tokens_for_model(&active_model)
+            .min(limit_tokens.saturating_div(2).max(1));
+        if let Some(metadata_limit) = self
+            .model_metadata
+            .read()
+            .await
+            .get(&model_metadata_key(&endpoint, &active_model))
+            .and_then(|metadata| metadata.max_completion_tokens)
+            .filter(|limit| *limit > 0)
+        {
+            output_reserve_tokens = output_reserve_tokens.min(metadata_limit);
+        }
         let usage_pct = ((total_tokens as f64 / limit_tokens.max(1) as f64) * 100.0).min(100.0);
 
         let mut filled_blocks = (usage_pct / 10.0).floor() as usize;
@@ -1142,7 +1174,9 @@ impl AIChatService {
             limit_str,
             total_messages: active_sess.messages.len(),
             total_turns: active_sess.messages.len().div_ceil(2),
+            attachment_count,
             total_tokens,
+            output_reserve_tokens,
             total_chars,
             usage_pct,
             progress_bar: bar,
@@ -2793,6 +2827,18 @@ mod tests {
             canonical_persisted_prompt(None, "ordinary chat"),
             "ordinary chat"
         );
+    }
+
+    #[test]
+    fn generated_image_base64_rejects_oversized_input_before_decode() {
+        let oversized = "A".repeat(
+            MAX_GENERATED_IMAGE_BYTES
+                .saturating_mul(4)
+                .div_ceil(3)
+                .saturating_add(16),
+        );
+        let error = decode_generated_image_base64(&oversized).unwrap_err();
+        assert_eq!(error.kind, ImageGenerationErrorKind::InvalidImage);
     }
 
     #[test]
