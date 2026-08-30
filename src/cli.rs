@@ -1158,33 +1158,34 @@ fn addon_route_text(route: &ModelRoute, providers: &[ProviderConfig]) -> String 
 }
 
 fn print_probe_event(event: ProbeEvent) {
+    let run_status = event.run_status();
     match event {
         ProbeEvent::Started { capability } => {
-            println!("  [probe] {:?}: started", capability);
+            println!("  [{run_status:?}] {:?}: started", capability);
         }
         ProbeEvent::Progress {
             capability,
             message,
         } => {
-            println!("  [probe] {:?}: {}", capability, message);
+            println!("  [{run_status:?}] {:?}: {}", capability, message);
         }
         ProbeEvent::Completed {
             capability,
             outcome,
         } => {
-            println!("  [probe] {:?}: {:?}", capability, outcome);
+            println!("  [{run_status:?}] {:?}: {:?}", capability, outcome);
         }
         ProbeEvent::Skipped { capability, reason } => {
-            println!("  [skip] {:?}: {}", capability, reason);
+            println!("  [{run_status:?}] {:?}: {}", capability, reason);
         }
         ProbeEvent::Persistence { saved } => {
             if saved {
-                println!("  [save] capability candidate persisted");
+                println!("  [{run_status:?}] capability candidate persisted");
             } else {
-                println!("  [ERROR] capability candidate was not persisted");
+                println!("  [{run_status:?}] capability candidate was not persisted");
             }
         }
-        ProbeEvent::Finished => println!("  [done] probe completed"),
+        ProbeEvent::Finished => println!("  [{run_status:?}] probe completed"),
     }
 }
 
