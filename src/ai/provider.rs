@@ -132,14 +132,6 @@ impl CapabilityProbeResponse {
     }
 }
 
-fn capability_state(value: Option<bool>) -> CapabilityState {
-    match value {
-        Some(true) => CapabilityState::Supported,
-        Some(false) => CapabilityState::Unsupported,
-        None => CapabilityState::Unknown,
-    }
-}
-
 fn catalog_presence_text_chat_claim() -> Option<bool> {
     // Being present in GET /models is catalog evidence only.
     None
@@ -2072,44 +2064,50 @@ mod tests {
     }
 
     #[test]
-    fn main_audio_route_accepts_native_audio_or_stt_and_rejects_neither() {
-        let native = CapabilityRecord {
-            supports_audio_input: Some(true),
-            supports_audio_transcription: None,
-            ..CapabilityRecord::default()
-        };
+    fn main_audio_route_accepts_fresh_native_audio_or_stt_and_rejects_neither() {
+        fn audio_record(native: CapabilityState, stt: CapabilityState) -> CapabilityRecord {
+            let now = chrono::Utc::now().to_rfc3339();
+            CapabilityRecord {
+                evidence: vec![
+                    CapabilityEvidence {
+                        capability: CapabilityKind::AudioInput,
+                        source: CapabilityEvidenceSource::ActiveProbe,
+                        outcome: native,
+                        checked_at: now.clone(),
+                        detail: None,
+                    },
+                    CapabilityEvidence {
+                        capability: CapabilityKind::AudioTranscription,
+                        source: CapabilityEvidenceSource::ActiveProbe,
+                        outcome: stt,
+                        checked_at: now,
+                        detail: None,
+                    },
+                ],
+                ..CapabilityRecord::default()
+            }
+        }
+
         assert_eq!(
             AIChatService::required_capability_state(
                 ModelRole::AudioStt,
-                &native,
+                &audio_record(CapabilityState::Supported, CapabilityState::Unknown),
                 RouteOrigin::MainModel
             ),
             CapabilityState::Supported
         );
-
-        let stt = CapabilityRecord {
-            supports_audio_input: Some(false),
-            supports_audio_transcription: Some(true),
-            ..CapabilityRecord::default()
-        };
         assert_eq!(
             AIChatService::required_capability_state(
                 ModelRole::AudioStt,
-                &stt,
+                &audio_record(CapabilityState::Unsupported, CapabilityState::Supported),
                 RouteOrigin::MainModel
             ),
             CapabilityState::Supported
         );
-
-        let neither = CapabilityRecord {
-            supports_audio_input: Some(false),
-            supports_audio_transcription: Some(false),
-            ..CapabilityRecord::default()
-        };
         assert_eq!(
             AIChatService::required_capability_state(
                 ModelRole::AudioStt,
-                &neither,
+                &audio_record(CapabilityState::Unsupported, CapabilityState::Unsupported),
                 RouteOrigin::MainModel
             ),
             CapabilityState::Unsupported
@@ -2460,6 +2458,50 @@ mod tests {
         assert_eq!(initial_main.provider.id, "main-a");
         assert_eq!(final_main.provider.id, "main-a");
         assert_eq!(live_store.active_id.as_deref(), Some("main-b"));
+    }
+
+    #[test]
+    fn compound_image_explanation_reuses_original_main_snapshot() {
+        let mut live_store = ProviderStore {
+            active_id: Some("main-a".to_string()),
+            providers: vec![provider("main-a", "model-a"), provider("main-b", "model-b")],
+            telegram_models: Vec::new(),
+        };
+        let a = live_store.providers[0].clone();
+        let b = live_store.providers[1].clone();
+        let snapshot = GenerationModelSnapshot {
+            provider_store: live_store.clone(),
+            routing: ModelRoutingConfig::default(),
+            capabilities: CapabilityRegistry {
+                models: vec![
+                    supported_record(&a, "model-a"),
+                    supported_record(&b, "model-b"),
+                ],
+            },
+        };
+
+        let image_route = AIChatService::resolve_model_route_from_snapshot(
+            &snapshot,
+            ModelRole::ImageGeneration,
+        )
+        .unwrap();
+        assert_eq!(image_route.provider.id, "main-a");
+
+        live_store.active_id = Some("main-b".to_string());
+
+        let explanation_route =
+            AIChatService::resolve_model_route_from_snapshot(&snapshot, ModelRole::Main).unwrap();
+        assert_eq!(explanation_route.provider.id, "main-a");
+
+        let next_request = GenerationModelSnapshot {
+            provider_store: live_store,
+            routing: ModelRoutingConfig::default(),
+            capabilities: snapshot.capabilities.clone(),
+        };
+        let next_main =
+            AIChatService::resolve_model_route_from_snapshot(&next_request, ModelRole::Main)
+                .unwrap();
+        assert_eq!(next_main.provider.id, "main-b");
     }
 
     #[test]

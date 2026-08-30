@@ -2056,7 +2056,13 @@ async fn handle_ai_chat(
     timeline.start_ticker();
     let _ = bot.send_chat_action(chat_id, "typing").await;
 
-    let current_model = ai_service.get_user_model(user_id).await;
+    let current_model = if let Some(snapshot) = model_snapshot {
+        AIChatService::resolve_model_route_from_snapshot(snapshot, ai::service::ModelRole::Main)
+            .map(|route| route.model)
+            .unwrap_or_else(|_| "unavailable".to_string())
+    } else {
+        ai_service.get_user_model(user_id).await
+    };
 
     let generation_input = ai::service::GenerationInput {
                 prompt: user_prompt,
