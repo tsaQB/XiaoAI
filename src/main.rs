@@ -1849,14 +1849,7 @@ where
             if telegram_photo_delivery_error_class(&first_error) == "caption_or_markup" =>
         {
             let retry_caption = "Image generated successfully.".to_string();
-            match sender(
-                image_bytes.to_vec(),
-                Some(retry_caption),
-                None,
-                None,
-            )
-            .await
-            {
+            match sender(image_bytes.to_vec(), Some(retry_caption), None, None).await {
                 Ok(()) => Ok(()),
                 Err(second_error) => Err(ImageDeliveryFailure {
                     class: telegram_photo_delivery_error_class(&second_error),
@@ -2608,9 +2601,8 @@ async fn handle_update(
             let audio_file_name = a.file_name;
             if let Some((data, path)) = bot.get_file_bytes(&a.file_id).await {
                 audio_bytes = Some(data);
-                doc_name = audio_file_name.or_else(|| {
-                    path.split('/').next_back().map(str::to_string)
-                });
+                doc_name =
+                    audio_file_name.or_else(|| path.split('/').next_back().map(str::to_string));
             }
         } else if let Some(vid) = msg.video {
             video_duration = vid.duration;
@@ -4324,10 +4316,7 @@ mod update_lane_tests {
 
     #[test]
     fn image_caption_is_unicode_safe_bounded_and_html_escaped() {
-        let prompt = format!(
-            "{} <tag> & \"quotes\" 'single'",
-            "🌌银河系".repeat(800)
-        );
+        let prompt = format!("{} <tag> & \"quotes\" 'single'", "🌌银河系".repeat(800));
         let caption = build_image_success_caption(
             &prompt,
             "provider<&>",
@@ -4351,9 +4340,7 @@ mod update_lane_tests {
     #[test]
     fn photo_delivery_classifier_retries_only_caption_or_markup_failures() {
         assert_eq!(
-            telegram_photo_delivery_error_class(
-                "Bad Request: can't parse entities in caption"
-            ),
+            telegram_photo_delivery_error_class("Bad Request: can't parse entities in caption"),
             "caption_or_markup"
         );
         assert_eq!(
