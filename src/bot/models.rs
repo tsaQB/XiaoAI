@@ -246,6 +246,19 @@ impl RichMessageButton {
             disabled: Some(serde_json::json!({})),
         }
     }
+
+    pub fn validate(&self) -> Result<(), String> {
+        let action_count = usize::from(self.url.is_some())
+            + usize::from(self.callback_data.is_some())
+            + usize::from(self.web_app.is_some())
+            + usize::from(self.disabled.is_some());
+        if action_count != 1 {
+            return Err(format!(
+                "RichMessageButton must contain exactly one action, found {action_count}"
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -422,6 +435,26 @@ impl InputRichMessage {
             is_rtl: None,
             skip_entity_detection: None,
         }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        let representation_count = usize::from(!self.blocks.is_empty())
+            + usize::from(self.html.is_some())
+            + usize::from(self.markdown.is_some());
+        if representation_count != 1 {
+            return Err(format!(
+                "InputRichMessage must contain exactly one of blocks, html, or markdown; found {representation_count}"
+            ));
+        }
+
+        for block in &self.blocks {
+            if let RichBlock::Buttons { buttons, .. } = block {
+                for button in buttons {
+                    button.validate()?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -604,6 +637,38 @@ pub struct FileInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rich_message_requires_exactly_one_representation() {
+        let empty = InputRichMessage::default();
+        assert!(empty.validate().is_err());
+
+        let mut conflicting = InputRichMessage::new(vec![RichBlock::Paragraph {
+            text: Value::String("hello".to_string()),
+        }]);
+        conflicting.markdown = Some("hello".to_string());
+        assert!(conflicting.validate().is_err());
+
+        let valid = InputRichMessage::new(vec![RichBlock::Paragraph {
+            text: Value::String("hello".to_string()),
+        }]);
+        assert!(valid.validate().is_ok());
+    }
+
+    #[test]
+    fn rich_message_button_requires_exactly_one_action() {
+        let mut button = RichMessageButton::callback("Open", "open");
+        assert!(button.validate().is_ok());
+
+        button.url = Some("https://example.com".to_string());
+        assert!(button.validate().is_err());
+
+        button.callback_data = None;
+        assert!(button.validate().is_ok());
+
+        button.url = None;
+        assert!(button.validate().is_err());
+    }
 
     #[test]
     fn disabled_inline_button_serializes_as_empty_object() {
