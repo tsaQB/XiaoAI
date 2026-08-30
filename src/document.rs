@@ -367,9 +367,26 @@ async fn render_scanned_pdf_pages(data: &[u8], page_count: usize) -> Result<Vec<
     tokio::fs::create_dir(&temp_dir)
         .await
         .map_err(|err| format!("Gagal membuat direktori PDF sementara: {err}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&temp_dir, std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(|err| format!("Gagal mengamankan direktori PDF sementara: {err}"))?;
+    }
     if let Err(err) = tokio::fs::write(&input, data).await {
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
         return Err(format!("Gagal menulis PDF sementara: {err}"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(err) =
+            tokio::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o600)).await
+        {
+            let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+            return Err(format!("Gagal mengamankan PDF sementara: {err}"));
+        }
     }
 
     let render_result = tokio::time::timeout(PDF_RENDER_TOTAL_TIMEOUT, async {
