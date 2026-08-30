@@ -1693,6 +1693,181 @@ fn plan_image_generation_intent(text: &str) -> Option<ImageGenerationIntent> {
     })
 }
 
+const TELEGRAM_PHOTO_CAPTION_MAX_CHARS: usize = 1024;
+const IMAGE_CAPTION_PROMPT_ESCAPED_CHARS: usize = 320;
+const IMAGE_CAPTION_PROVIDER_ESCAPED_CHARS: usize = 96;
+const IMAGE_CAPTION_MODEL_ESCAPED_CHARS: usize = 128;
+const IMAGE_CAPTION_FAILURE_ESCAPED_CHARS: usize = 144;
+
+fn bounded_escaped_html(text: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    let mut used = 0usize;
+    let mut truncated = false;
+
+    for ch in text.chars() {
+        let escaped = match ch {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '"' => "&quot;",
+            '\'' => "&#39;",
+            _ => {
+                let needed = 1usize;
+                if used.saturating_add(needed) > max_chars {
+                    truncated = true;
+                    break;
+                }
+                output.push(ch);
+                used += needed;
+                continue;
+            }
+        };
+        let needed = escaped.chars().count();
+        if used.saturating_add(needed) > max_chars {
+            truncated = true;
+            break;
+        }
+        output.push_str(escaped);
+        used += needed;
+    }
+
+    if truncated && used < max_chars {
+        output.push('…');
+    }
+    output
+}
+
+fn build_image_success_caption(
+    prompt: &str,
+    provider: &str,
+    model: &str,
+    width: usize,
+    height: usize,
+    elapsed_secs: f64,
+    primary_failure: Option<&str>,
+) -> String {
+    let safe_prompt = bounded_escaped_html(prompt, IMAGE_CAPTION_PROMPT_ESCAPED_CHARS);
+    let safe_provider = bounded_escaped_html(provider, IMAGE_CAPTION_PROVIDER_ESCAPED_CHARS);
+    let safe_model = bounded_escaped_html(model, IMAGE_CAPTION_MODEL_ESCAPED_CHARS);
+    let fallback_note = primary_failure.map_or_else(String::new, |failure| {
+        let safe_failure =
+            bounded_escaped_html(failure, IMAGE_CAPTION_FAILURE_ESCAPED_CHARS);
+        format!(
+            "\n⚠️ <i>External fallback opt-in digunakan.</i>\n<b>Primary failure:</b> {safe_failure}"
+        )
+    });
+
+    let caption = format!(
+        "🫟 <b>Gambar Berhasil Dibuat!</b>\n\n\
+         📝 <b>Prompt:</b> <i>\"{safe_prompt}\"</i>\n\
+         🧩 <b>Provider:</b> <code>{safe_provider}</code>\n\
+         🤖 <b>Model:</b> <code>{safe_model}</code>\n\
+         📐 <b>Size:</b> <code>{width} × {height}</code>\n\
+         ⏱️ <b>Elapsed:</b> <code>{elapsed_secs:.1}s</code>{fallback_note}"
+    );
+
+    if caption.chars().count() <= TELEGRAM_PHOTO_CAPTION_MAX_CHARS {
+        return caption;
+    }
+
+    let minimal = format!(
+        "🫟 <b>Gambar Berhasil Dibuat!</b>\n\
+         🧩 <b>Provider:</b> <code>{safe_provider}</code>\n\
+         🤖 <b>Model:</b> <code>{safe_model}</code>\n\
+         📐 <b>Size:</b> <code>{width} × {height}</code>\n\
+         ⏱️ <b>Elapsed:</b> <code>{elapsed_secs:.1}s</code>"
+    );
+    debug_assert!(minimal.chars().count() <= TELEGRAM_PHOTO_CAPTION_MAX_CHARS);
+    minimal
+}
+
+fn telegram_photo_delivery_error_class(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    if [
+        "caption",
+        "can't parse entities",
+        "cannot parse entities",
+        "parse entities",
+        "reply markup",
+        "reply_markup",
+        "inline keyboard",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        "caption_or_markup"
+    } else if [
+        "multipart error",
+        "timeout",
+        "timed out",
+        "connection",
+        "network",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        "telegram_transport"
+    } else if lower.contains("unsupported image signature") {
+        "local_image_validation"
+    } else {
+        "telegram_api"
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImageDeliveryFailure {
+    class: &'static str,
+    detail: String,
+    retry_attempted: bool,
+}
+
+async fn deliver_generated_image_with<F, Fut>(
+    image_bytes: &[u8],
+    caption: &str,
+    reply_markup: Option<Value>,
+    mut sender: F,
+) -> Result<(), ImageDeliveryFailure>
+where
+    F: FnMut(Vec<u8>, Option<String>, Option<String>, Option<Value>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    match sender(
+        image_bytes.to_vec(),
+        Some(caption.to_string()),
+        Some("HTML".to_string()),
+        reply_markup,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(first_error)
+            if telegram_photo_delivery_error_class(&first_error) == "caption_or_markup" =>
+        {
+            let retry_caption = "Image generated successfully.".to_string();
+            match sender(
+                image_bytes.to_vec(),
+                Some(retry_caption),
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(()) => Ok(()),
+                Err(second_error) => Err(ImageDeliveryFailure {
+                    class: telegram_photo_delivery_error_class(&second_error),
+                    detail: second_error,
+                    retry_attempted: true,
+                }),
+            }
+        }
+        Err(error) => Err(ImageDeliveryFailure {
+            class: telegram_photo_delivery_error_class(&error),
+            detail: error,
+            retry_attempted: false,
+        }),
+    }
+}
+
 async fn handle_image_generation(
     bot: &TelegramBotClient,
     ai_service: &AIChatService,
@@ -1919,29 +2094,17 @@ async fn handle_image_generation(
         }
     };
 
-    let safe_prompt = escape_html(&clean_prompt);
-    let safe_provider = escape_html(&generated.provider_name);
-    let safe_model = escape_html(&generated.model);
-    let fallback_note = if generated.used_external_fallback {
-        let primary_failure = generated
-            .primary_failure
-            .as_deref()
-            .map(|failure| escape_html(&truncate_chars(failure, 160)))
-            .unwrap_or_else(|| "Primary provider failure was not reported.".to_string());
-        format!(
-            "\n⚠️ <i>External fallback opt-in digunakan.</i>\n\
-             <b>Primary failure:</b> {primary_failure}"
-        )
-    } else {
-        String::new()
-    };
-    let caption_text = format!(
-        "🫟 <b>Gambar Berhasil Dibuat!</b>\n\n\
-         📝 <b>Prompt:</b> <i>\"{safe_prompt}\"</i>\n\
-         🧩 <b>Provider:</b> <code>{safe_provider}</code>\n\
-         🤖 <b>Model:</b> <code>{safe_model}</code>\n\
-         📐 <b>Size:</b> <code>{width} × {height}</code>\n\
-         ⏱️ <b>Elapsed:</b> <code>{elapsed_secs:.1}s</code>{fallback_note}"
+    let caption_text = build_image_success_caption(
+        &clean_prompt,
+        &generated.provider_name,
+        &generated.model,
+        width,
+        height,
+        elapsed_secs,
+        generated
+            .used_external_fallback
+            .then_some(generated.primary_failure.as_deref())
+            .flatten(),
     );
 
     let img_kb = InlineKeyboardMarkup::new(vec![
@@ -1955,16 +2118,58 @@ async fn handle_image_generation(
         )],
     ]);
 
-    let _ = bot
-        .send_photo_bytes(
-            chat_id,
-            generated.bytes,
-            Some(&caption_text),
-            Some("HTML"),
-            serde_json::to_value(img_kb).ok(),
-            None,
-        )
-        .await;
+    let delivery = deliver_generated_image_with(
+        &generated.bytes,
+        &caption_text,
+        serde_json::to_value(img_kb).ok(),
+        |bytes, caption, parse_mode, reply_markup| async move {
+            bot.send_photo_bytes(
+                chat_id,
+                bytes,
+                caption.as_deref(),
+                parse_mode.as_deref(),
+                reply_markup,
+                None,
+            )
+            .await
+            .map(|_| ())
+        },
+    )
+    .await;
+
+    if let Err(failure) = delivery {
+        warn!(
+            "Generated image delivery failed [{}; retry={}]: {}",
+            failure.class,
+            failure.retry_attempted,
+            truncate_chars(&failure.detail, 200)
+        );
+        let rich = InputRichMessage::new(vec![
+            RichBlock::SectionHeading {
+                text: Value::String("IMAGE DELIVERY FAILED".to_string()),
+                level: 1,
+            },
+            RichBlock::Paragraph {
+                text: Value::String(
+                    "Image generation succeeded, but Telegram could not deliver the image."
+                        .to_string(),
+                ),
+            },
+            RichBlock::BlockQuotation {
+                blocks: vec![json!({
+                    "type": "paragraph",
+                    "text": format!("Diagnostic class: {}", failure.class)
+                })],
+            },
+        ]);
+        if let Err(error) = bot.send_rich_message(chat_id, &rich, None, None).await {
+            warn!(
+                "Image delivery fallback message also failed: {}",
+                truncate_chars(&error, 160)
+            );
+        }
+        return;
+    }
 
     if let Some(explanation_prompt) = explanation_prompt
         .map(str::trim)
@@ -4110,6 +4315,168 @@ mod update_lane_tests {
         assert!(!policy.allows_stop_chat(100));
         assert!(!policy.allows_stop_chat(200));
         assert!(!policy.allows_stop_chat(999));
+    }
+
+    #[test]
+    fn image_caption_is_unicode_safe_bounded_and_html_escaped() {
+        let prompt = format!(
+            "{} <tag> & \"quotes\" 'single'",
+            "🌌银河系".repeat(800)
+        );
+        let caption = build_image_success_caption(
+            &prompt,
+            "provider<&>",
+            "model<\"x\">&",
+            1024,
+            1024,
+            12.34,
+            Some("failure <unsafe> & detail"),
+        );
+
+        assert!(caption.chars().count() <= TELEGRAM_PHOTO_CAPTION_MAX_CHARS);
+        assert!(!caption.contains("<tag>"));
+        assert!(caption.contains("&lt;"));
+        assert!(caption.contains("&amp;"));
+        assert!(caption.contains("&quot;"));
+        assert!(!caption.contains("provider<&>"));
+        assert!(caption.is_char_boundary(caption.len()));
+    }
+
+    #[test]
+    fn photo_delivery_classifier_retries_only_caption_or_markup_failures() {
+        assert_eq!(
+            telegram_photo_delivery_error_class(
+                "Bad Request: can't parse entities in caption"
+            ),
+            "caption_or_markup"
+        );
+        assert_eq!(
+            telegram_photo_delivery_error_class("sendPhoto multipart error: timeout"),
+            "telegram_transport"
+        );
+        assert_eq!(
+            telegram_photo_delivery_error_class(
+                "sendPhoto rejected bytes with an unsupported image signature"
+            ),
+            "local_image_validation"
+        );
+    }
+
+    #[tokio::test]
+    async fn image_delivery_success_is_single_send() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_sender = Arc::clone(&calls);
+        let result = deliver_generated_image_with(
+            b"same-image-bytes",
+            "safe caption",
+            Some(json!({"inline_keyboard": []})),
+            move |_bytes, _caption, _parse_mode, _markup| {
+                let calls = Arc::clone(&calls_for_sender);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn image_delivery_caption_retry_reuses_same_bytes_without_regeneration() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex as StdMutex;
+
+        let sends = Arc::new(AtomicUsize::new(0));
+        let seen_bytes = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+        let sends_for_sender = Arc::clone(&sends);
+        let seen_for_sender = Arc::clone(&seen_bytes);
+
+        // Provider generation already happened exactly once before the delivery helper.
+        let provider_calls = AtomicUsize::new(1);
+        let result = deliver_generated_image_with(
+            b"paid-generated-image",
+            "caption",
+            Some(json!({"inline_keyboard": [["button"]]})),
+            move |bytes, _caption, _parse_mode, _markup| {
+                let sends = Arc::clone(&sends_for_sender);
+                let seen = Arc::clone(&seen_for_sender);
+                async move {
+                    let attempt = sends.fetch_add(1, Ordering::SeqCst);
+                    seen.lock().expect("seen bytes lock").push(bytes);
+                    if attempt == 0 {
+                        Err("Bad Request: can't parse entities in caption".to_string())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sends.load(Ordering::SeqCst), 2);
+        let seen = seen_bytes.lock().expect("seen bytes lock");
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0], seen[1]);
+    }
+
+    #[tokio::test]
+    async fn image_delivery_double_failure_returns_user_error_policy() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let sends = Arc::new(AtomicUsize::new(0));
+        let sends_for_sender = Arc::clone(&sends);
+        let result = deliver_generated_image_with(
+            b"image",
+            "caption",
+            None,
+            move |_bytes, _caption, _parse_mode, _markup| {
+                let sends = Arc::clone(&sends_for_sender);
+                async move {
+                    let attempt = sends.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        Err("Bad Request: caption entities are invalid".to_string())
+                    } else {
+                        Err("sendPhoto multipart error: connection".to_string())
+                    }
+                }
+            },
+        )
+        .await;
+
+        let failure = result.expect_err("second delivery should fail");
+        assert_eq!(sends.load(Ordering::SeqCst), 2);
+        assert!(failure.retry_attempted);
+        assert_eq!(failure.class, "telegram_transport");
+    }
+
+    #[test]
+    fn compound_image_handler_has_one_generation_call_and_failure_precedes_explanation() {
+        let source = include_str!("main.rs");
+        let handler_start = source
+            .find("async fn handle_image_generation(")
+            .expect("image handler");
+        let handler_end = source[handler_start..]
+            .find("// Main AI Chat Handler")
+            .map(|offset| handler_start + offset)
+            .expect("image handler end");
+        let handler = &source[handler_start..handler_end];
+
+        assert_eq!(handler.matches(".generate_image_with_snapshot(").count(), 1);
+        let failure_return = handler
+            .find("if let Err(failure) = delivery")
+            .expect("delivery failure branch");
+        let explanation = handler
+            .find("if let Some(explanation_prompt)")
+            .expect("compound explanation");
+        assert!(failure_return < explanation);
+        assert!(handler[failure_return..explanation].contains("return;"));
     }
 
     #[test]
