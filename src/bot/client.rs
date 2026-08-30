@@ -49,10 +49,7 @@ pub struct TelegramBotClient {
 }
 
 impl TelegramBotClient {
-    pub async fn with_delivery_context<F, T>(
-        context: TelegramDeliveryContext,
-        future: F,
-    ) -> T
+    pub async fn with_delivery_context<F, T>(context: TelegramDeliveryContext, future: F) -> T
     where
         F: std::future::Future<Output = T>,
     {
@@ -402,13 +399,12 @@ impl TelegramBotClient {
             .map_err(|e| e.to_string())?;
             form = form.text("ephemeral_message_parameters", ephemeral);
         }
-        let reply_parameters = if let Some(ephemeral_message_id) =
-            delivery.source_ephemeral_message_id
-        {
-            Some(ReplyParameters::ephemeral(ephemeral_message_id))
-        } else {
-            reply_to_message_id.map(ReplyParameters::new)
-        };
+        let reply_parameters =
+            if let Some(ephemeral_message_id) = delivery.source_ephemeral_message_id {
+                Some(ReplyParameters::ephemeral(ephemeral_message_id))
+            } else {
+                reply_to_message_id.map(ReplyParameters::new)
+            };
         if let Some(reply_parameters) = reply_parameters {
             form = form.text(
                 "reply_parameters",
