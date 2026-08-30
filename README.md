@@ -10,8 +10,8 @@ XiaoAI adalah bot Telegram asynchronous berbasis Rust untuk endpoint AI yang kom
 - Streaming draft jawaban AI melalui `sendRichMessageDraft`, termasuk partial answer selama provider masih menghasilkan respons.
 - Native generation stop Bot API 10.3 di private chat owner: draft memakai `can_stop`/`keep_on_stop`, lalu update `stopped_message_generation` membatalkan stream provider aktif. Di group, Stop tidak diaktifkan karena event stop tidak membawa identitas user penekan tombol.
 - Native disabled inline button dan Rich Message buttons Bot API 10.3.
-- Session persisten di SQLite dengan stable `session_id`, active-session migration, monotonic ID allocation, delete nyata, dan late-result protection.
-- Update normal diproses oleh bounded ordered queue dan generation owner diserialisasi; native Stop diproses langsung agar cancellation tetap responsif.
+- Session persisten di SQLite dengan stable `session_id`, monotonic ID allocation, dan durable `revision`/generation epoch. Rename/clear/remove/switch/append mempublikasikan perubahan ke RAM hanya setelah transaksi SQLite berhasil.
+- Telegram update masuk ke durable inbox, lalu diklasifikasikan ke **control lane** atau **generation lane**. Generation owner tetap diserialisasi, control lane tetap responsif, dan native Stop membypass kedua queue untuk cancellation segera.
 - Provider OpenAI-compatible, discovery model `/models`, STT `/audio/transcriptions`, SSE chat completion, dan image generation.
 - Owner-only authorization melalui `OWNER_USER_ID`; `ALLOWED_CHAT_IDS` hanya mengatur chat tambahan tempat owner boleh menggunakan XiaoAI.
 - Batas download media dan fallback image eksternal yang default-nya nonaktif.
@@ -47,11 +47,13 @@ Secara default owner hanya dapat menggunakan bot di private chat miliknya. Tamba
 
 ### Session identity
 
-Session tidak lagi menggunakan posisi vector sebagai identitas. `session_id` stabil disimpan di SQLite, ID baru berasal dari persistent high-water counter, session yang dihapus benar-benar dihapus dari DB, dan hasil generation yang selesai terlambat tidak boleh berpindah ke session lain.
+Session tidak lagi menggunakan posisi vector sebagai identitas. `session_id` stabil disimpan di SQLite dan ID baru berasal dari persistent high-water counter. Setiap session juga memiliki revision monotonik yang durable. Generation menangkap `(user_id, session_id, revision)`; `/clear` menaikkan revision sehingga completion lama ditolak secara transaksional, delete membuat origin tidak valid, dan switch active session tidak pernah mengalihkan late output ke session baru.
 
 ### Credential/logging
 
-URL Telegram yang mengandung bot token tidak dicetak pada error log. Hindari menjalankan binary dengan logging HTTP library yang sangat verbose bila log akan dibagikan ke pihak lain.
+URL Telegram yang mengandung bot token tidak dicetak pada error log. `BOT_TOKEN` dan API key provider tidak disimpan sebagai nilai plaintext di row konfigurasi normal. SQLite menyimpan `secret://...` reference, sedangkan secret material disimpan terpisah di `~/.local/share/xiaoai/secrets/` dengan parent directory/private-file permissions yang diperketat pada Unix. Migrasi legacy menulis dan memverifikasi secret baru sebelum menghapus row/file plaintext lama. Ini adalah isolasi file lokal, **bukan klaim enkripsi at-rest atau OS keyring**.
+
+Hindari menjalankan binary dengan logging HTTP library yang sangat verbose bila log akan dibagikan ke pihak lain.
 
 ### External image fallback
 
@@ -78,7 +80,7 @@ Mengaktifkannya berarti prompt image dapat dikirim ke provider eksternal tersebu
 - PDF text-native diekstrak lokal; DOCX dan XLSX diekstrak dari container XML dengan batas entry/worksheet untuk mencegah resource exhaustion.
 - PDF scan/image-only dirender maksimal 6 halaman melalui `pdftoppm` dan dianalisis oleh vision model. Pada Linux, instal `poppler-utils` untuk jalur ini.
 - Attachment image/audio/video dan halaman PDF scan dipersist per-session dengan permission ketat, lalu dapat direhidrasi pada turn berikutnya sesuai capability model dan budget context.
-- Capability memakai state `Supported / Unsupported / Unknown`: `/models` metadata digabung dengan probe aman untuk text, vision, tools, dan structured output. Unknown tidak dipromosikan menjadi dukungan terverifikasi.
+- Capability memakai state `Supported / Unsupported / Unknown`: `/models` metadata digabung dengan probe aman untuk text, vision, tools, dan structured output. Untuk **semua input multimodal baru maupun rehidrasi**, hanya `Some(true)` yang boleh dirutekan; `Unsupported`, `Unknown`, dan record yang hilang fail-closed sampai probe/metadata mengonfirmasi dukungan.
 
 ## Struktur Direktori
 
@@ -86,7 +88,7 @@ Mengaktifkannya berarti prompt image dapat dikirim ke provider eksternal tersebu
 XiaoAI/
 ├── Cargo.toml
 ├── src/
-│   ├── main.rs           # access policy, ordered update router, Telegram UI handlers
+│   ├── main.rs           # access policy, durable inbox router, control/generation lanes, Telegram UI
 │   ├── cli.rs            # terminal setup/provider/model/Telegram commands
 │   ├── document.rs       # text/PDF/DOCX/XLSX + scanned-PDF render pipeline
 │   ├── attachments.rs    # bounded per-session multimodal persistence
@@ -180,7 +182,11 @@ chmod +x "$PREFIX/bin/xiao"
 
 ## Reliability Notes
 
-- Runtime SQLite operations invoked by the bot are routed through `spawn_blocking`; synchronous helpers remain for startup/CLI compatibility only.
+- Runtime SQLite operations invoked by the bot are routed through `spawn_blocking`; synchronous helpers remain for startup/CLI compatibility only. Public mutations report success only after the durable write/transaction commits; irreversible attachment cleanup happens afterwards.
+- Telegram intake is durable **at-least-once** processing, not exactly-once. A claimed update keeps its payload until the completed checkpoint; startup returns abandoned `processing` rows to `pending`. Completed tombstones deduplicate Telegram redelivery. A crash after an external side effect but before the completion checkpoint can still repeat that effect, so the documentation intentionally does not claim exactly-once side effects.
+- Provider SSE handling has independent absolute ceilings for visible answer, hidden reasoning, and total streamed wire bytes. Exceeding a ceiling stops consumption and prevents a bounded/truncated turn from becoming ordinary canonical history.
+- Streaming draft rendering separates stable completed Markdown from a provisional tail. Stable content uses the normal Rich Message AST parser; the provisional tail is sanitized so incomplete `**`, backticks, headings, dividers, and links do not flash raw syntax. Completion sends one permanent canonical answer; there is no second full-draft repaint.
+- Permanent output follows `Rich AST → sendRichMessage → safe HTML chunking → semantic plain text rendered from the AST`; raw model Markdown is never the ultimate fallback. Rich Message structural budgets are validated locally before network I/O.
 - Provider retry policy covers transient connect/timeout, HTTP 408/429/502/503/504, and honors `Retry-After`. Mid-stream interruption is preserved as a partial result rather than retried blindly.
-- Media is still encoded as base64 when an OpenAI-compatible JSON payload requires it, but downloads/persistence are bounded and normal updates are serialized, preventing unbounded concurrent memory growth.
-- Context sizing remains an estimate because tokenizer behavior differs by provider, but history selection is now context-budget-aware and reserves output/system headroom.
+- Media is still encoded as base64 when an OpenAI-compatible JSON payload requires it, but downloads/persistence are bounded and owner generations are serialized, preventing unbounded concurrent generation growth.
+- Context sizing remains an estimate because tokenizer behavior differs by provider, but history selection is context-budget-aware and reserves output/system headroom.

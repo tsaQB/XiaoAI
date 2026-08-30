@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased — Post-merge P1/P2/P3 hardening
+
+### Data integrity
+- Make session/provider mutations durable-first and add SQLite transaction boundaries for clear/remove/active-session transitions.
+- Add durable per-session revisions and conditional generation append so `/clear`, delete, and session switching cannot be undone or redirected by late completions.
+- Keep attachment cleanup after the corresponding durable session transaction commits.
+
+### Security & reliability
+- Make new and rehydrated multimodal inputs fail closed unless the active capability record explicitly reports support.
+- Move provider API keys and Telegram bot token out of ordinary plaintext configuration rows into a separately permissioned local SecretStore referenced by `secret://...`; migrate legacy plaintext only after the new secret commits.
+- Retain Telegram inbox payloads through claim and recover abandoned `processing` rows, documenting the resulting at-least-once semantics instead of exactly-once.
+- Add absolute visible/reasoning/wire SSE ceilings and prevent bounded/truncated streams from becoming normal canonical history.
+- Propagate CLI/provider persistence failures instead of reporting false success.
+
+### Rendering & Telegram
+- Split streaming Markdown into stable native-Rich content plus a sanitized provisional tail so incomplete delimiters do not flash raw syntax.
+- Enforce local Rich Message structural budgets and degrade deterministically when a payload exceeds them.
+- Make permanent fallback canonical: Rich AST → safe HTML → AST-derived semantic plain text; never raw model Markdown.
+
+### Governance & validation
+- Add CODEOWNERS and document the owner-side branch-protection/ruleset settings required for `master`.
+- Keep Actions least-privilege, SHA-pinned, and checkout credentials disabled; add an explicit host `cargo build --release --locked` gate.
+
 ## 0.2.0 — Hardening & Telegram Bot API 10.3
 
 ### Security

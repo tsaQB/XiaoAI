@@ -8,7 +8,7 @@ use tracing::debug;
 
 use crate::bot::client::{TelegramBotClient, TelegramDeliveryContext};
 use crate::bot::models::{InputRichMessage, RichBlock};
-use crate::parser::parse_markdown_to_rich_blocks;
+use crate::parser::parse_streaming_markdown_to_rich_blocks;
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,7 +295,7 @@ impl ExecutionTimeline {
             // the same semantic parser used by the permanent final so users do
             // not see serialization markers such as **, ###, or --- while
             // Xiao is in the Writing state.
-            blocks.extend(parse_markdown_to_rich_blocks(&partial));
+            blocks.extend(parse_streaming_markdown_to_rich_blocks(&partial));
         }
         let rich_message = InputRichMessage::new(blocks);
 
@@ -322,7 +322,7 @@ mod tests {
     #[test]
     fn streamed_markdown_uses_native_rich_blocks() {
         let partial = "## Dua Gaya yang Bertarung\n\nOrbit itu **jatuh terus-menerus**.\n\n---\n\n1. **Gravitasi Bumi** — tarik ke bawah\n2. **Kecepatan tangensial** — dorong ke samping";
-        let blocks = parse_markdown_to_rich_blocks(partial);
+        let blocks = parse_streaming_markdown_to_rich_blocks(partial);
         let wire = serde_json::to_string(&blocks).unwrap();
 
         assert!(blocks

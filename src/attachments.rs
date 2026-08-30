@@ -131,6 +131,23 @@ pub async fn delete_session_attachments(user_id: i64, session_id: usize) {
     let _ = tokio::fs::remove_dir_all(session_dir(user_id, session_id)).await;
 }
 
+pub async fn delete_attachment_refs(
+    user_id: i64,
+    session_id: usize,
+    attachments: &[AttachmentRef],
+) {
+    let dir = session_dir(user_id, session_id);
+    for attachment in attachments {
+        if attachment.file_name.contains('/')
+            || attachment.file_name.contains('\\')
+            || attachment.file_name.contains("..")
+        {
+            continue;
+        }
+        let _ = tokio::fs::remove_file(dir.join(&attachment.file_name)).await;
+    }
+}
+
 pub fn encode_user_content(text: &str, attachments: Vec<AttachmentRef>) -> Value {
     if attachments.is_empty() {
         return Value::String(text.to_string());
