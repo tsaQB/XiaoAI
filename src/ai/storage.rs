@@ -1450,23 +1450,31 @@ pub struct CapabilityRegistry {
     pub models: Vec<CapabilityRecord>,
 }
 
+fn decode_model_routing(
+    value: Option<&str>,
+) -> (crate::ai::routing::ModelRoutingConfig, bool) {
+    match value.and_then(|value| {
+        serde_json::from_str::<crate::ai::routing::ModelRoutingConfig>(value).ok()
+    }) {
+        Some(config) => (config, false),
+        None => (crate::ai::routing::ModelRoutingConfig::default(), true),
+    }
+}
+
 pub fn load_model_routing() -> crate::ai::routing::ModelRoutingConfig {
-    if let Ok(conn) = open_session_db() {
-        if let Ok(value) = conn.query_row(
+    let stored = open_session_db().ok().and_then(|conn| {
+        conn.query_row(
             "SELECT value FROM settings WHERE key='model_routing'",
             [],
             |row| row.get::<_, String>(0),
-        ) {
-            if let Ok(config) =
-                serde_json::from_str::<crate::ai::routing::ModelRoutingConfig>(&value)
-            {
-                return config;
-            }
+        )
+        .ok()
+    });
+    let (config, needs_persist) = decode_model_routing(stored.as_deref());
+    if needs_persist {
+        if let Err(error) = save_model_routing(&config) {
+            warn!("Failed to persist default model routing: {error}");
         }
-    }
-    let config = crate::ai::routing::ModelRoutingConfig::default();
-    if let Err(error) = save_model_routing(&config) {
-        warn!("Failed to persist default model routing: {error}");
     }
     config
 }
@@ -2051,6 +2059,25 @@ mod tests {
         assert!(secret_ref.starts_with("secret://telegram/"));
         assert_eq!(read_secret_in_dir(&dir, &secret_ref).unwrap(), token);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_model_routing_migrates_to_main_model_defaults() {
+        let (routing, needs_persist) = decode_model_routing(None);
+        assert!(needs_persist);
+        for role in crate::ai::routing::ModelRole::addon_roles() {
+            assert_eq!(
+                routing.route(role),
+                Some(&crate::ai::routing::ModelRoute::MainModel)
+            );
+        }
+    }
+
+    #[test]
+    fn valid_model_routing_does_not_request_rewrite() {
+        let json = serde_json::to_string(&crate::ai::routing::ModelRoutingConfig::default()).unwrap();
+        let (_, needs_persist) = decode_model_routing(Some(&json));
+        assert!(!needs_persist);
     }
 
     #[test]
