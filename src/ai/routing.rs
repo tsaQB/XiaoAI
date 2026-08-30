@@ -24,16 +24,6 @@ impl ModelRole {
         }
     }
 
-    pub fn cli_name(self) -> &'static str {
-        match self {
-            Self::Main => "main",
-            Self::Vision => "vision",
-            Self::Video => "video",
-            Self::AudioStt => "audio_stt",
-            Self::ImageGeneration => "image_gen",
-        }
-    }
-
     pub fn display_name(self) -> &'static str {
         match self {
             Self::Main => "Main Model",
@@ -54,29 +44,16 @@ impl ModelRole {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ModelRoute {
+    #[default]
     MainModel,
     Specific { provider_id: String, model: String },
     Disabled,
 }
 
-impl Default for ModelRoute {
-    fn default() -> Self {
-        Self::MainModel
-    }
-}
-
 impl ModelRoute {
-    pub fn display(&self) -> String {
-        match self {
-            Self::MainModel => "Main Model".to_string(),
-            Self::Specific { provider_id, model } => format!("{provider_id} / {model}"),
-            Self::Disabled => "Disabled".to_string(),
-        }
-    }
-
     pub fn referenced_provider(&self) -> Option<&str> {
         match self {
             Self::Specific { provider_id, .. } => Some(provider_id),
@@ -94,7 +71,6 @@ pub enum RouteOrigin {
 
 #[derive(Debug, Clone)]
 pub struct ResolvedModelRoute {
-    pub role: ModelRole,
     pub provider: crate::ai::storage::ProviderConfig,
     pub model: String,
     pub capability: crate::ai::storage::CapabilityRecord,
