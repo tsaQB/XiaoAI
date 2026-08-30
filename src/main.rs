@@ -829,6 +829,10 @@ fn specialist_context_policy(
     }
 }
 
+fn context_available_tokens(limit: usize, used: usize) -> usize {
+    limit.saturating_sub(used)
+}
+
 fn main_context_overflow_warning(model: &str, used: usize, usable_limit: usize) -> Option<String> {
     (used > usable_limit).then(|| {
         format!(
@@ -1318,7 +1322,7 @@ async fn build_context_monitor_ui(ai_service: &AIChatService, user_id: i64) -> I
 
     let used = stats.total_tokens;
     let limit = stats.limit_tokens.max(1);
-    let available = limit.saturating_sub(used);
+    let available = context_available_tokens(limit, used);
     let progress = format!(
         "{}  ~{:.1}%  ~{} / ~{} tokens",
         stats.progress_bar, stats.usage_pct, used, limit
@@ -3925,6 +3929,17 @@ mod update_lane_tests {
             ai::service::RouteOrigin::MainModel
         )
         .starts_with("Direct on Main"));
+    }
+
+    #[test]
+    fn context_semantics_use_only_main_budget_and_never_underflow() {
+        assert_eq!(context_available_tokens(100_000, 35_000), 65_000);
+        assert_eq!(context_available_tokens(64_000, 80_000), 0);
+        assert!(specialist_context_policy(
+            ai::service::ModelRole::Vision,
+            ai::service::RouteOrigin::Specific
+        )
+        .contains("no full history"));
     }
 
     #[test]
