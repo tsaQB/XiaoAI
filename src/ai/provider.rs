@@ -462,14 +462,28 @@ pub enum ProbePlan {
     Role(ModelRole),
 }
 
-fn explicit_capability_rejection(body: &str) -> bool {
+fn explicit_capability_rejection(capability: CapabilityKind, body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
     let sample_or_protocol_shape = [
         "unsupported media type",
         "unsupported codec",
+        "codec is unsupported",
         "unsupported file type",
+        "unsupported file format",
+        "file format is unsupported",
+        "unsupported audio format",
+        "audio format is unsupported",
+        "unsupported video format",
+        "video format is unsupported",
+        "unsupported image format",
+        "image format is unsupported",
         "malformed multipart",
+        "malformed request",
+        "invalid base64",
         "invalid input_audio schema",
         "invalid input audio schema",
+        "invalid image url",
+        "invalid image_url",
         "invalid content-type",
         "invalid content type",
         "unsupported content type",
@@ -482,31 +496,83 @@ fn explicit_capability_rejection(body: &str) -> bool {
 
     let rejected = body.contains("does not support")
         || body.contains("not supported")
-        || body.contains("unsupported");
-    let capability_specific = [
-        "model",
-        "modality",
-        "audio input",
-        "audio transcription",
-        "image input",
-        "image generation",
-        "video input",
-        "vision",
-        "tool",
-        "structured output",
-    ]
-    .iter()
-    .any(|needle| body.contains(needle));
-    rejected && capability_specific
+        || body.contains("unsupported")
+        || body.contains("cannot ")
+        || body.contains("can't ");
+    if !rejected {
+        return false;
+    }
+
+    let terms: &[&str] = match capability {
+        CapabilityKind::TextChat => &[
+            "text chat",
+            "text input",
+            "chat completion",
+            "chat completions",
+        ],
+        CapabilityKind::Tools => &[
+            "tools",
+            "tool call",
+            "tool calls",
+            "function calling",
+            "function call",
+        ],
+        CapabilityKind::StructuredOutput => &[
+            "response_format",
+            "response format",
+            "json mode",
+            "structured output",
+            "structured outputs",
+        ],
+        CapabilityKind::ImageInput => &[
+            "image input",
+            "input image",
+            "image modality",
+            "vision",
+        ],
+        CapabilityKind::AudioInput => &[
+            "audio input",
+            "input audio",
+            "input_audio",
+            "audio modality",
+        ],
+        CapabilityKind::AudioTranscription => &[
+            "audio transcription",
+            "transcription",
+            "speech-to-text",
+            "speech to text",
+            "transcribe audio",
+        ],
+        CapabilityKind::VideoInput => &[
+            "video input",
+            "input video",
+            "video modality",
+        ],
+        CapabilityKind::ImageGeneration => &[
+            "image generation",
+            "images generation",
+            "generate images",
+            "image-generation",
+        ],
+        _ => &[],
+    };
+
+    terms.iter().any(|needle| body.contains(needle))
 }
 
-fn classify_probe_http_failure(status: u16, body: &str) -> CapabilityProbeResponse {
+fn classify_probe_http_failure(
+    capability: CapabilityKind,
+    status: u16,
+    body: &str,
+) -> CapabilityProbeResponse {
     match status {
         401 | 403 => CapabilityProbeResponse::Unknown(ProbeOutcome::AuthFailed),
         429 => CapabilityProbeResponse::Unknown(ProbeOutcome::RateLimited),
         500..=599 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProviderError),
         404 | 405 | 415 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch),
-        400 | 422 if explicit_capability_rejection(body) => CapabilityProbeResponse::Rejected,
+        400 | 422 if explicit_capability_rejection(capability, body) => {
+            CapabilityProbeResponse::Rejected
+        }
         400 | 422 => CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch),
         _ => CapabilityProbeResponse::Unknown(ProbeOutcome::Inconclusive),
     }
@@ -795,6 +861,7 @@ impl AIChatService {
     async fn run_capability_probe_request(
         &self,
         provider: &ProviderConfig,
+        capability: CapabilityKind,
         payload: Value,
     ) -> CapabilityProbeResponse {
         let url = format!(
@@ -835,7 +902,7 @@ impl AIChatService {
         let body = read_bounded_provider_text(response, 64 * 1024)
             .await
             .to_ascii_lowercase();
-        classify_probe_http_failure(status, &body)
+        classify_probe_http_failure(capability, status, &body)
     }
 
     async fn run_audio_input_probe_request(
@@ -846,7 +913,8 @@ impl AIChatService {
         let encoded = base64::engine::general_purpose::STANDARD.encode(spoken_probe_audio_bytes());
         self.run_capability_probe_request(
             provider,
-            json!({
+            CapabilityKind::AudioInput,
+                json!({
                 "model": model,
                 "messages": [{
                     "role": "user",
@@ -921,7 +989,7 @@ impl AIChatService {
         let body = read_bounded_provider_text(response, 64 * 1024)
             .await
             .to_ascii_lowercase();
-        classify_probe_http_failure(status, &body)
+        classify_probe_http_failure(CapabilityKind::AudioTranscription, status, &body)
     }
 
     async fn run_image_generation_probe_request(
@@ -973,7 +1041,7 @@ impl AIChatService {
         let body = read_bounded_provider_text(response, 64 * 1024)
             .await
             .to_ascii_lowercase();
-        classify_probe_http_failure(status, &body)
+        classify_probe_http_failure(CapabilityKind::ImageGeneration, status, &body)
     }
 
     pub async fn test_model_role(&self, role: ModelRole) -> Result<String, String> {
@@ -989,12 +1057,14 @@ impl AIChatService {
                 let red_probe = self
                     .run_capability_probe_request(
                         &route.provider,
+                        CapabilityKind::ImageInput,
                         vision_probe_payload(&route.model, RED_PNG_BASE64),
                     )
                     .await;
                 let blue_probe = self
                     .run_capability_probe_request(
                         &route.provider,
+                        CapabilityKind::ImageInput,
                         vision_probe_payload(&route.model, BLUE_PNG_BASE64),
                     )
                     .await;
@@ -1018,6 +1088,7 @@ impl AIChatService {
                 let probe = self
                     .run_capability_probe_request(
                         &route.provider,
+                        CapabilityKind::VideoInput,
                         video_probe_payload(&route.model),
                     )
                     .await;
@@ -1256,7 +1327,8 @@ impl AIChatService {
             let text_probe = self
                 .run_capability_probe_request(
                     provider,
-                    json!({
+                    CapabilityKind::TextChat,
+                json!({
                         "model": model,
                         "messages": [{"role": "user", "content": "Reply with exactly OK."}],
                         "stream": false,
@@ -1291,7 +1363,8 @@ impl AIChatService {
             let tools_probe = self
                 .run_capability_probe_request(
                     provider,
-                    json!({
+                    CapabilityKind::Tools,
+                json!({
                         "model": model,
                         "messages": [{
                             "role": "user",
@@ -1345,7 +1418,8 @@ impl AIChatService {
             let structured_probe = self
                 .run_capability_probe_request(
                     provider,
-                    json!({
+                    CapabilityKind::StructuredOutput,
+                json!({
                         "model": model,
                         "messages": [{
                             "role": "user",
@@ -1398,7 +1472,11 @@ impl AIChatService {
                 message: "Vision 1/2: identifying red image...".to_string(),
             });
             let red_probe = self
-                .run_capability_probe_request(provider, vision_probe_payload(model, RED_PNG_BASE64))
+                .run_capability_probe_request(
+                    provider,
+                    CapabilityKind::ImageInput,
+                    vision_probe_payload(model, RED_PNG_BASE64),
+                )
                 .await;
             observer(ProbeEvent::Progress {
                 capability: CapabilityKind::ImageInput,
@@ -1407,6 +1485,7 @@ impl AIChatService {
             let blue_probe = self
                 .run_capability_probe_request(
                     provider,
+                    CapabilityKind::ImageInput,
                     vision_probe_payload(model, BLUE_PNG_BASE64),
                 )
                 .await;
@@ -1534,7 +1613,11 @@ impl AIChatService {
                 message: "Probing video input with a tiny bounded red MP4 sample...".to_string(),
             });
             let video_probe = self
-                .run_capability_probe_request(provider, video_probe_payload(model))
+                .run_capability_probe_request(
+                    provider,
+                    CapabilityKind::VideoInput,
+                    video_probe_payload(model),
+                )
                 .await;
             let probed_video_input = validate_color_probe(&video_probe, "red");
             let metadata_video_input = modalities.contains("video").then_some(true);
@@ -2393,31 +2476,143 @@ mod tests {
     }
 
     #[test]
-    fn probe_http_semantics_distinguish_protocol_shape_from_capability_rejection() {
+    fn probe_http_semantics_are_capability_specific_and_conservative() {
         for status in [404, 405] {
             assert!(matches!(
-                classify_probe_http_failure(status, "not found"),
+                classify_probe_http_failure(CapabilityKind::ImageInput, status, "not found"),
                 CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch)
             ));
         }
         assert!(matches!(
-            classify_probe_http_failure(415, "unsupported media type"),
+            classify_probe_http_failure(
+                CapabilityKind::ImageInput,
+                415,
+                "model does not support image input"
+            ),
             CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch)
         ));
         assert!(matches!(
-            classify_probe_http_failure(422, "malformed multipart content"),
+            classify_probe_http_failure(
+                CapabilityKind::AudioTranscription,
+                422,
+                "malformed multipart content"
+            ),
             CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch)
         ));
         assert!(matches!(
-            classify_probe_http_failure(422, "model does not support audio input"),
+            classify_probe_http_failure(
+                CapabilityKind::ImageInput,
+                400,
+                "this model does not support max_tokens"
+            ),
+            CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch)
+        ));
+        assert!(matches!(
+            classify_probe_http_failure(
+                CapabilityKind::ImageInput,
+                400,
+                "this model does not support response_format"
+            ),
+            CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch)
+        ));
+        assert!(matches!(
+            classify_probe_http_failure(
+                CapabilityKind::ImageInput,
+                422,
+                "this model does not support image input"
+            ),
             CapabilityProbeResponse::Rejected
         ));
         assert!(matches!(
-            classify_probe_http_failure(429, "rate limit"),
+            classify_probe_http_failure(
+                CapabilityKind::AudioInput,
+                400,
+                "unsupported codec"
+            ),
+            CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch)
+        ));
+        assert!(matches!(
+            classify_probe_http_failure(
+                CapabilityKind::AudioInput,
+                422,
+                "model does not support audio input"
+            ),
+            CapabilityProbeResponse::Rejected
+        ));
+        assert!(matches!(
+            classify_probe_http_failure(
+                CapabilityKind::AudioTranscription,
+                400,
+                "unsupported file type"
+            ),
+            CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch)
+        ));
+        assert!(matches!(
+            classify_probe_http_failure(
+                CapabilityKind::AudioTranscription,
+                422,
+                "audio transcription is not supported for this model"
+            ),
+            CapabilityProbeResponse::Rejected
+        ));
+        assert!(matches!(
+            classify_probe_http_failure(
+                CapabilityKind::Tools,
+                400,
+                "this model does not support tools"
+            ),
+            CapabilityProbeResponse::Rejected
+        ));
+        assert!(matches!(
+            classify_probe_http_failure(
+                CapabilityKind::Tools,
+                400,
+                "this model does not support max_tokens"
+            ),
+            CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch)
+        ));
+        assert!(matches!(
+            classify_probe_http_failure(
+                CapabilityKind::StructuredOutput,
+                400,
+                "response_format is not supported"
+            ),
+            CapabilityProbeResponse::Rejected
+        ));
+        assert!(matches!(
+            classify_probe_http_failure(
+                CapabilityKind::VideoInput,
+                400,
+                "video modality unsupported"
+            ),
+            CapabilityProbeResponse::Rejected
+        ));
+        assert!(matches!(
+            classify_probe_http_failure(
+                CapabilityKind::ImageGeneration,
+                422,
+                "image generation is not supported for this model"
+            ),
+            CapabilityProbeResponse::Rejected
+        ));
+        assert!(matches!(
+            classify_probe_http_failure(CapabilityKind::Tools, 401, "unauthorized"),
+            CapabilityProbeResponse::Unknown(ProbeOutcome::AuthFailed)
+        ));
+        assert!(matches!(
+            classify_probe_http_failure(CapabilityKind::Tools, 403, "forbidden"),
+            CapabilityProbeResponse::Unknown(ProbeOutcome::AuthFailed)
+        ));
+        assert!(matches!(
+            classify_probe_http_failure(CapabilityKind::ImageInput, 429, "rate limit"),
             CapabilityProbeResponse::Unknown(ProbeOutcome::RateLimited)
         ));
         assert!(matches!(
-            classify_probe_http_failure(503, "provider unavailable"),
+            classify_probe_http_failure(
+                CapabilityKind::ImageInput,
+                503,
+                "provider unavailable"
+            ),
             CapabilityProbeResponse::Unknown(ProbeOutcome::ProviderError)
         ));
     }
