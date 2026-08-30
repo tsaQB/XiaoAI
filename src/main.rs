@@ -2548,6 +2548,10 @@ async fn main() {
     let worker_access = Arc::clone(&access);
     let worker_handle = tokio::spawn(async move {
         while let Some(update) = update_rx.recv().await {
+            let update_id = update.update_id;
+            if !ai::storage::mark_telegram_processing_async(update_id).await {
+                continue;
+            }
             handle_update(
                 &worker_bot,
                 &worker_ai,
@@ -2556,11 +2560,41 @@ async fn main() {
                 update,
             )
             .await;
+            if !ai::storage::mark_telegram_processed_async(update_id).await {
+                warn!("Gagal menyelesaikan durable Telegram inbox update {update_id}");
+            }
         }
     });
 
-    let mut offset: Option<i64> = None;
-    info!("Memulai polling pesan dengan bounded ordered update queue...");
+    let interrupted = ai::storage::quarantine_telegram_processing_async().await;
+    if interrupted > 0 {
+        warn!(
+            "{interrupted} Telegram update dikarantina karena daemon berhenti saat processing; replay otomatis dinonaktifkan untuk mencegah side effect ganda"
+        );
+    }
+
+    for record in ai::storage::pending_telegram_updates_async(500).await {
+        match serde_json::from_str::<Update>(&record.payload_json) {
+            Ok(update) => {
+                if update_tx.send(update).await.is_err() {
+                    error!("Update worker stopped while replaying durable inbox");
+                    return;
+                }
+            }
+            Err(error) => {
+                warn!(
+                    "Durable Telegram update {} tidak dapat didecode: {error}",
+                    record.update_id
+                );
+                if ai::storage::mark_telegram_processing_async(record.update_id).await {
+                    let _ = ai::storage::mark_telegram_processed_async(record.update_id).await;
+                }
+            }
+        }
+    }
+
+    let mut offset = ai::storage::load_telegram_offset_async().await;
+    info!("Memulai polling pesan dengan durable bounded ordered update queue...");
 
     loop {
         tokio::select! {
@@ -2573,18 +2607,49 @@ async fn main() {
                     Ok(resp) if resp.ok => {
                         if let Some(updates) = resp.result {
                             for update in updates {
-                                offset = Some(update.update_id + 1);
+                                let update_id = update.update_id;
+                                let payload_json = match serde_json::to_string(&update) {
+                                    Ok(payload) => payload,
+                                    Err(error) => {
+                                        error!("Gagal serialize Telegram update {update_id}: {error}");
+                                        break;
+                                    }
+                                };
+                                let Some(accepted) = ai::storage::enqueue_telegram_update_async(
+                                    update_id,
+                                    payload_json,
+                                )
+                                .await
+                                else {
+                                    // Never acknowledge a later Telegram update if the durable
+                                    // acceptance transaction for this update failed.
+                                    error!(
+                                        "Durable Telegram intake gagal untuk update {update_id}; offset tidak dimajukan"
+                                    );
+                                    break;
+                                };
+                                offset = Some(update_id.saturating_add(1));
+                                if !accepted {
+                                    continue;
+                                }
+
                                 if update.stopped_message_generation.is_some() {
-                                    // Native Stop must bypass the ordered queue so it can cancel
-                                    // the generation currently occupying the single-owner worker.
-                                    handle_update(
-                                        &bot,
-                                        &ai_service,
-                                        &user_last_image_prompt,
-                                        &access,
-                                        update,
-                                    )
-                                    .await;
+                                    // Native Stop bypasses the ordered worker so it remains
+                                    // responsive, but it still crosses the same durable claim
+                                    // boundary before any cancellation side effect.
+                                    if ai::storage::mark_telegram_processing_async(update_id).await {
+                                        handle_update(
+                                            &bot,
+                                            &ai_service,
+                                            &user_last_image_prompt,
+                                            &access,
+                                            update,
+                                        )
+                                        .await;
+                                        let _ =
+                                            ai::storage::mark_telegram_processed_async(update_id)
+                                                .await;
+                                    }
                                 } else if update_tx.send(update).await.is_err() {
                                     error!("Update worker stopped unexpectedly");
                                     return;
