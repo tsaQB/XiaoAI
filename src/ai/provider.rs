@@ -512,7 +512,6 @@ fn classify_probe_http_failure(status: u16, body: &str) -> CapabilityProbeRespon
     }
 }
 
-
 impl AIChatService {
     pub async fn reload_provider_store(&self) -> bool {
         let store = match tokio::task::spawn_blocking(load_provider_store).await {
@@ -792,7 +791,6 @@ impl AIChatService {
         *self.provider_store.write().await = candidate;
         true
     }
-
 
     async fn run_capability_probe_request(
         &self,
@@ -2478,11 +2476,9 @@ mod tests {
             },
         };
 
-        let image_route = AIChatService::resolve_model_route_from_snapshot(
-            &snapshot,
-            ModelRole::ImageGeneration,
-        )
-        .unwrap();
+        let image_route =
+            AIChatService::resolve_model_route_from_snapshot(&snapshot, ModelRole::ImageGeneration)
+                .unwrap();
         assert_eq!(image_route.provider.id, "main-a");
 
         live_store.active_id = Some("main-b".to_string());

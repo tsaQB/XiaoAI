@@ -2580,8 +2580,8 @@ impl AIChatService {
         let clean_prompt = prompt.trim();
         let route = Self::resolve_model_route_from_snapshot(snapshot, ModelRole::ImageGeneration)
             .map_err(|error| {
-                ImageGenerationError::new(classify_image_route_error(&error), error)
-            })?;
+            ImageGenerationError::new(classify_image_route_error(&error), error)
+        })?;
 
         let generation_timeout = timeout_from_env(IMAGE_GENERATION_TIMEOUT_ENV, 120);
         let protocol = ImageGenerationProtocol::OpenAiImages;
