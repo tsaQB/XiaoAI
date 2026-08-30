@@ -1,6 +1,6 @@
 # xiaochat
 
-xiaochat adalah bot Telegram asynchronous berbasis Rust untuk endpoint AI yang kompatibel dengan OpenAI. Versi 0.2.0 berfokus pada **session/data-integrity hardening, owner-only security, streaming yang dapat dibatalkan, serta integrasi fitur Telegram Bot API 10.3 yang dipakai XiaoAI**.
+xiaochat adalah bot Telegram asynchronous berbasis Rust untuk endpoint AI yang kompatibel dengan OpenAI. xiaochat v0.3.0 menambahkan **role-based multimodal model routing, observable capability discovery, model-aware image generation, dan native Rich command UI Telegram 10.3** di atas hardening session/security 0.2.0.
 
 > XiaoAI tidak mengklaim mengimplementasikan seluruh Telegram Bot API. Client hanya memodelkan method dan update yang dibutuhkan aplikasi.
 
@@ -17,9 +17,24 @@ xiaochat adalah bot Telegram asynchronous berbasis Rust untuk endpoint AI yang k
 - Batas download media dan fallback image eksternal yang default-nya nonaktif.
 - Unicode-safe truncation/prefix handling serta HTML escaping untuk data dinamis yang masuk ke `parse_mode=HTML`.
 
+
+### Routing model v0.3.0
+
+Xiao mempunyai lima role:
+
+- **Main Model** — chat/final answer dan pemilik canonical history.
+- **Vision Model** — image dan halaman PDF scan.
+- **Video Model** — video understanding.
+- **Audio STT Model** — native Main audio atau transcription route.
+- **Image Generation Model** — text-to-image.
+
+Empat addon memakai tepat tiga state: **Main Model**, **Specific Model**, atau **Disabled**. Default adalah Main Model. `Main Model` adalah referensi hidup: mengganti Main otomatis memengaruhi addon yang memakai Main, sedangkan Specific tidak berubah. Capability tetap fail-closed; route boleh tersimpan walaupun capability belum tersedia.
+
+Jika specialist berbeda provider/model, Xiao mengirim media + pertanyaan saat ini saja, menerima observation/transcript yang dibatasi, lalu meminta Main membuat jawaban final. Full session history tidak dikirim ke specialist secara default dan intermediate specialist tidak menjadi canonical assistant turn.
+
 ## Telegram Bot API 10.3 yang Digunakan
 
-XiaoAI 0.2.0 memakai subset 10.3 yang relevan untuk UI/AI flow:
+xiaochat v0.3.0 memakai subset Telegram Bot API 10.3 yang relevan untuk UI/AI flow:
 
 - `can_stop` dan `keep_on_stop` pada streaming draft.
 - update `stopped_message_generation` / `MessageGenerationStopped`.
@@ -80,7 +95,7 @@ Mengaktifkannya berarti prompt image dapat dikirim ke provider eksternal tersebu
 - PDF text-native diekstrak lokal; DOCX dan XLSX diekstrak dari container XML dengan batas entry/worksheet untuk mencegah resource exhaustion.
 - PDF scan/image-only dirender maksimal 6 halaman melalui `pdftoppm` dan dianalisis oleh vision model. Pada Linux, instal `poppler-utils` untuk jalur ini.
 - Attachment image/audio/video dan halaman PDF scan dipersist per-session dengan permission ketat, lalu dapat direhidrasi pada turn berikutnya sesuai capability model dan budget context.
-- Capability memakai state `Supported / Unsupported / Unknown`: `/models` metadata digabung dengan probe aman untuk text, vision, tools, dan structured output. Untuk **semua input multimodal baru maupun rehidrasi**, hanya `Some(true)` yang boleh dirutekan; `Unsupported`, `Unknown`, dan record yang hilang fail-closed sampai probe/metadata mengonfirmasi dukungan.
+- Capability memakai state `Supported / Unsupported / Unknown` dengan freshness per capability. `/models` hanya merupakan catalog/metadata evidence dan **tidak** otomatis membuktikan text-chat. Probe aman mencakup text, Vision merah/biru, Video MP4 kecil, tools, structured output, dan native audio/STT; active image-generation probe hanya dijalankan secara eksplisit karena dapat memakai kredit dan hasilnya harus lolos validator gambar runtime. Semua media baru maupun rehidrasi tetap fail-closed bila capability Unknown/stale.
 
 ## Struktur Direktori
 
@@ -122,9 +137,19 @@ xiao telegram owner <telegram_user_id>
 xiao model [name]
 xiao model probe
 xiao model pick
+xiao model addon
+xiao model addon set vision main
+xiao model addon set image_gen provider_id::model
+xiao model addon reset <vision|video|audio_stt|image_gen|all>
+xiao model addon disable <vision|video|audio_stt|image_gen>
+xiao model addon show <vision|video|audio_stt|image_gen>
+xiao model addon probe [role]
+xiao model addon test <role>
 xiao status
 xiao help
 ```
+
+`xiao model addon probe [role]` memperbarui dan menyimpan evidence capability yang aman; active image-generation probe tidak dijalankan oleh command ini. `xiao model addon test <role>` mengirim sample fungsional ke route yang sudah tersimpan tanpa mengubah routing; khusus Image Generation, test eksplisit dapat memakai kredit dan menyimpan evidence hasilnya.
 
 `xiao model pick` mengelola whitelist model Telegram di SQLite. File JSON legacy hanya digunakan sebagai sumber migrasi kompatibilitas bila masih ditemukan. Environment/.env dapat menjadi bootstrap input, tetapi SQLite adalah runtime source of truth.
 
@@ -140,9 +165,15 @@ AI_ENDPOINT=https://provider.example/v1
 AI_API_KEY=provider-api-key
 AI_MODEL=model-name
 IMAGE_FALLBACK_PROVIDER=none
+AI_PROVIDER_CONNECT_TIMEOUT_SECS=10
+IMAGE_PROVIDER_CONNECT_TIMEOUT_SECS=10
+IMAGE_GENERATION_TIMEOUT_SECS=120
+IMAGE_DOWNLOAD_TIMEOUT_SECS=30
 ```
 
-`AI_ENDPOINT` dan `AI_API_KEY` bersifat generik untuk endpoint OpenAI-compatible.
+`AI_ENDPOINT` dan `AI_API_KEY` dipakai untuk subset protokol OpenAI-compatible yang didukung XiaoAI (`/chat/completions`, `/audio/transcriptions`, dan `/images/generations`); ini bukan klaim dukungan untuk semua protokol/provider OpenAI-compatible.
+
+`AI_PROVIDER_CONNECT_TIMEOUT_SECS` mengatur connect timeout umum traffic AI. `IMAGE_GENERATION_TIMEOUT_SECS` dan `IMAGE_DOWNLOAD_TIMEOUT_SECS` hanya mengatur operasi image; `IMAGE_PROVIDER_CONNECT_TIMEOUT_SECS` dipertahankan sebagai knob khusus koneksi download image agar konfigurasi lama tetap aman.
 
 ## Build & Validation
 
@@ -177,7 +208,8 @@ chmod +x "$PREFIX/bin/xiao"
 | `/context` | Estimasi context dan capability |
 | `/session` | Session manager |
 | `/new` | Session baru |
-| `/clear` | Hapus history session aktif |
+| `/clear` | Hapus history session aktif setelah konfirmasi |
+| `/cancel` | Batalkan wizard/aksi interaktif; generation dibatalkan lewat native Stop Telegram |
 | `/help` | Bantuan |
 
 ## Reliability Notes
@@ -186,7 +218,9 @@ chmod +x "$PREFIX/bin/xiao"
 - Telegram intake is durable **at-least-once** processing, not exactly-once. A claimed update keeps its payload until the completed checkpoint; startup returns abandoned `processing` rows to `pending`. Completed tombstones deduplicate Telegram redelivery. A crash after an external side effect but before the completion checkpoint can still repeat that effect, so the documentation intentionally does not claim exactly-once side effects.
 - Provider SSE handling has independent absolute ceilings for visible answer, hidden reasoning, and total streamed wire bytes. Exceeding a ceiling stops consumption and prevents a bounded/truncated turn from becoming ordinary canonical history.
 - Streaming draft rendering separates stable completed Markdown from a provisional tail. Stable content uses the normal Rich Message AST parser; the provisional tail is sanitized so incomplete `**`, backticks, headings, dividers, and links do not flash raw syntax. Completion sends one permanent canonical answer; there is no second full-draft repaint.
-- Permanent output follows `Rich AST → sendRichMessage → safe HTML chunking → semantic plain text rendered from the AST`; raw model Markdown is never the ultimate fallback. Rich Message structural budgets are validated locally before network I/O.
+- Permanent chat/text output follows `Rich AST → sendRichMessage → safe HTML chunking → semantic plain text rendered from the AST`; raw model Markdown is never the ultimate fallback. Rich Message structural budgets are validated locally before network I/O.
+- Successful `/image` delivery intentionally uses a native Telegram photo message with a safe HTML caption and inline buttons. Image status/error/dashboard surfaces may use Rich Message blocks; image success is not claimed to be a Rich Message AST body.
 - Provider retry policy covers transient connect/timeout, HTTP 408/429/502/503/504, and honors `Retry-After`. Mid-stream interruption is preserved as a partial result rather than retried blindly.
 - Media is still encoded as base64 when an OpenAI-compatible JSON payload requires it, but downloads/persistence are bounded and owner generations are serialized, preventing unbounded concurrent generation growth.
+- Runtime media authorization uses fresh capability evidence, not legacy raw booleans. Evidence precedence is UserOverride > ActiveProbe > KnownProviderProfile > ProviderMetadata; TTLs are 7 days for ActiveProbe, 30 days for KnownProviderProfile, and 6 hours for ProviderMetadata, while UserOverride remains until explicitly replaced/removed.
 - Context sizing remains an estimate because tokenizer behavior differs by provider, but history selection is context-budget-aware and reserves output/system headroom.

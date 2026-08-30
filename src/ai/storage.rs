@@ -1223,32 +1223,331 @@ pub(super) async fn load_active_session_id_db_async(user_id: i64) -> Option<usiz
     .await
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityState {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityKind {
+    TextChat,
+    ImageInput,
+    ImageGeneration,
+    ImageEditing,
+    AudioInput,
+    AudioTranscription,
+    VideoInput,
+    NativeFileInput,
+    Tools,
+    StructuredOutput,
+    Reasoning,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityEvidenceSource {
+    ProviderMetadata,
+    ActiveProbe,
+    KnownProviderProfile,
+    UserOverride,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityEvidence {
+    pub capability: CapabilityKind,
+    pub source: CapabilityEvidenceSource,
+    pub outcome: CapabilityState,
+    pub checked_at: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceFreshness {
+    Fresh,
+    Stale,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeRunStatus {
+    Waiting,
+    CheckingMetadata,
+    Probing,
+    Completed,
+    Skipped,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeOutcome {
+    Supported,
+    Unsupported,
+    Inconclusive,
+    AuthFailed,
+    RateLimited,
+    Timeout,
+    NetworkError,
+    ProtocolMismatch,
+    ProviderError,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum ProbeEvent {
+    Started {
+        capability: CapabilityKind,
+    },
+    Progress {
+        capability: CapabilityKind,
+        message: String,
+    },
+    Completed {
+        capability: CapabilityKind,
+        outcome: ProbeOutcome,
+    },
+    Skipped {
+        capability: CapabilityKind,
+        reason: String,
+    },
+    Persistence {
+        saved: bool,
+    },
+    Finished,
+}
+
+impl ProbeEvent {
+    pub fn run_status(&self) -> ProbeRunStatus {
+        match self {
+            Self::Progress { message, .. } if message.starts_with("Checking provider metadata") => {
+                ProbeRunStatus::CheckingMetadata
+            }
+            Self::Progress { message, .. } if message.starts_with("Persisting") => {
+                ProbeRunStatus::Waiting
+            }
+            Self::Started { .. } | Self::Progress { .. } => ProbeRunStatus::Probing,
+            Self::Completed { .. } | Self::Finished => ProbeRunStatus::Completed,
+            Self::Skipped { .. } => ProbeRunStatus::Skipped,
+            Self::Persistence { saved: false } => ProbeRunStatus::Failed,
+            Self::Persistence { saved: true } => ProbeRunStatus::Completed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CapabilityRecord {
     pub provider_id: String,
     pub provider_name: String,
     pub model: String,
     pub context_window: Option<usize>,
+    #[serde(default, alias = "supports_text")]
+    pub supports_text_chat: Option<bool>,
+    #[serde(default, alias = "supports_image")]
+    pub supports_image_input: Option<bool>,
     #[serde(default)]
-    pub supports_text: Option<bool>,
-    pub supports_image: Option<bool>,
-    pub supports_audio: Option<bool>,
-    pub supports_video: Option<bool>,
+    pub supports_image_generation: Option<bool>,
+    #[serde(default)]
+    pub supports_image_editing: Option<bool>,
+    #[serde(default, alias = "supports_audio")]
+    pub supports_audio_input: Option<bool>,
+    #[serde(default)]
+    pub supports_audio_transcription: Option<bool>,
+    #[serde(default, alias = "supports_video")]
+    pub supports_video_input: Option<bool>,
+    #[serde(default, alias = "supports_file_input")]
+    pub supports_native_file_input: Option<bool>,
+    #[serde(default)]
     pub supports_reasoning: Option<bool>,
     #[serde(default)]
     pub supports_tools: Option<bool>,
     #[serde(default)]
     pub supports_structured_output: Option<bool>,
     #[serde(default)]
-    pub supports_file_input: Option<bool>,
+    pub evidence: Vec<CapabilityEvidence>,
+    #[serde(default)]
     pub source: String,
+    #[serde(default)]
     pub details: Vec<String>,
+    #[serde(default)]
     pub checked_at: String,
+}
+
+impl CapabilityRecord {
+    #[cfg(test)]
+    fn timestamp_freshness(checked_at: &str, ttl: std::time::Duration) -> EvidenceFreshness {
+        let Ok(checked_at) = chrono::DateTime::parse_from_rfc3339(checked_at) else {
+            return EvidenceFreshness::Stale;
+        };
+        let age = chrono::Utc::now().signed_duration_since(checked_at.with_timezone(&chrono::Utc));
+        if age.num_seconds() >= 0 && age.to_std().is_ok_and(|age| age <= ttl) {
+            EvidenceFreshness::Fresh
+        } else {
+            EvidenceFreshness::Stale
+        }
+    }
+
+    fn evidence_source_ttl(source: CapabilityEvidenceSource) -> Option<std::time::Duration> {
+        match source {
+            CapabilityEvidenceSource::ProviderMetadata => {
+                Some(std::time::Duration::from_secs(6 * 60 * 60))
+            }
+            CapabilityEvidenceSource::ActiveProbe => {
+                Some(std::time::Duration::from_secs(7 * 24 * 60 * 60))
+            }
+            CapabilityEvidenceSource::KnownProviderProfile => {
+                Some(std::time::Duration::from_secs(30 * 24 * 60 * 60))
+            }
+            CapabilityEvidenceSource::UserOverride => None,
+        }
+    }
+
+    fn evidence_source_precedence(source: CapabilityEvidenceSource) -> u8 {
+        match source {
+            CapabilityEvidenceSource::ProviderMetadata => 1,
+            CapabilityEvidenceSource::KnownProviderProfile => 2,
+            CapabilityEvidenceSource::ActiveProbe => 3,
+            CapabilityEvidenceSource::UserOverride => 4,
+        }
+    }
+
+    fn evidence_is_fresh(evidence: &CapabilityEvidence) -> bool {
+        let Ok(checked_at) = chrono::DateTime::parse_from_rfc3339(&evidence.checked_at) else {
+            return false;
+        };
+        let age = chrono::Utc::now().signed_duration_since(checked_at.with_timezone(&chrono::Utc));
+        if age.num_seconds() < 0 {
+            return false;
+        }
+        match Self::evidence_source_ttl(evidence.source) {
+            Some(ttl) => age.to_std().is_ok_and(|age| age <= ttl),
+            None => true,
+        }
+    }
+
+    pub fn effective_evidence_for(
+        &self,
+        capability: CapabilityKind,
+    ) -> Option<&CapabilityEvidence> {
+        self.evidence
+            .iter()
+            .filter(|evidence| evidence.capability == capability)
+            .filter(|evidence| Self::evidence_is_fresh(evidence))
+            .max_by(|left, right| {
+                let left_key = (
+                    Self::evidence_source_precedence(left.source),
+                    chrono::DateTime::parse_from_rfc3339(&left.checked_at)
+                        .map(|timestamp| timestamp.timestamp_millis())
+                        .unwrap_or(i64::MIN),
+                );
+                let right_key = (
+                    Self::evidence_source_precedence(right.source),
+                    chrono::DateTime::parse_from_rfc3339(&right.checked_at)
+                        .map(|timestamp| timestamp.timestamp_millis())
+                        .unwrap_or(i64::MIN),
+                );
+                left_key.cmp(&right_key)
+            })
+    }
+
+    pub fn effective_state_for(&self, capability: CapabilityKind) -> CapabilityState {
+        self.effective_evidence_for(capability)
+            .map(|evidence| evidence.outcome)
+            .unwrap_or(CapabilityState::Unknown)
+    }
+
+    #[cfg(test)]
+    pub fn freshness_for(
+        &self,
+        capability: CapabilityKind,
+        ttl: std::time::Duration,
+    ) -> EvidenceFreshness {
+        let latest = self
+            .evidence
+            .iter()
+            .filter(|evidence| evidence.capability == capability)
+            .filter_map(|evidence| {
+                chrono::DateTime::parse_from_rfc3339(&evidence.checked_at)
+                    .ok()
+                    .map(|timestamp| (timestamp, evidence.checked_at.as_str()))
+            })
+            .max_by_key(|(timestamp, _)| timestamp.timestamp_millis())
+            .map(|(_, checked_at)| checked_at);
+
+        // Freshness is strictly capability-scoped. Unrelated metadata or
+        // catalog refreshes must never re-authorize stale legacy or missing
+        // capability evidence. If no typed evidence exists for this capability,
+        // it is always Stale (fail-closed).
+        match latest {
+            Some(checked_at) => Self::timestamp_freshness(checked_at, ttl),
+            None => EvidenceFreshness::Stale,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CapabilityRegistry {
     pub models: Vec<CapabilityRecord>,
+}
+
+fn decode_model_routing(value: Option<&str>) -> (crate::ai::routing::ModelRoutingConfig, bool) {
+    match value.and_then(|value| {
+        serde_json::from_str::<crate::ai::routing::ModelRoutingConfig>(value).ok()
+    }) {
+        Some(config) => (config, false),
+        None => (crate::ai::routing::ModelRoutingConfig::default(), true),
+    }
+}
+
+pub fn load_model_routing() -> crate::ai::routing::ModelRoutingConfig {
+    let stored = open_session_db().ok().and_then(|conn| {
+        conn.query_row(
+            "SELECT value FROM settings WHERE key='model_routing'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    });
+    let (config, needs_persist) = decode_model_routing(stored.as_deref());
+    if needs_persist {
+        if let Err(error) = save_model_routing(&config) {
+            warn!("Failed to persist default model routing: {error}");
+        }
+    }
+    config
+}
+
+pub fn save_model_routing(config: &crate::ai::routing::ModelRoutingConfig) -> std::io::Result<()> {
+    let value = serde_json::to_string_pretty(config)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let conn = open_session_db().map_err(|error| std::io::Error::other(error.to_string()))?;
+    conn.execute(
+        "INSERT INTO settings(key,value) VALUES('model_routing',?1) \
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![value],
+    )
+    .map(|_| ())
+    .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
+pub(super) async fn persist_model_routing(config: crate::ai::routing::ModelRoutingConfig) -> bool {
+    match tokio::task::spawn_blocking(move || save_model_routing(&config)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            warn!("Failed to persist model routing: {error}");
+            false
+        }
+        Err(error) => {
+            warn!("Model routing persistence task failed: {error}");
+            false
+        }
+    }
 }
 
 pub fn get_capability_registry_path() -> std::path::PathBuf {
@@ -1302,13 +1601,6 @@ pub(super) async fn persist_capability_registry(registry: CapabilityRegistry) ->
             false
         }
     }
-}
-
-pub(super) async fn load_app_setting_async(key: &'static str) -> Option<String> {
-    tokio::task::spawn_blocking(move || load_app_setting(key))
-        .await
-        .ok()
-        .flatten()
 }
 
 fn secret_setting_namespace(key: &str) -> Option<&'static str> {
@@ -1804,6 +2096,345 @@ mod tests {
         assert!(secret_ref.starts_with("secret://telegram/"));
         assert_eq!(read_secret_in_dir(&dir, &secret_ref).unwrap(), token);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_model_routing_migrates_to_main_model_defaults() {
+        let (routing, needs_persist) = decode_model_routing(None);
+        assert!(needs_persist);
+        for role in crate::ai::routing::ModelRole::addon_roles() {
+            assert_eq!(
+                routing.route(role),
+                Some(&crate::ai::routing::ModelRoute::MainModel)
+            );
+        }
+    }
+
+    #[test]
+    fn valid_model_routing_does_not_request_rewrite() {
+        let json =
+            serde_json::to_string(&crate::ai::routing::ModelRoutingConfig::default()).unwrap();
+        let (_, needs_persist) = decode_model_routing(Some(&json));
+        assert!(!needs_persist);
+    }
+
+    #[test]
+    fn capability_freshness_is_scoped_to_its_own_evidence() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let old = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        let record = CapabilityRecord {
+            supports_text_chat: Some(true),
+            supports_image_generation: Some(true),
+            checked_at: now.clone(),
+            evidence: vec![
+                CapabilityEvidence {
+                    capability: CapabilityKind::TextChat,
+                    source: CapabilityEvidenceSource::ActiveProbe,
+                    outcome: CapabilityState::Supported,
+                    checked_at: now,
+                    detail: None,
+                },
+                CapabilityEvidence {
+                    capability: CapabilityKind::ImageGeneration,
+                    source: CapabilityEvidenceSource::ActiveProbe,
+                    outcome: CapabilityState::Supported,
+                    checked_at: old,
+                    detail: None,
+                },
+            ],
+            ..CapabilityRecord::default()
+        };
+        let ttl = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+        assert_eq!(
+            record.freshness_for(CapabilityKind::TextChat, ttl),
+            EvidenceFreshness::Fresh
+        );
+        assert_eq!(
+            record.freshness_for(CapabilityKind::ImageGeneration, ttl),
+            EvidenceFreshness::Stale
+        );
+        assert_eq!(
+            record.freshness_for(CapabilityKind::AudioTranscription, ttl),
+            EvidenceFreshness::Stale
+        );
+    }
+
+    #[test]
+    fn source_aware_freshness_uses_each_evidence_own_ttl() {
+        let now = chrono::Utc::now();
+        let record = CapabilityRecord {
+            evidence: vec![
+                CapabilityEvidence {
+                    capability: CapabilityKind::ImageInput,
+                    source: CapabilityEvidenceSource::ActiveProbe,
+                    outcome: CapabilityState::Unsupported,
+                    checked_at: (now - chrono::Duration::days(8)).to_rfc3339(),
+                    detail: None,
+                },
+                CapabilityEvidence {
+                    capability: CapabilityKind::ImageInput,
+                    source: CapabilityEvidenceSource::ProviderMetadata,
+                    outcome: CapabilityState::Supported,
+                    checked_at: (now - chrono::Duration::hours(2)).to_rfc3339(),
+                    detail: None,
+                },
+            ],
+            ..CapabilityRecord::default()
+        };
+        assert_eq!(
+            record.effective_state_for(CapabilityKind::ImageInput),
+            CapabilityState::Supported
+        );
+    }
+
+    #[test]
+    fn fresh_active_probe_remains_authoritative_when_metadata_is_stale() {
+        let now = chrono::Utc::now();
+        let record = CapabilityRecord {
+            evidence: vec![
+                CapabilityEvidence {
+                    capability: CapabilityKind::ImageInput,
+                    source: CapabilityEvidenceSource::ActiveProbe,
+                    outcome: CapabilityState::Supported,
+                    checked_at: (now - chrono::Duration::days(1)).to_rfc3339(),
+                    detail: None,
+                },
+                CapabilityEvidence {
+                    capability: CapabilityKind::ImageInput,
+                    source: CapabilityEvidenceSource::ProviderMetadata,
+                    outcome: CapabilityState::Unsupported,
+                    checked_at: (now - chrono::Duration::hours(7)).to_rfc3339(),
+                    detail: None,
+                },
+            ],
+            ..CapabilityRecord::default()
+        };
+        assert_eq!(
+            record.effective_state_for(CapabilityKind::ImageInput),
+            CapabilityState::Supported
+        );
+    }
+
+    #[test]
+    fn fresh_active_probe_overrides_fresh_metadata_deterministically() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let record = CapabilityRecord {
+            evidence: vec![
+                CapabilityEvidence {
+                    capability: CapabilityKind::AudioInput,
+                    source: CapabilityEvidenceSource::ProviderMetadata,
+                    outcome: CapabilityState::Supported,
+                    checked_at: now.clone(),
+                    detail: None,
+                },
+                CapabilityEvidence {
+                    capability: CapabilityKind::AudioInput,
+                    source: CapabilityEvidenceSource::ActiveProbe,
+                    outcome: CapabilityState::Unsupported,
+                    checked_at: now,
+                    detail: None,
+                },
+            ],
+            ..CapabilityRecord::default()
+        };
+        assert_eq!(
+            record.effective_state_for(CapabilityKind::AudioInput),
+            CapabilityState::Unsupported
+        );
+    }
+
+    #[test]
+    fn stale_metadata_does_not_inherit_active_probe_ttl() {
+        let now = chrono::Utc::now();
+        let record = CapabilityRecord {
+            evidence: vec![
+                CapabilityEvidence {
+                    capability: CapabilityKind::VideoInput,
+                    source: CapabilityEvidenceSource::ProviderMetadata,
+                    outcome: CapabilityState::Supported,
+                    checked_at: (now - chrono::Duration::hours(7)).to_rfc3339(),
+                    detail: None,
+                },
+                CapabilityEvidence {
+                    capability: CapabilityKind::VideoInput,
+                    source: CapabilityEvidenceSource::ActiveProbe,
+                    outcome: CapabilityState::Supported,
+                    checked_at: (now - chrono::Duration::days(8)).to_rfc3339(),
+                    detail: None,
+                },
+            ],
+            ..CapabilityRecord::default()
+        };
+        assert_eq!(
+            record.effective_state_for(CapabilityKind::VideoInput),
+            CapabilityState::Unknown
+        );
+    }
+
+    #[test]
+    fn unrelated_fresh_probe_cannot_refresh_other_capability_metadata() {
+        let now = chrono::Utc::now();
+        let record = CapabilityRecord {
+            evidence: vec![
+                CapabilityEvidence {
+                    capability: CapabilityKind::TextChat,
+                    source: CapabilityEvidenceSource::ActiveProbe,
+                    outcome: CapabilityState::Supported,
+                    checked_at: now.to_rfc3339(),
+                    detail: None,
+                },
+                CapabilityEvidence {
+                    capability: CapabilityKind::ImageInput,
+                    source: CapabilityEvidenceSource::ProviderMetadata,
+                    outcome: CapabilityState::Supported,
+                    checked_at: (now - chrono::Duration::hours(7)).to_rfc3339(),
+                    detail: None,
+                },
+            ],
+            ..CapabilityRecord::default()
+        };
+        assert_eq!(
+            record.effective_state_for(CapabilityKind::ImageInput),
+            CapabilityState::Unknown
+        );
+        assert_eq!(
+            record.effective_state_for(CapabilityKind::TextChat),
+            CapabilityState::Supported
+        );
+    }
+
+    #[test]
+    fn legacy_capability_fields_migrate_without_granting_new_capabilities() {
+        let legacy = serde_json::json!({
+            "provider_id": "legacy-provider",
+            "provider_name": "Legacy",
+            "model": "legacy-model",
+            "supports_text": true,
+            "supports_image": true,
+            "supports_audio": true,
+            "supports_video": false,
+            "supports_file_input": true
+        });
+        let record: CapabilityRecord = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(record.supports_text_chat, Some(true));
+        assert_eq!(record.supports_image_input, Some(true));
+        assert_eq!(record.supports_audio_input, Some(true));
+        assert_eq!(record.supports_video_input, Some(false));
+        assert_eq!(record.supports_native_file_input, Some(true));
+        assert_eq!(record.supports_image_generation, None);
+        assert_eq!(record.supports_image_editing, None);
+        assert_eq!(record.supports_audio_transcription, None);
+    }
+
+    #[test]
+    fn legacy_supports_image_without_evidence_and_stale_timestamp_remains_stale() {
+        let old = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        let record = CapabilityRecord {
+            supports_image_input: Some(true),
+            evidence: Vec::new(),
+            checked_at: old,
+            ..CapabilityRecord::default()
+        };
+        let ttl = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+        assert_eq!(
+            record.freshness_for(CapabilityKind::ImageInput, ttl),
+            EvidenceFreshness::Stale
+        );
+    }
+
+    #[test]
+    fn legacy_audio_not_refreshed_by_unrelated_text_metadata() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let record = CapabilityRecord {
+            supports_audio_input: Some(true),
+            evidence: vec![CapabilityEvidence {
+                capability: CapabilityKind::TextChat,
+                source: CapabilityEvidenceSource::ProviderMetadata,
+                outcome: CapabilityState::Supported,
+                checked_at: now.clone(),
+                detail: None,
+            }],
+            checked_at: now,
+            ..CapabilityRecord::default()
+        };
+        let ttl = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+        assert_eq!(
+            record.freshness_for(CapabilityKind::AudioInput, ttl),
+            EvidenceFreshness::Stale
+        );
+        assert_eq!(
+            record.freshness_for(CapabilityKind::TextChat, ttl),
+            EvidenceFreshness::Fresh
+        );
+    }
+
+    #[test]
+    fn fresh_provider_metadata_specifically_for_image_input_is_fresh() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let record = CapabilityRecord {
+            supports_image_input: Some(true),
+            evidence: vec![CapabilityEvidence {
+                capability: CapabilityKind::ImageInput,
+                source: CapabilityEvidenceSource::ProviderMetadata,
+                outcome: CapabilityState::Supported,
+                checked_at: now.clone(),
+                detail: Some("modalities: text,image".to_string()),
+            }],
+            checked_at: now,
+            ..CapabilityRecord::default()
+        };
+        let ttl = std::time::Duration::from_secs(6 * 60 * 60);
+        assert_eq!(
+            record.freshness_for(CapabilityKind::ImageInput, ttl),
+            EvidenceFreshness::Fresh
+        );
+    }
+
+    #[test]
+    fn fresh_text_chat_evidence_does_not_make_image_generation_fresh() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let record = CapabilityRecord {
+            supports_text_chat: Some(true),
+            supports_image_generation: Some(true),
+            evidence: vec![CapabilityEvidence {
+                capability: CapabilityKind::TextChat,
+                source: CapabilityEvidenceSource::ActiveProbe,
+                outcome: CapabilityState::Supported,
+                checked_at: now.clone(),
+                detail: None,
+            }],
+            checked_at: now,
+            ..CapabilityRecord::default()
+        };
+        let ttl = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+        assert_eq!(
+            record.freshness_for(CapabilityKind::ImageGeneration, ttl),
+            EvidenceFreshness::Stale
+        );
+    }
+
+    #[test]
+    fn stale_active_probe_for_image_generation_with_fresh_model_catalog_metadata_stays_stale() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let old = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        let record = CapabilityRecord {
+            supports_image_generation: Some(true),
+            evidence: vec![CapabilityEvidence {
+                capability: CapabilityKind::ImageGeneration,
+                source: CapabilityEvidenceSource::ActiveProbe,
+                outcome: CapabilityState::Supported,
+                checked_at: old,
+                detail: None,
+            }],
+            checked_at: now,
+            ..CapabilityRecord::default()
+        };
+        let ttl = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+        assert_eq!(
+            record.freshness_for(CapabilityKind::ImageGeneration, ttl),
+            EvidenceFreshness::Stale
+        );
     }
 
     #[cfg(unix)]
