@@ -1,9 +1,7 @@
 use regex::Regex;
 use serde_json::{json, Value};
 
-use crate::bot::models::{
-    InputRichMessage, RichBlock, RichBlockListItem, RichBlockTableCell,
-};
+use crate::bot::models::{InputRichMessage, RichBlock, RichBlockListItem, RichBlockTableCell};
 
 pub fn parse_inline(input_str: &str) -> Value {
     if input_str.is_empty() {
