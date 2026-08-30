@@ -1325,9 +1325,7 @@ pub enum ProbeEvent {
 impl ProbeEvent {
     pub fn run_status(&self) -> ProbeRunStatus {
         match self {
-            Self::Progress { message, .. }
-                if message.starts_with("Checking provider metadata") =>
-            {
+            Self::Progress { message, .. } if message.starts_with("Checking provider metadata") => {
                 ProbeRunStatus::CheckingMetadata
             }
             Self::Progress { message, .. } if message.starts_with("Persisting") => {
