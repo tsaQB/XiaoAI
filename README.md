@@ -1,6 +1,6 @@
-# XiaoAI 0.2.0
+# xiaochat
 
-XiaoAI adalah bot Telegram asynchronous berbasis Rust untuk endpoint AI yang kompatibel dengan OpenAI. Versi 0.2.0 berfokus pada **session/data-integrity hardening, owner-only security, streaming yang dapat dibatalkan, serta integrasi fitur Telegram Bot API 10.3 yang dipakai XiaoAI**.
+xiaochat adalah bot Telegram asynchronous berbasis Rust untuk endpoint AI yang kompatibel dengan OpenAI. Versi 0.2.0 berfokus pada **session/data-integrity hardening, owner-only security, streaming yang dapat dibatalkan, serta integrasi fitur Telegram Bot API 10.3 yang dipakai XiaoAI**.
 
 > XiaoAI tidak mengklaim mengimplementasikan seluruh Telegram Bot API. Client hanya memodelkan method dan update yang dibutuhkan aplikasi.
 
