@@ -1003,15 +1003,6 @@ impl AIChatService {
         }
     }
 
-    pub async fn probe_model_capabilities(
-        &self,
-        provider: &ProviderConfig,
-        model: &str,
-    ) -> CapabilityRecord {
-        self.probe_model_capabilities_with_observer(provider, model, |_| {})
-            .await
-    }
-
     pub async fn probe_model_capabilities_with_observer<F>(
         &self,
         provider: &ProviderConfig,
