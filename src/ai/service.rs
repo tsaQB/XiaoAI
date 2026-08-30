@@ -163,19 +163,52 @@ fn validate_generated_image_bytes(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-async fn download_generated_image(url: &str) -> Result<Vec<u8>, ImageGenerationError> {
+fn decode_generated_image_base64(encoded: &str) -> Result<Vec<u8>, ImageGenerationError> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| {
+            ImageGenerationError::new(
+                ImageGenerationErrorKind::InvalidBase64,
+                "Provider mengembalikan base64 gambar yang rusak.",
+            )
+        })?;
+    validate_generated_image_bytes(&bytes)
+        .map_err(|error| ImageGenerationError::new(ImageGenerationErrorKind::InvalidImage, error))?;
+    Ok(bytes)
+}
+
+fn parse_generated_image_url(url: &str) -> Result<url::Url, ImageGenerationError> {
     let parsed = url::Url::parse(url).map_err(|_| {
         ImageGenerationError::new(
             ImageGenerationErrorKind::UnsafeImageUrl,
             "provider returned an invalid image URL",
         )
     })?;
-    if !matches!(parsed.scheme(), "http" | "https") {
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
         return Err(ImageGenerationError::new(
             ImageGenerationErrorKind::UnsafeImageUrl,
-            "provider image URL must use http or https",
+            "provider image URL must use http or https with a host",
         ));
     }
+    Ok(parsed)
+}
+
+fn timeout_image_error(label: &str, timeout: Duration) -> ImageGenerationError {
+    ImageGenerationError::new(
+        ImageGenerationErrorKind::Timeout,
+        format!("{label} melewati batas waktu {} detik.", timeout.as_secs()),
+    )
+}
+
+fn signal_generation_cancel(sender: Option<GenerationCancelSender>) -> bool {
+    sender
+        .map(|sender| sender.send(true).is_ok())
+        .unwrap_or(false)
+}
+
+async fn download_generated_image(url: &str) -> Result<Vec<u8>, ImageGenerationError> {
+    let parsed = parse_generated_image_url(url)?;
     let host = parsed.host_str().ok_or_else(|| {
         ImageGenerationError::new(
             ImageGenerationErrorKind::UnsafeImageUrl,
@@ -999,9 +1032,7 @@ impl AIChatService {
             .await
             .get(&(chat_id, draft_id))
             .cloned();
-        sender
-            .map(|sender| sender.send(true).is_ok())
-            .unwrap_or(false)
+        signal_generation_cancel(sender)
     }
 
     pub async fn end_generation(&self, chat_id: i64, draft_id: i64) {
@@ -2420,12 +2451,9 @@ impl AIChatService {
             }
             response = req.send() => {
                 match response {
-                    Err(error) if error.is_timeout() => Err(ImageGenerationError::new(
-                        ImageGenerationErrorKind::Timeout,
-                        format!(
-                            "Image Generation Model melewati batas waktu {} detik.",
-                            generation_timeout.as_secs()
-                        ),
+                    Err(error) if error.is_timeout() => Err(timeout_image_error(
+                        "Image Generation Model",
+                        generation_timeout,
                     )),
                     Err(error) => Err(ImageGenerationError::new(
                         ImageGenerationErrorKind::Provider,
@@ -2473,22 +2501,7 @@ impl AIChatService {
                         let bytes = if let Some(encoded) =
                             data.get("b64_json").and_then(|value| value.as_str())
                         {
-                            use base64::Engine;
-                            let bytes = base64::engine::general_purpose::STANDARD
-                                .decode(encoded)
-                                .map_err(|_| {
-                                    ImageGenerationError::new(
-                                        ImageGenerationErrorKind::InvalidBase64,
-                                        "Provider mengembalikan base64 gambar yang rusak.",
-                                    )
-                                })?;
-                            validate_generated_image_bytes(&bytes).map_err(|error| {
-                                ImageGenerationError::new(
-                                    ImageGenerationErrorKind::InvalidImage,
-                                    error,
-                                )
-                            })?;
-                            bytes
+                            decode_generated_image_base64(encoded)?
                         } else if let Some(url) = data.get("url").and_then(|value| value.as_str()) {
                             download_generated_image(url).await?
                         } else {
@@ -2779,6 +2792,45 @@ mod tests {
             canonical_persisted_prompt(None, "ordinary chat"),
             "ordinary chat"
         );
+    }
+
+    #[test]
+    fn generated_image_base64_validation_is_typed() {
+        let error = decode_generated_image_base64("%%%not-base64%%%").unwrap_err();
+        assert_eq!(error.kind, ImageGenerationErrorKind::InvalidBase64);
+
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(b"\x89PNG\r\n\x1a\nrest");
+        assert!(decode_generated_image_base64(&encoded).is_ok());
+    }
+
+    #[test]
+    fn generated_image_url_validation_rejects_unsafe_schemes_and_private_ips() {
+        assert_eq!(
+            parse_generated_image_url("file:///etc/passwd").unwrap_err().kind,
+            ImageGenerationErrorKind::UnsafeImageUrl
+        );
+        assert!(parse_generated_image_url("https://example.com/image.png").is_ok());
+        assert!(is_unsafe_remote_ip("127.0.0.1".parse().unwrap()));
+        assert!(is_unsafe_remote_ip("10.1.2.3".parse().unwrap()));
+        assert!(is_unsafe_remote_ip("::1".parse().unwrap()));
+        assert!(!is_unsafe_remote_ip("1.1.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn image_timeout_is_a_typed_timeout_not_unsupported() {
+        let error = timeout_image_error("Image Generation Model", Duration::from_secs(120));
+        assert_eq!(error.kind, ImageGenerationErrorKind::Timeout);
+        assert!(error.message.contains("120"));
+    }
+
+    #[tokio::test]
+    async fn generation_cancel_signal_reaches_registered_receiver() {
+        let (sender, mut receiver) = watch::channel(false);
+        assert!(signal_generation_cancel(Some(sender)));
+        receiver.changed().await.unwrap();
+        assert!(*receiver.borrow());
     }
 
     #[test]
