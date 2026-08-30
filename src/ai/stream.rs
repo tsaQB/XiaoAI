@@ -111,9 +111,7 @@ mod tests {
     #[test]
     fn joins_multiline_data_events() {
         let mut decoder = SseDecoder::default();
-        let events = decoder
-            .push(b"data: {\"a\":\ndata: 1}\n\n")
-            .unwrap();
+        let events = decoder.push(b"data: {\"a\":\ndata: 1}\n\n").unwrap();
         assert_eq!(events, vec![StreamEvent::Json(json!({"a": 1}))]);
     }
 
@@ -137,8 +135,6 @@ mod tests {
         assert!(invalid.push(b"data: \xff\n").is_err());
 
         let mut oversized = SseDecoder::default();
-        assert!(oversized
-            .push(&vec![b'x'; MAX_SSE_LINE_BYTES + 1])
-            .is_err());
+        assert!(oversized.push(&vec![b'x'; MAX_SSE_LINE_BYTES + 1]).is_err());
     }
 }
