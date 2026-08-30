@@ -1134,10 +1134,18 @@ async fn build_model_dashboard_ui(ai_service: &AIChatService, user_id: i64) -> I
             })],
         },
         RichBlock::Buttons {
-            buttons: vec![
-                RichMessageButton::callback_styled("Change Main", "model_change_main", "primary"),
-                RichMessageButton::callback("Refresh", "model_dashboard"),
-            ],
+            buttons: {
+                let mut buttons = Vec::new();
+                if telegram_can_edit_model_role(ai::service::ModelRole::Main) {
+                    buttons.push(RichMessageButton::callback_styled(
+                        "Change Main",
+                        "model_change_main",
+                        "primary",
+                    ));
+                }
+                buttons.push(RichMessageButton::callback("Refresh", "model_dashboard"));
+                buttons
+            },
             align: Some("center".to_string()),
         },
     ])
