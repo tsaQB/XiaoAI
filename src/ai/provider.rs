@@ -110,9 +110,7 @@ use super::capability::{
     get_model_capabilities_with_meta, model_metadata_key, ModelCapability, ModelMetadata,
 };
 use super::routing::{ModelRole, ModelRoute, ModelRoutingConfig, ResolvedModelRoute, RouteOrigin};
-use super::service::{
-    decode_generated_image_base64, download_generated_image, AIChatService,
-};
+use super::service::{decode_generated_image_base64, download_generated_image, AIChatService};
 use super::storage::{
     load_provider_store, persist_capability_registry, persist_model_routing,
     persist_provider_state, CapabilityEvidence, CapabilityEvidenceSource, CapabilityKind,
@@ -1861,7 +1859,9 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap();
         let encoded = url.strip_prefix("data:video/mp4;base64,").unwrap();
-        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
         assert!(bytes.len() < 2 * 1024);
         assert_eq!(&bytes[4..8], b"ftyp");
     }
