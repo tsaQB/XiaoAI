@@ -1744,18 +1744,23 @@ fn build_image_success_caption(
     width: usize,
     height: usize,
     elapsed_secs: f64,
+    used_external_fallback: bool,
     primary_failure: Option<&str>,
 ) -> String {
     let safe_prompt = bounded_escaped_html(prompt, IMAGE_CAPTION_PROMPT_ESCAPED_CHARS);
     let safe_provider = bounded_escaped_html(provider, IMAGE_CAPTION_PROVIDER_ESCAPED_CHARS);
     let safe_model = bounded_escaped_html(model, IMAGE_CAPTION_MODEL_ESCAPED_CHARS);
-    let fallback_note = primary_failure.map_or_else(String::new, |failure| {
-        let safe_failure =
-            bounded_escaped_html(failure, IMAGE_CAPTION_FAILURE_ESCAPED_CHARS);
+    let fallback_note = if used_external_fallback {
+        let safe_failure = bounded_escaped_html(
+            primary_failure.unwrap_or("Primary provider failure was not reported."),
+            IMAGE_CAPTION_FAILURE_ESCAPED_CHARS,
+        );
         format!(
             "\n⚠️ <i>External fallback opt-in digunakan.</i>\n<b>Primary failure:</b> {safe_failure}"
         )
-    });
+    } else {
+        String::new()
+    };
 
     let caption = format!(
         "🫟 <b>Gambar Berhasil Dibuat!</b>\n\n\
@@ -2101,10 +2106,8 @@ async fn handle_image_generation(
         width,
         height,
         elapsed_secs,
-        generated
-            .used_external_fallback
-            .then_some(generated.primary_failure.as_deref())
-            .flatten(),
+        generated.used_external_fallback,
+        generated.primary_failure.as_deref(),
     );
 
     let img_kb = InlineKeyboardMarkup::new(vec![
@@ -2595,14 +2598,19 @@ async fn handle_update(
         if let Some(v) = msg.voice {
             audio_duration = v.duration;
             audio_mime = v.mime_type;
-            if let Some((data, _)) = bot.get_file_bytes(&v.file_id).await {
+            if let Some((data, path)) = bot.get_file_bytes(&v.file_id).await {
                 audio_bytes = Some(data);
+                doc_name = path.split('/').next_back().map(str::to_string);
             }
         } else if let Some(a) = msg.audio {
             audio_duration = a.duration;
             audio_mime = a.mime_type;
-            if let Some((data, _)) = bot.get_file_bytes(&a.file_id).await {
+            let audio_file_name = a.file_name;
+            if let Some((data, path)) = bot.get_file_bytes(&a.file_id).await {
                 audio_bytes = Some(data);
+                doc_name = audio_file_name.or_else(|| {
+                    path.split('/').next_back().map(str::to_string)
+                });
             }
         } else if let Some(vid) = msg.video {
             video_duration = vid.duration;
@@ -2664,11 +2672,8 @@ async fn handle_update(
                         .any(|ext| path.to_lowercase().ends_with(ext))
                 {
                     audio_bytes = Some(data);
-                    audio_mime = Some(if d_mime.is_empty() {
-                        "audio/ogg".to_string()
-                    } else {
-                        d_mime
-                    });
+                    audio_mime = (!d_mime.is_empty()).then_some(d_mime);
+                    doc_name = Some(d_name);
                 } else if document::is_extractable_document(&d_mime, &d_name) {
                     match document::extract_document(data, &d_mime, &d_name).await {
                         Ok(extracted) => {
@@ -4330,6 +4335,7 @@ mod update_lane_tests {
             1024,
             1024,
             12.34,
+            true,
             Some("failure <unsafe> & detail"),
         );
 
