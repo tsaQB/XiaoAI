@@ -2465,9 +2465,18 @@ mod tests {
     #[test]
     fn capability_rejection_requires_semantically_bound_phrases() {
         let rejected = [
-            (CapabilityKind::ImageInput, "this model does not support image input"),
-            (CapabilityKind::ImageInput, "vision is not supported for this model"),
-            (CapabilityKind::AudioInput, "model does not support audio input"),
+            (
+                CapabilityKind::ImageInput,
+                "this model does not support image input",
+            ),
+            (
+                CapabilityKind::ImageInput,
+                "vision is not supported for this model",
+            ),
+            (
+                CapabilityKind::AudioInput,
+                "model does not support audio input",
+            ),
             (
                 CapabilityKind::AudioTranscription,
                 "audio transcription is not supported",
@@ -2509,26 +2518,11 @@ mod tests {
                 "audio request does not support max_tokens",
             ),
             (CapabilityKind::AudioInput, "unsupported codec"),
-            (
-                CapabilityKind::AudioInput,
-                "invalid input_audio schema",
-            ),
-            (
-                CapabilityKind::AudioTranscription,
-                "unsupported codec",
-            ),
-            (
-                CapabilityKind::AudioTranscription,
-                "unsupported file type",
-            ),
-            (
-                CapabilityKind::AudioTranscription,
-                "malformed multipart",
-            ),
-            (
-                CapabilityKind::AudioTranscription,
-                "invalid audio format",
-            ),
+            (CapabilityKind::AudioInput, "invalid input_audio schema"),
+            (CapabilityKind::AudioTranscription, "unsupported codec"),
+            (CapabilityKind::AudioTranscription, "unsupported file type"),
+            (CapabilityKind::AudioTranscription, "malformed multipart"),
+            (CapabilityKind::AudioTranscription, "invalid audio format"),
             (
                 CapabilityKind::VideoInput,
                 "video request does not support temperature",
@@ -2543,16 +2537,10 @@ mod tests {
                 CapabilityKind::StructuredOutput,
                 "this model does not support temperature",
             ),
-            (
-                CapabilityKind::ImageGeneration,
-                "unsupported image format",
-            ),
+            (CapabilityKind::ImageGeneration, "unsupported image format"),
             (CapabilityKind::ImageGeneration, "unsupported size"),
             (CapabilityKind::ImageGeneration, "unsupported quality"),
-            (
-                CapabilityKind::ImageGeneration,
-                "invalid response_format",
-            ),
+            (CapabilityKind::ImageGeneration, "invalid response_format"),
             (
                 CapabilityKind::TextChat,
                 "this model does not support max_tokens",
@@ -2570,7 +2558,11 @@ mod tests {
     fn probe_http_policy_only_rejects_explicit_capability_failures() {
         for status in [401, 403] {
             assert!(matches!(
-                classify_probe_http_failure(CapabilityKind::Tools, status, "does not support tools"),
+                classify_probe_http_failure(
+                    CapabilityKind::Tools,
+                    status,
+                    "does not support tools"
+                ),
                 CapabilityProbeResponse::Unknown(ProbeOutcome::AuthFailed)
             ));
         }
@@ -2638,9 +2630,18 @@ mod tests {
         }
 
         let explicit = [
-            (CapabilityKind::ImageInput, "this model does not support image input"),
-            (CapabilityKind::ImageInput, "vision is not supported for this model"),
-            (CapabilityKind::AudioInput, "model does not support audio input"),
+            (
+                CapabilityKind::ImageInput,
+                "this model does not support image input",
+            ),
+            (
+                CapabilityKind::ImageInput,
+                "vision is not supported for this model",
+            ),
+            (
+                CapabilityKind::AudioInput,
+                "model does not support audio input",
+            ),
             (
                 CapabilityKind::AudioTranscription,
                 "audio transcription is not supported",
