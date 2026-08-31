@@ -2538,19 +2538,79 @@ async fn process_durable_update(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TelegramDocumentMediaKind {
+    Image,
+    Audio,
+    Video,
+    Other,
+}
+
+const TELEGRAM_IMAGE_DOCUMENT_EXTENSIONS: [&str; 4] = [".png", ".jpg", ".jpeg", ".webp"];
 const TELEGRAM_AUDIO_DOCUMENT_EXTENSIONS: [&str; 7] =
     [".ogg", ".oga", ".opus", ".mp3", ".wav", ".m4a", ".flac"];
+const TELEGRAM_VIDEO_DOCUMENT_EXTENSIONS: [&str; 5] =
+    [".mp4", ".mov", ".avi", ".webm", ".mkv"];
 
-fn telegram_document_is_audio(mime_type: &str, file_name: &str, remote_path: &str) -> bool {
-    if mime_type.trim().to_ascii_lowercase().starts_with("audio/") {
-        return true;
-    }
+fn normalize_telegram_document_mime(mime_type: &str) -> String {
+    mime_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
 
+fn telegram_document_has_extension(
+    file_name: &str,
+    remote_path: &str,
+    extensions: &[&str],
+) -> bool {
     let file_name = file_name.to_ascii_lowercase();
     let remote_path = remote_path.to_ascii_lowercase();
-    TELEGRAM_AUDIO_DOCUMENT_EXTENSIONS
+    extensions
         .iter()
         .any(|extension| file_name.ends_with(extension) || remote_path.ends_with(extension))
+}
+
+fn classify_telegram_document_media(
+    mime_type: &str,
+    file_name: &str,
+    remote_path: &str,
+) -> TelegramDocumentMediaKind {
+    let mime_type = normalize_telegram_document_mime(mime_type);
+
+    if mime_type.starts_with("image/") {
+        return TelegramDocumentMediaKind::Image;
+    }
+    if mime_type.starts_with("audio/") {
+        return TelegramDocumentMediaKind::Audio;
+    }
+    if mime_type.starts_with("video/") {
+        return TelegramDocumentMediaKind::Video;
+    }
+
+    if telegram_document_has_extension(
+        file_name,
+        remote_path,
+        &TELEGRAM_IMAGE_DOCUMENT_EXTENSIONS,
+    ) {
+        TelegramDocumentMediaKind::Image
+    } else if telegram_document_has_extension(
+        file_name,
+        remote_path,
+        &TELEGRAM_AUDIO_DOCUMENT_EXTENSIONS,
+    ) {
+        TelegramDocumentMediaKind::Audio
+    } else if telegram_document_has_extension(
+        file_name,
+        remote_path,
+        &TELEGRAM_VIDEO_DOCUMENT_EXTENSIONS,
+    ) {
+        TelegramDocumentMediaKind::Video
+    } else {
+        TelegramDocumentMediaKind::Other
+    }
 }
 
 async fn handle_update(
@@ -2650,72 +2710,76 @@ async fn handle_update(
                 .clone()
                 .unwrap_or_else(|| "dokumen".to_string());
             if let Some((data, path)) = bot.get_file_bytes(&doc.file_id).await {
-                if d_mime.starts_with("image/")
-                    || [".png", ".jpg", ".jpeg", ".webp"]
-                        .iter()
-                        .any(|ext| path.to_lowercase().ends_with(ext))
-                {
-                    image_bytes = Some(data);
-                    mime_type = Some(if d_mime.is_empty() {
-                        "image/jpeg".to_string()
-                    } else {
-                        d_mime
-                    });
-                } else if d_mime.starts_with("video/")
-                    || [".mp4", ".mov", ".avi", ".webm", ".mkv"]
-                        .iter()
-                        .any(|ext| path.to_lowercase().ends_with(ext))
-                {
-                    video_bytes = Some(data);
-                    video_mime = Some(if d_mime.is_empty() {
-                        "video/mp4".to_string()
-                    } else {
-                        d_mime
-                    });
-                } else if telegram_document_is_audio(&d_mime, &d_name, &path) {
-                    audio_bytes = Some(data);
-                    audio_mime = (!d_mime.is_empty()).then_some(d_mime);
-                    doc_name = Some(d_name);
-                } else if document::is_extractable_document(&d_mime, &d_name) {
-                    match document::extract_document(data, &d_mime, &d_name).await {
-                        Ok(extracted) => {
-                            doc_text = extracted.text;
-                            if !extracted.rendered_pages.is_empty() {
-                                document_images = Some(extracted.rendered_pages);
+                let normalized_mime = normalize_telegram_document_mime(&d_mime);
+                match classify_telegram_document_media(&d_mime, &d_name, &path) {
+                    TelegramDocumentMediaKind::Image => {
+                        image_bytes = Some(data);
+                        mime_type = Some(if normalized_mime.starts_with("image/") {
+                            normalized_mime
+                        } else {
+                            "image/jpeg".to_string()
+                        });
+                    }
+                    TelegramDocumentMediaKind::Audio => {
+                        audio_bytes = Some(data);
+                        audio_mime = normalized_mime
+                            .starts_with("audio/")
+                            .then_some(normalized_mime);
+                        doc_name = Some(d_name);
+                    }
+                    TelegramDocumentMediaKind::Video => {
+                        video_bytes = Some(data);
+                        video_mime = Some(if normalized_mime.starts_with("video/") {
+                            normalized_mime
+                        } else {
+                            "video/mp4".to_string()
+                        });
+                    }
+                    TelegramDocumentMediaKind::Other
+                        if document::is_extractable_document(&d_mime, &d_name) =>
+                    {
+                        match document::extract_document(data, &d_mime, &d_name).await {
+                            Ok(extracted) => {
+                                doc_text = extracted.text;
+                                if !extracted.rendered_pages.is_empty() {
+                                    document_images = Some(extracted.rendered_pages);
+                                }
+                                doc_name = Some(d_name);
+                                if let Some(warning) = extracted.warning {
+                                    info!("{warning}");
+                                }
                             }
-                            doc_name = Some(d_name);
-                            if let Some(warning) = extracted.warning {
-                                info!("{warning}");
+                            Err(err) => {
+                                let safe_name = escape_html(&d_name);
+                                let safe_error = escape_html(&err);
+                                let _ = bot
+                                    .send_message(
+                                        chat_id,
+                                        &format!(
+                                            "⚠️ <b>Dokumen tidak dapat diproses.</b>\n\n<code>{safe_name}</code>\n{safe_error}"
+                                        ),
+                                        Some("HTML"),
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                    )
+                                    .await;
+                                return;
                             }
-                        }
-                        Err(err) => {
-                            let safe_name = escape_html(&d_name);
-                            let safe_error = escape_html(&err);
-                            let _ = bot
-                                .send_message(
-                                    chat_id,
-                                    &format!(
-                                        "⚠️ <b>Dokumen tidak dapat diproses.</b>\n\n<code>{safe_name}</code>\n{safe_error}"
-                                    ),
-                                    Some("HTML"),
-                                    None,
-                                    None,
-                                    None,
-                                )
-                                .await;
-                            return;
                         }
                     }
-                } else {
-                    let safe_name = escape_html(&d_name);
-                    let _ = bot.send_message(
-                        chat_id,
-                        &format!(
-                            "⚠️ <b>Format dokumen belum didukung.</b>\n\n<code>{safe_name}</code> tidak akan dipaksa dibaca sebagai teks biner. Xiao mendukung dokumen teks/kode, PDF, DOCX, dan XLSX."
-                        ),
-                        Some("HTML"), None, None, None
-                    ).await;
-                    return;
+                    TelegramDocumentMediaKind::Other => {
+                        let safe_name = escape_html(&d_name);
+                        let _ = bot.send_message(
+                            chat_id,
+                            &format!(
+                                "⚠️ <b>Format dokumen belum didukung.</b>\n\n<code>{safe_name}</code> tidak akan dipaksa dibaca sebagai teks biner. Xiao mendukung dokumen teks/kode, PDF, DOCX, dan XLSX."
+                            ),
+                            Some("HTML"), None, None, None
+                        ).await;
+                        return;
+                    }
                 }
             }
         }
@@ -4325,63 +4389,122 @@ mod update_lane_tests {
     }
 
     #[test]
-    fn telegram_document_audio_detection_is_conservative_without_mime() {
-        for file_name in [
-            "file.ogg",
-            "file.oga",
-            "file.opus",
-            "file.mp3",
-            "file.wav",
-            "file.m4a",
-            "file.flac",
-        ] {
-            assert!(
-                telegram_document_is_audio("", file_name, file_name),
-                "{file_name}"
+    fn telegram_document_explicit_media_mime_overrides_conflicting_extension() {
+        let cases = [
+            ("audio/webm", "file.webm", TelegramDocumentMediaKind::Audio),
+            ("audio/mp4", "file.mp4", TelegramDocumentMediaKind::Audio),
+            ("audio/flac", "file.mkv", TelegramDocumentMediaKind::Audio),
+            ("audio/opus", "clip.webm", TelegramDocumentMediaKind::Audio),
+            ("video/mp4", "recording.mp3", TelegramDocumentMediaKind::Video),
+            ("video/webm", "voice.opus", TelegramDocumentMediaKind::Video),
+            ("image/png", "movie.mp4", TelegramDocumentMediaKind::Image),
+            (
+                "image/jpeg",
+                "recording.flac",
+                TelegramDocumentMediaKind::Image,
+            ),
+        ];
+
+        for (mime_type, file_name, expected) in cases {
+            assert_eq!(
+                classify_telegram_document_media(mime_type, file_name, file_name),
+                expected,
+                "{mime_type} / {file_name}"
             );
         }
-
-        for file_name in ["file.mp4", "file.webm", "file.mkv"] {
-            assert!(
-                !telegram_document_is_audio("", file_name, file_name),
-                "{file_name}"
-            );
-        }
-
-        assert!(telegram_document_is_audio(
-            "",
-            "voice.opus",
-            "documents/file_123"
-        ));
-        assert!(telegram_document_is_audio(
-            "",
-            "recording.flac",
-            "documents/file_456"
-        ));
     }
 
     #[test]
-    fn telegram_document_audio_mime_takes_precedence_over_filename() {
-        assert!(telegram_document_is_audio(
-            "audio/flac",
-            "arbitrary.bin",
-            "documents/file_123"
-        ));
-        assert!(telegram_document_is_audio(
-            "audio/opus",
-            "arbitrary.bin",
-            "documents/file_456"
-        ));
-        assert!(!telegram_document_is_audio(
-            "video/mp4",
-            "file.mp4",
-            "documents/file.mp4"
-        ));
-        assert!(!telegram_document_is_audio(
-            "",
-            "arbitrary.bin",
-            "documents/file_789"
-        ));
+    fn telegram_document_mime_less_extension_inference_is_conservative() {
+        let cases = [
+            ("file.ogg", TelegramDocumentMediaKind::Audio),
+            ("file.oga", TelegramDocumentMediaKind::Audio),
+            ("file.opus", TelegramDocumentMediaKind::Audio),
+            ("file.mp3", TelegramDocumentMediaKind::Audio),
+            ("file.wav", TelegramDocumentMediaKind::Audio),
+            ("file.m4a", TelegramDocumentMediaKind::Audio),
+            ("file.flac", TelegramDocumentMediaKind::Audio),
+            ("file.mp4", TelegramDocumentMediaKind::Video),
+            ("file.webm", TelegramDocumentMediaKind::Video),
+            ("file.mkv", TelegramDocumentMediaKind::Video),
+            ("file.png", TelegramDocumentMediaKind::Image),
+        ];
+
+        for (file_name, expected) in cases {
+            assert_eq!(
+                classify_telegram_document_media("", file_name, file_name),
+                expected,
+                "{file_name}"
+            );
+        }
+
+        assert_eq!(
+            classify_telegram_document_media("", "arbitrary.bin", "documents/file_789"),
+            TelegramDocumentMediaKind::Other
+        );
+    }
+
+    #[test]
+    fn telegram_document_remote_path_fallback_is_used_when_name_is_generic() {
+        assert_eq!(
+            classify_telegram_document_media("", "document", "documents/file.opus"),
+            TelegramDocumentMediaKind::Audio
+        );
+        assert_eq!(
+            classify_telegram_document_media("", "document", "documents/video.webm"),
+            TelegramDocumentMediaKind::Video
+        );
+    }
+
+    #[test]
+    fn telegram_document_mime_normalization_handles_case_and_parameters() {
+        assert_eq!(
+            classify_telegram_document_media(
+                "Audio/WebM; codecs=opus",
+                "file.webm",
+                "documents/file.webm"
+            ),
+            TelegramDocumentMediaKind::Audio
+        );
+        assert_eq!(
+            classify_telegram_document_media(
+                "VIDEO/MP4",
+                "file.mp3",
+                "documents/file.mp3"
+            ),
+            TelegramDocumentMediaKind::Video
+        );
+        assert_eq!(
+            classify_telegram_document_media(
+                "  image/PNG ; charset=binary ",
+                "clip.mp4",
+                "documents/clip.mp4"
+            ),
+            TelegramDocumentMediaKind::Image
+        );
+    }
+
+    #[test]
+    fn telegram_document_runtime_uses_one_authoritative_media_classifier() {
+        let source = include_str!("main.rs");
+        let document_start = source
+            .find("} else if let Some(doc) = msg.document {")
+            .expect("Telegram document branch");
+        let document_end = source[document_start..]
+            .find("\n        }\n\n        // Wizard state handler")
+            .map(|offset| document_start + offset)
+            .expect("Telegram document branch end");
+        let document_branch = &source[document_start..document_end];
+
+        assert_eq!(
+            document_branch
+                .matches("classify_telegram_document_media(")
+                .count(),
+            1
+        );
+        assert!(!document_branch.contains("telegram_document_is_audio"));
+        assert!(!document_branch.contains("|| [\".png\""));
+        assert!(!document_branch.contains("|| [\".mp4\""));
     }
 
     #[test]
