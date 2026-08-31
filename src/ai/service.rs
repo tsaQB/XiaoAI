@@ -297,10 +297,7 @@ fn media_data_url(
     Ok(format!("data:{mime_type};base64,{encoded}"))
 }
 
-fn resolved_audio_persistence_mime(
-    mime_type: Option<&str>,
-    file_name: Option<&str>,
-) -> String {
+fn resolved_audio_persistence_mime(mime_type: Option<&str>, file_name: Option<&str>) -> String {
     let normalized = mime_type
         .unwrap_or_default()
         .split(';')
@@ -3648,9 +3645,7 @@ mod tests {
 
         assert!(!persistence.contains("mime_type.unwrap_or(\"image/jpeg\")"));
         assert!(!persistence.contains("video_mime.unwrap_or(\"video/mp4\")"));
-        assert!(!persistence.contains(
-            "audio_mime.unwrap_or(\"application/octet-stream\")"
-        ));
+        assert!(!persistence.contains("audio_mime.unwrap_or(\"application/octet-stream\")"));
         assert!(persistence.contains("resolved_audio_persistence_mime(audio_mime, doc_name)"));
     }
 
