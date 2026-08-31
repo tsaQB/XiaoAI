@@ -2542,11 +2542,7 @@ const TELEGRAM_AUDIO_DOCUMENT_EXTENSIONS: [&str; 7] =
     [".ogg", ".oga", ".opus", ".mp3", ".wav", ".m4a", ".flac"];
 
 fn telegram_document_is_audio(mime_type: &str, file_name: &str, remote_path: &str) -> bool {
-    if mime_type
-        .trim()
-        .to_ascii_lowercase()
-        .starts_with("audio/")
-    {
+    if mime_type.trim().to_ascii_lowercase().starts_with("audio/") {
         return true;
     }
 
