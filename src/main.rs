@@ -2549,8 +2549,7 @@ enum TelegramDocumentMediaKind {
 const TELEGRAM_IMAGE_DOCUMENT_EXTENSIONS: [&str; 4] = [".png", ".jpg", ".jpeg", ".webp"];
 const TELEGRAM_AUDIO_DOCUMENT_EXTENSIONS: [&str; 7] =
     [".ogg", ".oga", ".opus", ".mp3", ".wav", ".m4a", ".flac"];
-const TELEGRAM_VIDEO_DOCUMENT_EXTENSIONS: [&str; 5] =
-    [".mp4", ".mov", ".avi", ".webm", ".mkv"];
+const TELEGRAM_VIDEO_DOCUMENT_EXTENSIONS: [&str; 5] = [".mp4", ".mov", ".avi", ".webm", ".mkv"];
 
 fn normalize_telegram_document_mime(mime_type: &str) -> String {
     mime_type
@@ -2590,11 +2589,8 @@ fn classify_telegram_document_media(
         return TelegramDocumentMediaKind::Video;
     }
 
-    if telegram_document_has_extension(
-        file_name,
-        remote_path,
-        &TELEGRAM_IMAGE_DOCUMENT_EXTENSIONS,
-    ) {
+    if telegram_document_has_extension(file_name, remote_path, &TELEGRAM_IMAGE_DOCUMENT_EXTENSIONS)
+    {
         TelegramDocumentMediaKind::Image
     } else if telegram_document_has_extension(
         file_name,
@@ -4394,7 +4390,11 @@ mod update_lane_tests {
             ("audio/mp4", "file.mp4", TelegramDocumentMediaKind::Audio),
             ("audio/flac", "file.mkv", TelegramDocumentMediaKind::Audio),
             ("audio/opus", "clip.webm", TelegramDocumentMediaKind::Audio),
-            ("video/mp4", "recording.mp3", TelegramDocumentMediaKind::Video),
+            (
+                "video/mp4",
+                "recording.mp3",
+                TelegramDocumentMediaKind::Video,
+            ),
             ("video/webm", "voice.opus", TelegramDocumentMediaKind::Video),
             ("image/png", "movie.mp4", TelegramDocumentMediaKind::Image),
             (
@@ -4466,11 +4466,7 @@ mod update_lane_tests {
             TelegramDocumentMediaKind::Audio
         );
         assert_eq!(
-            classify_telegram_document_media(
-                "VIDEO/MP4",
-                "file.mp3",
-                "documents/file.mp3"
-            ),
+            classify_telegram_document_media("VIDEO/MP4", "file.mp3", "documents/file.mp3"),
             TelegramDocumentMediaKind::Video
         );
         assert_eq!(
