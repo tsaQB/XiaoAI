@@ -179,9 +179,12 @@ fn extension_for_mime(mime: &str) -> &'static str {
         "audio/mp4" | "audio/m4a" | "audio/x-m4a" => "m4a",
         "audio/flac" | "audio/x-flac" => "flac",
         "audio/webm" => "webm",
+        "video/mp4" => "mp4",
         "video/webm" => "webm",
+        "video/quicktime" => "mov",
+        "video/x-msvideo" => "avi",
+        "video/x-matroska" => "mkv",
         "application/pdf" => "pdf",
-        _ if normalized.starts_with("video/") => "mp4",
         _ => "bin",
     }
 }
@@ -230,6 +233,28 @@ mod tests {
         for (mime, expected) in cases {
             assert_eq!(extension_for_mime(mime), expected, "{mime}");
         }
+    }
+
+    #[test]
+    fn persisted_media_identity_uses_exact_known_extensions() {
+        let cases = [
+            ("audio/mpeg", "mp3"),
+            ("audio/opus", "opus"),
+            ("image/png", "png"),
+            ("image/webp", "webp"),
+            ("video/mp4", "mp4"),
+            ("video/webm", "webm"),
+            ("video/quicktime", "mov"),
+            ("video/x-msvideo", "avi"),
+            ("video/x-matroska", "mkv"),
+        ];
+
+        for (mime, expected_extension) in cases {
+            assert_eq!(extension_for_mime(mime), expected_extension, "{mime}");
+        }
+
+        assert_eq!(extension_for_mime("video/x-unknown"), "bin");
+        assert_eq!(extension_for_mime("application/octet-stream"), "bin");
     }
 
     #[tokio::test]
