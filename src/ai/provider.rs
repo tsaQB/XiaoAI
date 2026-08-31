@@ -2473,10 +2473,12 @@ mod tests {
                 CapabilityKind::ImageInput,
                 "vision is not supported for this model",
             ),
+            (CapabilityKind::ImageInput, "vision is not supported"),
             (
                 CapabilityKind::AudioInput,
                 "model does not support audio input",
             ),
+            (CapabilityKind::AudioInput, "audio input is not supported"),
             (
                 CapabilityKind::AudioTranscription,
                 "audio transcription is not supported",
@@ -2516,6 +2518,10 @@ mod tests {
             (
                 CapabilityKind::AudioInput,
                 "audio request does not support max_tokens",
+            ),
+            (
+                CapabilityKind::AudioInput,
+                "audio request does not support temperature",
             ),
             (CapabilityKind::AudioInput, "unsupported codec"),
             (CapabilityKind::AudioInput, "invalid input_audio schema"),
@@ -2606,6 +2612,10 @@ mod tests {
                 CapabilityKind::AudioInput,
                 "audio request does not support max_tokens",
             ),
+            (
+                CapabilityKind::AudioInput,
+                "audio request does not support temperature",
+            ),
             (CapabilityKind::AudioTranscription, "unsupported codec"),
             (
                 CapabilityKind::VideoInput,
@@ -2642,6 +2652,7 @@ mod tests {
                 CapabilityKind::AudioInput,
                 "model does not support audio input",
             ),
+            (CapabilityKind::AudioInput, "audio input is not supported"),
             (
                 CapabilityKind::AudioTranscription,
                 "audio transcription is not supported",
