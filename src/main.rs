@@ -2762,7 +2762,6 @@ async fn handle_update(
                                         None,
                                         None,
                                         None,
-                                        None,
                                     )
                                     .await;
                                 return;
