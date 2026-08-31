@@ -462,93 +462,89 @@ pub enum ProbePlan {
     Role(ModelRole),
 }
 
-fn explicit_capability_rejection(capability: CapabilityKind, body: &str) -> bool {
-    let body = body.to_ascii_lowercase();
-    let sample_or_protocol_shape = [
-        "unsupported media type",
-        "unsupported codec",
-        "codec is unsupported",
-        "unsupported file type",
-        "unsupported file format",
-        "file format is unsupported",
-        "unsupported audio format",
-        "audio format is unsupported",
-        "unsupported video format",
-        "video format is unsupported",
-        "unsupported image format",
-        "image format is unsupported",
-        "malformed multipart",
-        "malformed request",
-        "invalid base64",
-        "invalid input_audio schema",
-        "invalid input audio schema",
-        "invalid image url",
-        "invalid image_url",
-        "invalid content-type",
-        "invalid content type",
-        "unsupported content type",
-    ]
-    .iter()
-    .any(|needle| body.contains(needle));
-    if sample_or_protocol_shape {
-        return false;
-    }
-
-    let rejected = body.contains("does not support")
-        || body.contains("not supported")
-        || body.contains("unsupported")
-        || body.contains("cannot ")
-        || body.contains("can't ");
-    if !rejected {
-        return false;
-    }
-
-    let terms: &[&str] = match capability {
+fn capability_rejection_patterns(capability: CapabilityKind) -> &'static [&'static str] {
+    match capability {
         CapabilityKind::TextChat => &[
-            "text chat",
-            "text input",
-            "chat completion",
-            "chat completions",
+            "does not support text chat",
+            "text chat is not supported",
+            "text chat unsupported",
+            "does not support text input",
+            "text input is not supported",
+            "text input unsupported",
+            "does not support chat completions",
+            "chat completions are not supported",
+            "chat completions unsupported",
         ],
         CapabilityKind::Tools => &[
-            "tools",
-            "tool call",
-            "tool calls",
-            "function calling",
-            "function call",
+            "does not support tools",
+            "tools are not supported",
+            "tools unsupported",
+            "function calling is not supported",
+            "function calling unsupported",
+            "tool calls are not supported",
+            "tool calls are unsupported",
         ],
         CapabilityKind::StructuredOutput => &[
-            "response_format",
-            "response format",
-            "json mode",
-            "structured output",
-            "structured outputs",
+            "response_format is not supported",
+            "response format is not supported",
+            "structured output is not supported",
+            "structured output unsupported",
+            "structured outputs are not supported",
+            "json mode is not supported",
+            "json mode unsupported",
         ],
-        CapabilityKind::ImageInput => &["image input", "input image", "image modality", "vision"],
+        CapabilityKind::ImageInput => &[
+            "does not support image input",
+            "image input is not supported",
+            "image input unsupported",
+            "does not support vision",
+            "vision is not supported",
+            "vision capability is unsupported",
+            "image modality is not supported",
+            "image modality unsupported",
+        ],
         CapabilityKind::AudioInput => &[
-            "audio input",
-            "input audio",
-            "input_audio",
-            "audio modality",
+            "does not support audio input",
+            "audio input is not supported",
+            "audio input unsupported",
+            "audio modality is not supported",
+            "audio modality unsupported",
+            "input_audio is not supported",
+            "input audio is not supported",
         ],
         CapabilityKind::AudioTranscription => &[
-            "audio transcription",
-            "transcription",
-            "speech-to-text",
-            "speech to text",
-            "transcribe audio",
+            "audio transcription is not supported",
+            "audio transcription unsupported",
+            "does not support transcription",
+            "transcription is not supported",
+            "speech-to-text is not supported",
+            "speech to text is not supported",
+            "cannot transcribe audio",
+            "can't transcribe audio",
         ],
-        CapabilityKind::VideoInput => &["video input", "input video", "video modality"],
+        CapabilityKind::VideoInput => &[
+            "does not support video input",
+            "video input is not supported",
+            "video input unsupported",
+            "video modality is not supported",
+            "video modality unsupported",
+        ],
         CapabilityKind::ImageGeneration => &[
-            "image generation",
-            "images generation",
-            "generate images",
-            "image-generation",
+            "image generation is not supported",
+            "image generation unsupported",
+            "does not support image generation",
+            "cannot generate images",
+            "can't generate images",
         ],
         _ => &[],
-    };
+    }
+}
 
-    terms.iter().any(|needle| body.contains(needle))
+fn explicit_capability_rejection(capability: CapabilityKind, body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    capability_rejection_patterns(capability)
+        .iter()
+        .any(|pattern| body.contains(pattern))
 }
 
 fn classify_probe_http_failure(
@@ -2467,137 +2463,203 @@ mod tests {
     }
 
     #[test]
-    fn probe_http_semantics_are_capability_specific_and_conservative() {
-        for status in [404, 405] {
+    fn capability_rejection_requires_semantically_bound_phrases() {
+        let rejected = [
+            (CapabilityKind::ImageInput, "this model does not support image input"),
+            (CapabilityKind::ImageInput, "vision is not supported for this model"),
+            (CapabilityKind::AudioInput, "model does not support audio input"),
+            (
+                CapabilityKind::AudioTranscription,
+                "audio transcription is not supported",
+            ),
+            (CapabilityKind::VideoInput, "video input is not supported"),
+            (CapabilityKind::Tools, "this model does not support tools"),
+            (
+                CapabilityKind::StructuredOutput,
+                "response_format is not supported",
+            ),
+            (
+                CapabilityKind::ImageGeneration,
+                "image generation is not supported",
+            ),
+            (CapabilityKind::TextChat, "text chat is not supported"),
+        ];
+        for (capability, body) in rejected {
+            assert!(
+                explicit_capability_rejection(capability, body),
+                "{capability:?}: {body}"
+            );
+        }
+
+        let ambiguous = [
+            (
+                CapabilityKind::ImageInput,
+                "model gpt-4-vision-preview does not support max_tokens",
+            ),
+            (
+                CapabilityKind::ImageInput,
+                "vision request for this model does not support response_format",
+            ),
+            (CapabilityKind::ImageInput, "invalid image url"),
+            (CapabilityKind::ImageInput, "unsupported image format"),
+            (CapabilityKind::ImageInput, "unsupported media type"),
+            (CapabilityKind::ImageInput, "invalid base64"),
+            (
+                CapabilityKind::AudioInput,
+                "audio request does not support max_tokens",
+            ),
+            (CapabilityKind::AudioInput, "unsupported codec"),
+            (
+                CapabilityKind::AudioInput,
+                "invalid input_audio schema",
+            ),
+            (
+                CapabilityKind::AudioTranscription,
+                "unsupported codec",
+            ),
+            (
+                CapabilityKind::AudioTranscription,
+                "unsupported file type",
+            ),
+            (
+                CapabilityKind::AudioTranscription,
+                "malformed multipart",
+            ),
+            (
+                CapabilityKind::AudioTranscription,
+                "invalid audio format",
+            ),
+            (
+                CapabilityKind::VideoInput,
+                "video request does not support temperature",
+            ),
+            (CapabilityKind::VideoInput, "unsupported video format"),
+            (CapabilityKind::VideoInput, "invalid video encoding"),
+            (
+                CapabilityKind::Tools,
+                "this model does not support max_tokens",
+            ),
+            (
+                CapabilityKind::StructuredOutput,
+                "this model does not support temperature",
+            ),
+            (
+                CapabilityKind::ImageGeneration,
+                "unsupported image format",
+            ),
+            (CapabilityKind::ImageGeneration, "unsupported size"),
+            (CapabilityKind::ImageGeneration, "unsupported quality"),
+            (
+                CapabilityKind::ImageGeneration,
+                "invalid response_format",
+            ),
+            (
+                CapabilityKind::TextChat,
+                "this model does not support max_tokens",
+            ),
+        ];
+        for (capability, body) in ambiguous {
+            assert!(
+                !explicit_capability_rejection(capability, body),
+                "{capability:?}: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_http_policy_only_rejects_explicit_capability_failures() {
+        for status in [401, 403] {
             assert!(matches!(
-                classify_probe_http_failure(CapabilityKind::ImageInput, status, "not found"),
+                classify_probe_http_failure(CapabilityKind::Tools, status, "does not support tools"),
+                CapabilityProbeResponse::Unknown(ProbeOutcome::AuthFailed)
+            ));
+        }
+        for status in [404, 405, 415] {
+            assert!(matches!(
+                classify_probe_http_failure(
+                    CapabilityKind::ImageInput,
+                    status,
+                    "this model does not support image input"
+                ),
                 CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch)
             ));
         }
         assert!(matches!(
             classify_probe_http_failure(
                 CapabilityKind::ImageInput,
-                415,
-                "model does not support image input"
-            ),
-            CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch)
-        ));
-        assert!(matches!(
-            classify_probe_http_failure(
-                CapabilityKind::AudioTranscription,
-                422,
-                "malformed multipart content"
-            ),
-            CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch)
-        ));
-        assert!(matches!(
-            classify_probe_http_failure(
-                CapabilityKind::ImageInput,
-                400,
-                "this model does not support max_tokens"
-            ),
-            CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch)
-        ));
-        assert!(matches!(
-            classify_probe_http_failure(
-                CapabilityKind::ImageInput,
-                400,
-                "this model does not support response_format"
-            ),
-            CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch)
-        ));
-        assert!(matches!(
-            classify_probe_http_failure(
-                CapabilityKind::ImageInput,
-                422,
+                429,
                 "this model does not support image input"
             ),
-            CapabilityProbeResponse::Rejected
-        ));
-        assert!(matches!(
-            classify_probe_http_failure(CapabilityKind::AudioInput, 400, "unsupported codec"),
-            CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch)
-        ));
-        assert!(matches!(
-            classify_probe_http_failure(
-                CapabilityKind::AudioInput,
-                422,
-                "model does not support audio input"
-            ),
-            CapabilityProbeResponse::Rejected
-        ));
-        assert!(matches!(
-            classify_probe_http_failure(
-                CapabilityKind::AudioTranscription,
-                400,
-                "unsupported file type"
-            ),
-            CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch)
-        ));
-        assert!(matches!(
-            classify_probe_http_failure(
-                CapabilityKind::AudioTranscription,
-                422,
-                "audio transcription is not supported for this model"
-            ),
-            CapabilityProbeResponse::Rejected
-        ));
-        assert!(matches!(
-            classify_probe_http_failure(
-                CapabilityKind::Tools,
-                400,
-                "this model does not support tools"
-            ),
-            CapabilityProbeResponse::Rejected
-        ));
-        assert!(matches!(
-            classify_probe_http_failure(
-                CapabilityKind::Tools,
-                400,
-                "this model does not support max_tokens"
-            ),
-            CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch)
-        ));
-        assert!(matches!(
-            classify_probe_http_failure(
-                CapabilityKind::StructuredOutput,
-                400,
-                "response_format is not supported"
-            ),
-            CapabilityProbeResponse::Rejected
-        ));
-        assert!(matches!(
-            classify_probe_http_failure(
-                CapabilityKind::VideoInput,
-                400,
-                "video modality unsupported"
-            ),
-            CapabilityProbeResponse::Rejected
-        ));
-        assert!(matches!(
-            classify_probe_http_failure(
-                CapabilityKind::ImageGeneration,
-                422,
-                "image generation is not supported for this model"
-            ),
-            CapabilityProbeResponse::Rejected
-        ));
-        assert!(matches!(
-            classify_probe_http_failure(CapabilityKind::Tools, 401, "unauthorized"),
-            CapabilityProbeResponse::Unknown(ProbeOutcome::AuthFailed)
-        ));
-        assert!(matches!(
-            classify_probe_http_failure(CapabilityKind::Tools, 403, "forbidden"),
-            CapabilityProbeResponse::Unknown(ProbeOutcome::AuthFailed)
-        ));
-        assert!(matches!(
-            classify_probe_http_failure(CapabilityKind::ImageInput, 429, "rate limit"),
             CapabilityProbeResponse::Unknown(ProbeOutcome::RateLimited)
         ));
         assert!(matches!(
-            classify_probe_http_failure(CapabilityKind::ImageInput, 503, "provider unavailable"),
+            classify_probe_http_failure(
+                CapabilityKind::ImageInput,
+                503,
+                "this model does not support image input"
+            ),
             CapabilityProbeResponse::Unknown(ProbeOutcome::ProviderError)
         ));
+
+        let ambiguous = [
+            (
+                CapabilityKind::ImageInput,
+                "model gpt-4-vision-preview does not support max_tokens",
+            ),
+            (
+                CapabilityKind::ImageInput,
+                "vision request for this model does not support response_format",
+            ),
+            (
+                CapabilityKind::AudioInput,
+                "audio request does not support max_tokens",
+            ),
+            (CapabilityKind::AudioTranscription, "unsupported codec"),
+            (
+                CapabilityKind::VideoInput,
+                "video request does not support temperature",
+            ),
+            (
+                CapabilityKind::Tools,
+                "this model does not support max_tokens",
+            ),
+            (
+                CapabilityKind::StructuredOutput,
+                "this model does not support temperature",
+            ),
+        ];
+        for status in [400, 422] {
+            for (capability, body) in ambiguous {
+                assert!(matches!(
+                    classify_probe_http_failure(capability, status, body),
+                    CapabilityProbeResponse::Unknown(ProbeOutcome::ProtocolMismatch)
+                ));
+            }
+        }
+
+        let explicit = [
+            (CapabilityKind::ImageInput, "this model does not support image input"),
+            (CapabilityKind::ImageInput, "vision is not supported for this model"),
+            (CapabilityKind::AudioInput, "model does not support audio input"),
+            (
+                CapabilityKind::AudioTranscription,
+                "audio transcription is not supported",
+            ),
+            (CapabilityKind::VideoInput, "video input is not supported"),
+            (CapabilityKind::Tools, "this model does not support tools"),
+            (
+                CapabilityKind::StructuredOutput,
+                "response_format is not supported",
+            ),
+        ];
+        for status in [400, 422] {
+            for (capability, body) in explicit {
+                assert!(matches!(
+                    classify_probe_http_failure(capability, status, body),
+                    CapabilityProbeResponse::Rejected
+                ));
+            }
+        }
     }
 
     fn supported_record(provider: &ProviderConfig, model: &str) -> CapabilityRecord {
