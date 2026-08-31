@@ -1693,6 +1693,179 @@ fn plan_image_generation_intent(text: &str) -> Option<ImageGenerationIntent> {
     })
 }
 
+const TELEGRAM_PHOTO_CAPTION_MAX_CHARS: usize = 1024;
+const IMAGE_CAPTION_PROMPT_ESCAPED_CHARS: usize = 320;
+const IMAGE_CAPTION_PROVIDER_ESCAPED_CHARS: usize = 96;
+const IMAGE_CAPTION_MODEL_ESCAPED_CHARS: usize = 128;
+const IMAGE_CAPTION_FAILURE_ESCAPED_CHARS: usize = 144;
+
+fn bounded_escaped_html(text: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    let mut used = 0usize;
+    let mut truncated = false;
+
+    for ch in text.chars() {
+        let escaped = match ch {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '"' => "&quot;",
+            '\'' => "&#39;",
+            _ => {
+                let needed = 1usize;
+                if used.saturating_add(needed) > max_chars {
+                    truncated = true;
+                    break;
+                }
+                output.push(ch);
+                used += needed;
+                continue;
+            }
+        };
+        let needed = escaped.chars().count();
+        if used.saturating_add(needed) > max_chars {
+            truncated = true;
+            break;
+        }
+        output.push_str(escaped);
+        used += needed;
+    }
+
+    if truncated && used < max_chars {
+        output.push('…');
+    }
+    output
+}
+
+fn build_image_success_caption(
+    prompt: &str,
+    provider: &str,
+    model: &str,
+    dimensions: (usize, usize),
+    elapsed_secs: f64,
+    used_external_fallback: bool,
+    primary_failure: Option<&str>,
+) -> String {
+    let (width, height) = dimensions;
+    let safe_prompt = bounded_escaped_html(prompt, IMAGE_CAPTION_PROMPT_ESCAPED_CHARS);
+    let safe_provider = bounded_escaped_html(provider, IMAGE_CAPTION_PROVIDER_ESCAPED_CHARS);
+    let safe_model = bounded_escaped_html(model, IMAGE_CAPTION_MODEL_ESCAPED_CHARS);
+    let fallback_note = if used_external_fallback {
+        let safe_failure = bounded_escaped_html(
+            primary_failure.unwrap_or("Primary provider failure was not reported."),
+            IMAGE_CAPTION_FAILURE_ESCAPED_CHARS,
+        );
+        format!(
+            "\n⚠️ <i>External fallback opt-in digunakan.</i>\n<b>Primary failure:</b> {safe_failure}"
+        )
+    } else {
+        String::new()
+    };
+
+    let caption = format!(
+        "🫟 <b>Gambar Berhasil Dibuat!</b>\n\n\
+         📝 <b>Prompt:</b> <i>\"{safe_prompt}\"</i>\n\
+         🧩 <b>Provider:</b> <code>{safe_provider}</code>\n\
+         🤖 <b>Model:</b> <code>{safe_model}</code>\n\
+         📐 <b>Size:</b> <code>{width} × {height}</code>\n\
+         ⏱️ <b>Elapsed:</b> <code>{elapsed_secs:.1}s</code>{fallback_note}"
+    );
+
+    if caption.chars().count() <= TELEGRAM_PHOTO_CAPTION_MAX_CHARS {
+        return caption;
+    }
+
+    let minimal = format!(
+        "🫟 <b>Gambar Berhasil Dibuat!</b>\n\
+         🧩 <b>Provider:</b> <code>{safe_provider}</code>\n\
+         🤖 <b>Model:</b> <code>{safe_model}</code>\n\
+         📐 <b>Size:</b> <code>{width} × {height}</code>\n\
+         ⏱️ <b>Elapsed:</b> <code>{elapsed_secs:.1}s</code>"
+    );
+    debug_assert!(minimal.chars().count() <= TELEGRAM_PHOTO_CAPTION_MAX_CHARS);
+    minimal
+}
+
+fn telegram_photo_delivery_error_class(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    if [
+        "caption",
+        "can't parse entities",
+        "cannot parse entities",
+        "parse entities",
+        "reply markup",
+        "reply_markup",
+        "inline keyboard",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        "caption_or_markup"
+    } else if [
+        "multipart error",
+        "timeout",
+        "timed out",
+        "connection",
+        "network",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        "telegram_transport"
+    } else if lower.contains("unsupported image signature") {
+        "local_image_validation"
+    } else {
+        "telegram_api"
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImageDeliveryFailure {
+    class: &'static str,
+    detail: String,
+    retry_attempted: bool,
+}
+
+async fn deliver_generated_image_with<F, Fut>(
+    image_bytes: &[u8],
+    caption: &str,
+    reply_markup: Option<Value>,
+    mut sender: F,
+) -> Result<(), ImageDeliveryFailure>
+where
+    F: FnMut(Vec<u8>, Option<String>, Option<String>, Option<Value>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    match sender(
+        image_bytes.to_vec(),
+        Some(caption.to_string()),
+        Some("HTML".to_string()),
+        reply_markup,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(first_error)
+            if telegram_photo_delivery_error_class(&first_error) == "caption_or_markup" =>
+        {
+            let retry_caption = "Image generated successfully.".to_string();
+            match sender(image_bytes.to_vec(), Some(retry_caption), None, None).await {
+                Ok(()) => Ok(()),
+                Err(second_error) => Err(ImageDeliveryFailure {
+                    class: telegram_photo_delivery_error_class(&second_error),
+                    detail: second_error,
+                    retry_attempted: true,
+                }),
+            }
+        }
+        Err(error) => Err(ImageDeliveryFailure {
+            class: telegram_photo_delivery_error_class(&error),
+            detail: error,
+            retry_attempted: false,
+        }),
+    }
+}
+
 async fn handle_image_generation(
     bot: &TelegramBotClient,
     ai_service: &AIChatService,
@@ -1919,29 +2092,14 @@ async fn handle_image_generation(
         }
     };
 
-    let safe_prompt = escape_html(&clean_prompt);
-    let safe_provider = escape_html(&generated.provider_name);
-    let safe_model = escape_html(&generated.model);
-    let fallback_note = if generated.used_external_fallback {
-        let primary_failure = generated
-            .primary_failure
-            .as_deref()
-            .map(|failure| escape_html(&truncate_chars(failure, 160)))
-            .unwrap_or_else(|| "Primary provider failure was not reported.".to_string());
-        format!(
-            "\n⚠️ <i>External fallback opt-in digunakan.</i>\n\
-             <b>Primary failure:</b> {primary_failure}"
-        )
-    } else {
-        String::new()
-    };
-    let caption_text = format!(
-        "🫟 <b>Gambar Berhasil Dibuat!</b>\n\n\
-         📝 <b>Prompt:</b> <i>\"{safe_prompt}\"</i>\n\
-         🧩 <b>Provider:</b> <code>{safe_provider}</code>\n\
-         🤖 <b>Model:</b> <code>{safe_model}</code>\n\
-         📐 <b>Size:</b> <code>{width} × {height}</code>\n\
-         ⏱️ <b>Elapsed:</b> <code>{elapsed_secs:.1}s</code>{fallback_note}"
+    let caption_text = build_image_success_caption(
+        &clean_prompt,
+        &generated.provider_name,
+        &generated.model,
+        (width, height),
+        elapsed_secs,
+        generated.used_external_fallback,
+        generated.primary_failure.as_deref(),
     );
 
     let img_kb = InlineKeyboardMarkup::new(vec![
@@ -1955,16 +2113,58 @@ async fn handle_image_generation(
         )],
     ]);
 
-    let _ = bot
-        .send_photo_bytes(
-            chat_id,
-            generated.bytes,
-            Some(&caption_text),
-            Some("HTML"),
-            serde_json::to_value(img_kb).ok(),
-            None,
-        )
-        .await;
+    let delivery = deliver_generated_image_with(
+        &generated.bytes,
+        &caption_text,
+        serde_json::to_value(img_kb).ok(),
+        |bytes, caption, parse_mode, reply_markup| async move {
+            bot.send_photo_bytes(
+                chat_id,
+                bytes,
+                caption.as_deref(),
+                parse_mode.as_deref(),
+                reply_markup,
+                None,
+            )
+            .await
+            .map(|_| ())
+        },
+    )
+    .await;
+
+    if let Err(failure) = delivery {
+        warn!(
+            "Generated image delivery failed [{}; retry={}]: {}",
+            failure.class,
+            failure.retry_attempted,
+            truncate_chars(&failure.detail, 200)
+        );
+        let rich = InputRichMessage::new(vec![
+            RichBlock::SectionHeading {
+                text: Value::String("IMAGE DELIVERY FAILED".to_string()),
+                level: 1,
+            },
+            RichBlock::Paragraph {
+                text: Value::String(
+                    "Image generation succeeded, but Telegram could not deliver the image."
+                        .to_string(),
+                ),
+            },
+            RichBlock::BlockQuotation {
+                blocks: vec![json!({
+                    "type": "paragraph",
+                    "text": format!("Diagnostic class: {}", failure.class)
+                })],
+            },
+        ]);
+        if let Err(error) = bot.send_rich_message(chat_id, &rich, None, None).await {
+            warn!(
+                "Image delivery fallback message also failed: {}",
+                truncate_chars(&error, 160)
+            );
+        }
+        return;
+    }
 
     if let Some(explanation_prompt) = explanation_prompt
         .map(str::trim)
@@ -2338,6 +2538,77 @@ async fn process_durable_update(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TelegramDocumentMediaKind {
+    Image,
+    Audio,
+    Video,
+    Other,
+}
+
+const TELEGRAM_IMAGE_DOCUMENT_EXTENSIONS: [&str; 4] = [".png", ".jpg", ".jpeg", ".webp"];
+const TELEGRAM_AUDIO_DOCUMENT_EXTENSIONS: [&str; 7] =
+    [".ogg", ".oga", ".opus", ".mp3", ".wav", ".m4a", ".flac"];
+const TELEGRAM_VIDEO_DOCUMENT_EXTENSIONS: [&str; 5] = [".mp4", ".mov", ".avi", ".webm", ".mkv"];
+
+fn normalize_telegram_document_mime(mime_type: &str) -> String {
+    mime_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn telegram_document_has_extension(
+    file_name: &str,
+    remote_path: &str,
+    extensions: &[&str],
+) -> bool {
+    let file_name = file_name.to_ascii_lowercase();
+    let remote_path = remote_path.to_ascii_lowercase();
+    extensions
+        .iter()
+        .any(|extension| file_name.ends_with(extension) || remote_path.ends_with(extension))
+}
+
+fn classify_telegram_document_media(
+    mime_type: &str,
+    file_name: &str,
+    remote_path: &str,
+) -> TelegramDocumentMediaKind {
+    let mime_type = normalize_telegram_document_mime(mime_type);
+
+    if mime_type.starts_with("image/") {
+        return TelegramDocumentMediaKind::Image;
+    }
+    if mime_type.starts_with("audio/") {
+        return TelegramDocumentMediaKind::Audio;
+    }
+    if mime_type.starts_with("video/") {
+        return TelegramDocumentMediaKind::Video;
+    }
+
+    if telegram_document_has_extension(file_name, remote_path, &TELEGRAM_IMAGE_DOCUMENT_EXTENSIONS)
+    {
+        TelegramDocumentMediaKind::Image
+    } else if telegram_document_has_extension(
+        file_name,
+        remote_path,
+        &TELEGRAM_AUDIO_DOCUMENT_EXTENSIONS,
+    ) {
+        TelegramDocumentMediaKind::Audio
+    } else if telegram_document_has_extension(
+        file_name,
+        remote_path,
+        &TELEGRAM_VIDEO_DOCUMENT_EXTENSIONS,
+    ) {
+        TelegramDocumentMediaKind::Video
+    } else {
+        TelegramDocumentMediaKind::Other
+    }
+}
+
 async fn handle_update(
     bot: &TelegramBotClient,
     ai_service: &AIChatService,
@@ -2390,14 +2661,18 @@ async fn handle_update(
         if let Some(v) = msg.voice {
             audio_duration = v.duration;
             audio_mime = v.mime_type;
-            if let Some((data, _)) = bot.get_file_bytes(&v.file_id).await {
+            if let Some((data, path)) = bot.get_file_bytes(&v.file_id).await {
                 audio_bytes = Some(data);
+                doc_name = path.split('/').next_back().map(str::to_string);
             }
         } else if let Some(a) = msg.audio {
             audio_duration = a.duration;
             audio_mime = a.mime_type;
-            if let Some((data, _)) = bot.get_file_bytes(&a.file_id).await {
+            let audio_file_name = a.file_name;
+            if let Some((data, path)) = bot.get_file_bytes(&a.file_id).await {
                 audio_bytes = Some(data);
+                doc_name =
+                    audio_file_name.or_else(|| path.split('/').next_back().map(str::to_string));
             }
         } else if let Some(vid) = msg.video {
             video_duration = vid.duration;
@@ -2431,79 +2706,75 @@ async fn handle_update(
                 .clone()
                 .unwrap_or_else(|| "dokumen".to_string());
             if let Some((data, path)) = bot.get_file_bytes(&doc.file_id).await {
-                if d_mime.starts_with("image/")
-                    || [".png", ".jpg", ".jpeg", ".webp"]
-                        .iter()
-                        .any(|ext| path.to_lowercase().ends_with(ext))
-                {
-                    image_bytes = Some(data);
-                    mime_type = Some(if d_mime.is_empty() {
-                        "image/jpeg".to_string()
-                    } else {
-                        d_mime
-                    });
-                } else if d_mime.starts_with("video/")
-                    || [".mp4", ".mov", ".avi", ".webm", ".mkv"]
-                        .iter()
-                        .any(|ext| path.to_lowercase().ends_with(ext))
-                {
-                    video_bytes = Some(data);
-                    video_mime = Some(if d_mime.is_empty() {
-                        "video/mp4".to_string()
-                    } else {
-                        d_mime
-                    });
-                } else if d_mime.starts_with("audio/")
-                    || [".ogg", ".mp3", ".wav", ".m4a"]
-                        .iter()
-                        .any(|ext| path.to_lowercase().ends_with(ext))
-                {
-                    audio_bytes = Some(data);
-                    audio_mime = Some(if d_mime.is_empty() {
-                        "audio/ogg".to_string()
-                    } else {
-                        d_mime
-                    });
-                } else if document::is_extractable_document(&d_mime, &d_name) {
-                    match document::extract_document(data, &d_mime, &d_name).await {
-                        Ok(extracted) => {
-                            doc_text = extracted.text;
-                            if !extracted.rendered_pages.is_empty() {
-                                document_images = Some(extracted.rendered_pages);
+                let normalized_mime = normalize_telegram_document_mime(&d_mime);
+                match classify_telegram_document_media(&d_mime, &d_name, &path) {
+                    TelegramDocumentMediaKind::Image => {
+                        image_bytes = Some(data);
+                        mime_type = Some(if normalized_mime.starts_with("image/") {
+                            normalized_mime
+                        } else {
+                            "image/jpeg".to_string()
+                        });
+                    }
+                    TelegramDocumentMediaKind::Audio => {
+                        audio_bytes = Some(data);
+                        audio_mime = normalized_mime
+                            .starts_with("audio/")
+                            .then_some(normalized_mime);
+                        doc_name = Some(d_name);
+                    }
+                    TelegramDocumentMediaKind::Video => {
+                        video_bytes = Some(data);
+                        video_mime = Some(if normalized_mime.starts_with("video/") {
+                            normalized_mime
+                        } else {
+                            "video/mp4".to_string()
+                        });
+                    }
+                    TelegramDocumentMediaKind::Other
+                        if document::is_extractable_document(&d_mime, &d_name) =>
+                    {
+                        match document::extract_document(data, &d_mime, &d_name).await {
+                            Ok(extracted) => {
+                                doc_text = extracted.text;
+                                if !extracted.rendered_pages.is_empty() {
+                                    document_images = Some(extracted.rendered_pages);
+                                }
+                                doc_name = Some(d_name);
+                                if let Some(warning) = extracted.warning {
+                                    info!("{warning}");
+                                }
                             }
-                            doc_name = Some(d_name);
-                            if let Some(warning) = extracted.warning {
-                                info!("{warning}");
+                            Err(err) => {
+                                let safe_name = escape_html(&d_name);
+                                let safe_error = escape_html(&err);
+                                let _ = bot
+                                    .send_message(
+                                        chat_id,
+                                        &format!(
+                                            "⚠️ <b>Dokumen tidak dapat diproses.</b>\n\n<code>{safe_name}</code>\n{safe_error}"
+                                        ),
+                                        Some("HTML"),
+                                        None,
+                                        None,
+                                        None,
+                                    )
+                                    .await;
+                                return;
                             }
-                        }
-                        Err(err) => {
-                            let safe_name = escape_html(&d_name);
-                            let safe_error = escape_html(&err);
-                            let _ = bot
-                                .send_message(
-                                    chat_id,
-                                    &format!(
-                                        "⚠️ <b>Dokumen tidak dapat diproses.</b>\n\n<code>{safe_name}</code>\n{safe_error}"
-                                    ),
-                                    Some("HTML"),
-                                    None,
-                                    None,
-                                    None,
-                                )
-                                .await;
-                            return;
                         }
                     }
-                } else {
-                    let safe_name = escape_html(&d_name);
-                    let _ = bot.send_message(
-                        chat_id,
-                        &format!(
-                            "⚠️ <b>Format dokumen belum didukung.</b>\n\n<code>{safe_name}</code> tidak akan dipaksa dibaca sebagai teks biner. Xiao mendukung dokumen teks/kode, PDF, DOCX, dan XLSX."
-                        ),
-                        Some("HTML"), None, None, None
-                    ).await;
-                    return;
+                    TelegramDocumentMediaKind::Other => {
+                        let safe_name = escape_html(&d_name);
+                        let _ = bot.send_message(
+                            chat_id,
+                            &format!(
+                                "⚠️ <b>Format dokumen belum didukung.</b>\n\n<code>{safe_name}</code> tidak akan dipaksa dibaca sebagai teks biner. Xiao mendukung dokumen teks/kode, PDF, DOCX, dan XLSX."
+                            ),
+                            Some("HTML"), None, None, None
+                        ).await;
+                        return;
+                    }
                 }
             }
         }
@@ -4110,6 +4381,282 @@ mod update_lane_tests {
         assert!(!policy.allows_stop_chat(100));
         assert!(!policy.allows_stop_chat(200));
         assert!(!policy.allows_stop_chat(999));
+    }
+
+    #[test]
+    fn telegram_document_explicit_media_mime_overrides_conflicting_extension() {
+        let cases = [
+            ("audio/webm", "file.webm", TelegramDocumentMediaKind::Audio),
+            ("audio/mp4", "file.mp4", TelegramDocumentMediaKind::Audio),
+            ("audio/flac", "file.mkv", TelegramDocumentMediaKind::Audio),
+            ("audio/opus", "clip.webm", TelegramDocumentMediaKind::Audio),
+            (
+                "video/mp4",
+                "recording.mp3",
+                TelegramDocumentMediaKind::Video,
+            ),
+            ("video/webm", "voice.opus", TelegramDocumentMediaKind::Video),
+            ("image/png", "movie.mp4", TelegramDocumentMediaKind::Image),
+            (
+                "image/jpeg",
+                "recording.flac",
+                TelegramDocumentMediaKind::Image,
+            ),
+        ];
+
+        for (mime_type, file_name, expected) in cases {
+            assert_eq!(
+                classify_telegram_document_media(mime_type, file_name, file_name),
+                expected,
+                "{mime_type} / {file_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn telegram_document_mime_less_extension_inference_is_conservative() {
+        let cases = [
+            ("file.ogg", TelegramDocumentMediaKind::Audio),
+            ("file.oga", TelegramDocumentMediaKind::Audio),
+            ("file.opus", TelegramDocumentMediaKind::Audio),
+            ("file.mp3", TelegramDocumentMediaKind::Audio),
+            ("file.wav", TelegramDocumentMediaKind::Audio),
+            ("file.m4a", TelegramDocumentMediaKind::Audio),
+            ("file.flac", TelegramDocumentMediaKind::Audio),
+            ("file.mp4", TelegramDocumentMediaKind::Video),
+            ("file.webm", TelegramDocumentMediaKind::Video),
+            ("file.mkv", TelegramDocumentMediaKind::Video),
+            ("file.png", TelegramDocumentMediaKind::Image),
+        ];
+
+        for (file_name, expected) in cases {
+            assert_eq!(
+                classify_telegram_document_media("", file_name, file_name),
+                expected,
+                "{file_name}"
+            );
+        }
+
+        assert_eq!(
+            classify_telegram_document_media("", "arbitrary.bin", "documents/file_789"),
+            TelegramDocumentMediaKind::Other
+        );
+    }
+
+    #[test]
+    fn telegram_document_remote_path_fallback_is_used_when_name_is_generic() {
+        assert_eq!(
+            classify_telegram_document_media("", "document", "documents/file.opus"),
+            TelegramDocumentMediaKind::Audio
+        );
+        assert_eq!(
+            classify_telegram_document_media("", "document", "documents/video.webm"),
+            TelegramDocumentMediaKind::Video
+        );
+    }
+
+    #[test]
+    fn telegram_document_mime_normalization_handles_case_and_parameters() {
+        assert_eq!(
+            classify_telegram_document_media(
+                "Audio/WebM; codecs=opus",
+                "file.webm",
+                "documents/file.webm"
+            ),
+            TelegramDocumentMediaKind::Audio
+        );
+        assert_eq!(
+            classify_telegram_document_media("VIDEO/MP4", "file.mp3", "documents/file.mp3"),
+            TelegramDocumentMediaKind::Video
+        );
+        assert_eq!(
+            classify_telegram_document_media(
+                "  image/PNG ; charset=binary ",
+                "clip.mp4",
+                "documents/clip.mp4"
+            ),
+            TelegramDocumentMediaKind::Image
+        );
+    }
+
+    #[test]
+    fn telegram_document_runtime_uses_one_authoritative_media_classifier() {
+        let source = include_str!("main.rs");
+        let document_start = source
+            .find("} else if let Some(doc) = msg.document {")
+            .expect("Telegram document branch");
+        let document_end = source[document_start..]
+            .find("\n        }\n\n        // Wizard state handler")
+            .map(|offset| document_start + offset)
+            .expect("Telegram document branch end");
+        let document_branch = &source[document_start..document_end];
+
+        assert_eq!(
+            document_branch
+                .matches("classify_telegram_document_media(")
+                .count(),
+            1
+        );
+        assert!(!document_branch.contains("telegram_document_is_audio"));
+        assert!(!document_branch.contains("|| [\".png\""));
+        assert!(!document_branch.contains("|| [\".mp4\""));
+    }
+
+    #[test]
+    fn image_caption_is_unicode_safe_bounded_and_html_escaped() {
+        let prompt = format!("{} <tag> & \"quotes\" 'single'", "🌌银河系".repeat(800));
+        let caption = build_image_success_caption(
+            &prompt,
+            "provider<&>",
+            "model<\"x\">&",
+            (1024, 1024),
+            12.34,
+            true,
+            Some("failure <unsafe> & detail"),
+        );
+
+        assert!(caption.chars().count() <= TELEGRAM_PHOTO_CAPTION_MAX_CHARS);
+        assert!(!caption.contains("<tag>"));
+        assert!(caption.contains("&lt;"));
+        assert!(caption.contains("&amp;"));
+        assert!(caption.contains("&quot;"));
+        assert!(!caption.contains("provider<&>"));
+        assert!(caption.is_char_boundary(caption.len()));
+    }
+
+    #[test]
+    fn photo_delivery_classifier_retries_only_caption_or_markup_failures() {
+        assert_eq!(
+            telegram_photo_delivery_error_class("Bad Request: can't parse entities in caption"),
+            "caption_or_markup"
+        );
+        assert_eq!(
+            telegram_photo_delivery_error_class("sendPhoto multipart error: timeout"),
+            "telegram_transport"
+        );
+        assert_eq!(
+            telegram_photo_delivery_error_class(
+                "sendPhoto rejected bytes with an unsupported image signature"
+            ),
+            "local_image_validation"
+        );
+    }
+
+    #[tokio::test]
+    async fn image_delivery_success_is_single_send() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_sender = Arc::clone(&calls);
+        let result = deliver_generated_image_with(
+            b"same-image-bytes",
+            "safe caption",
+            Some(json!({"inline_keyboard": []})),
+            move |_bytes, _caption, _parse_mode, _markup| {
+                let calls = Arc::clone(&calls_for_sender);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn image_delivery_caption_retry_reuses_same_bytes_without_regeneration() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex as StdMutex;
+
+        let sends = Arc::new(AtomicUsize::new(0));
+        let seen_bytes = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+        let sends_for_sender = Arc::clone(&sends);
+        let seen_for_sender = Arc::clone(&seen_bytes);
+
+        // Provider generation already happened exactly once before the delivery helper.
+        let provider_calls = AtomicUsize::new(1);
+        let result = deliver_generated_image_with(
+            b"paid-generated-image",
+            "caption",
+            Some(json!({"inline_keyboard": [["button"]]})),
+            move |bytes, _caption, _parse_mode, _markup| {
+                let sends = Arc::clone(&sends_for_sender);
+                let seen = Arc::clone(&seen_for_sender);
+                async move {
+                    let attempt = sends.fetch_add(1, Ordering::SeqCst);
+                    seen.lock().expect("seen bytes lock").push(bytes);
+                    if attempt == 0 {
+                        Err("Bad Request: can't parse entities in caption".to_string())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sends.load(Ordering::SeqCst), 2);
+        let seen = seen_bytes.lock().expect("seen bytes lock");
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0], seen[1]);
+    }
+
+    #[tokio::test]
+    async fn image_delivery_double_failure_returns_user_error_policy() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let sends = Arc::new(AtomicUsize::new(0));
+        let sends_for_sender = Arc::clone(&sends);
+        let result = deliver_generated_image_with(
+            b"image",
+            "caption",
+            None,
+            move |_bytes, _caption, _parse_mode, _markup| {
+                let sends = Arc::clone(&sends_for_sender);
+                async move {
+                    let attempt = sends.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        Err("Bad Request: caption entities are invalid".to_string())
+                    } else {
+                        Err("sendPhoto multipart error: connection".to_string())
+                    }
+                }
+            },
+        )
+        .await;
+
+        let failure = result.expect_err("second delivery should fail");
+        assert_eq!(sends.load(Ordering::SeqCst), 2);
+        assert!(failure.retry_attempted);
+        assert_eq!(failure.class, "telegram_transport");
+    }
+
+    #[test]
+    fn compound_image_handler_has_one_generation_call_and_failure_precedes_explanation() {
+        let source = include_str!("main.rs");
+        let handler_start = source
+            .find("async fn handle_image_generation(")
+            .expect("image handler");
+        let handler_end = source[handler_start..]
+            .find("// Main AI Chat Handler")
+            .map(|offset| handler_start + offset)
+            .expect("image handler end");
+        let handler = &source[handler_start..handler_end];
+
+        assert_eq!(handler.matches(".generate_image_with_snapshot(").count(), 1);
+        let failure_return = handler
+            .find("if let Err(failure) = delivery")
+            .expect("delivery failure branch");
+        let explanation = handler
+            .find("if let Some(explanation_prompt)")
+            .expect("compound explanation");
+        assert!(failure_return < explanation);
+        assert!(handler[failure_return..explanation].contains("return;"));
     }
 
     #[test]
