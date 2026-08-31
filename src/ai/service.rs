@@ -264,6 +264,57 @@ fn historical_native_audio_input_part(
     native_audio_input_part(bytes, Some(mime_type), file_name)
 }
 
+fn resolved_runtime_media_mime(
+    mime_type: Option<&str>,
+    expected_prefix: &str,
+    media_name: &str,
+) -> Result<String, String> {
+    let normalized = mime_type
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if normalized.starts_with(expected_prefix) {
+        Ok(normalized)
+    } else {
+        Err(format!(
+            "{media_name} MIME type is unknown or does not match the media kind; refusing to invent media metadata"
+        ))
+    }
+}
+
+fn media_data_url(
+    bytes: &[u8],
+    mime_type: Option<&str>,
+    expected_prefix: &str,
+    media_name: &str,
+) -> Result<String, String> {
+    use base64::Engine;
+    let mime_type = resolved_runtime_media_mime(mime_type, expected_prefix, media_name)?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(format!("data:{mime_type};base64,{encoded}"))
+}
+
+fn resolved_audio_persistence_mime(
+    mime_type: Option<&str>,
+    file_name: Option<&str>,
+) -> String {
+    let normalized = mime_type
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if normalized.starts_with("audio/") {
+        normalized
+    } else {
+        resolve_audio_file_and_mime(None, file_name).0.to_string()
+    }
+}
+
 const AI_PROVIDER_CONNECT_TIMEOUT_ENV: &str = "AI_PROVIDER_CONNECT_TIMEOUT_SECS";
 const IMAGE_PROVIDER_CONNECT_TIMEOUT_ENV: &str = "IMAGE_PROVIDER_CONNECT_TIMEOUT_SECS";
 const IMAGE_GENERATION_TIMEOUT_ENV: &str = "IMAGE_GENERATION_TIMEOUT_SECS";
@@ -865,17 +916,26 @@ impl AIChatService {
                 break;
             }
 
-            use base64::Engine;
             match attachment.kind.as_str() {
                 "image" | "document_page" => {
-                    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-                    parts.push(json!({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": format!("data:{};base64,{encoded}", attachment.mime_type),
-                            "detail": "auto"
-                        }
-                    }));
+                    match media_data_url(
+                        &bytes,
+                        Some(&attachment.mime_type),
+                        "image/",
+                        "historical image",
+                    ) {
+                        Ok(data_url) => parts.push(json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": data_url,
+                                "detail": "auto"
+                            }
+                        })),
+                        Err(error) => text.push_str(&format!(
+                            "\n[Historical image '{}' omitted: {error}.]",
+                            attachment.name.as_deref().unwrap_or("image")
+                        )),
+                    }
                 }
                 "audio" => {
                     match historical_native_audio_input_part(
@@ -893,13 +953,23 @@ impl AIChatService {
                     }
                 }
                 "video" => {
-                    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-                    parts.push(json!({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": format!("data:{};base64,{encoded}", attachment.mime_type)
-                        }
-                    }));
+                    match media_data_url(
+                        &bytes,
+                        Some(&attachment.mime_type),
+                        "video/",
+                        "historical video",
+                    ) {
+                        Ok(data_url) => parts.push(json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": data_url
+                            }
+                        })),
+                        Err(error) => text.push_str(&format!(
+                            "\n[Historical video '{}' omitted: {error}.]",
+                            attachment.name.as_deref().unwrap_or("video")
+                        )),
+                    }
                 }
                 _ => {}
             }
@@ -1477,18 +1547,16 @@ impl AIChatService {
                 }));
             }
         } else if let Some(bytes) = video_bytes {
-            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-            let mime = video_mime.unwrap_or("video/mp4");
+            let data_url = media_data_url(bytes, video_mime, "video/", "video")?;
             content.push(json!({
                 "type": "image_url",
-                "image_url": {"url": format!("data:{mime};base64,{encoded}")}
+                "image_url": {"url": data_url}
             }));
         } else if let Some(bytes) = image_bytes {
-            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-            let mime = mime_type.unwrap_or("image/jpeg");
+            let data_url = media_data_url(bytes, mime_type, "image/", "image")?;
             content.push(json!({
                 "type": "image_url",
-                "image_url": {"url": format!("data:{mime};base64,{encoded}"), "detail": "auto"}
+                "image_url": {"url": data_url, "detail": "auto"}
             }));
         }
 
@@ -2057,10 +2125,10 @@ impl AIChatService {
                 }
                 messages.push(json!({ "role": "user", "content": content }));
             } else if let Some(v_bytes) = video_bytes.as_ref() {
-                use base64::Engine;
-                let b64_vid = base64::engine::general_purpose::STANDARD.encode(v_bytes);
-                let v_m = video_mime.unwrap_or("video/mp4");
-                let data_url = format!("data:{v_m};base64,{b64_vid}");
+                let data_url = match media_data_url(v_bytes, video_mime, "video/", "video") {
+                    Ok(data_url) => data_url,
+                    Err(error) => return (None, error, false),
+                };
                 messages.push(json!({
                     "role": "user",
                     "content": [
@@ -2069,10 +2137,10 @@ impl AIChatService {
                     ]
                 }));
             } else if let Some(i_bytes) = image_bytes.as_ref() {
-                use base64::Engine;
-                let b64_img = base64::engine::general_purpose::STANDARD.encode(i_bytes);
-                let i_m = mime_type.unwrap_or("image/jpeg");
-                let data_url = format!("data:{i_m};base64,{b64_img}");
+                let data_url = match media_data_url(i_bytes, mime_type, "image/", "image") {
+                    Ok(data_url) => data_url,
+                    Err(error) => return (None, error, false),
+                };
                 messages.push(json!({
                     "role": "user",
                     "content": [
@@ -2559,25 +2627,31 @@ impl AIChatService {
                 }
             }
         } else if let Some(bytes) = image_bytes.as_ref() {
-            match persist_attachment(
-                user_id,
-                request_session_id,
-                "image",
-                mime_type.unwrap_or("image/jpeg"),
-                None,
-                bytes,
-            )
-            .await
-            {
-                Ok(reference) => attachment_refs.push(reference),
-                Err(err) => warn!("Failed to persist image attachment: {err}"),
+            match resolved_runtime_media_mime(mime_type, "image/", "persisted image") {
+                Ok(resolved_mime) => {
+                    match persist_attachment(
+                        user_id,
+                        request_session_id,
+                        "image",
+                        &resolved_mime,
+                        None,
+                        bytes,
+                    )
+                    .await
+                    {
+                        Ok(reference) => attachment_refs.push(reference),
+                        Err(err) => warn!("Failed to persist image attachment: {err}"),
+                    }
+                }
+                Err(err) => warn!("Refusing to persist image with false media identity: {err}"),
             }
         } else if let Some(bytes) = audio_bytes.as_ref() {
+            let resolved_mime = resolved_audio_persistence_mime(audio_mime, doc_name);
             match persist_attachment(
                 user_id,
                 request_session_id,
                 "audio",
-                audio_mime.unwrap_or("application/octet-stream"),
+                &resolved_mime,
                 doc_name,
                 bytes,
             )
@@ -2587,18 +2661,23 @@ impl AIChatService {
                 Err(err) => warn!("Failed to persist audio attachment: {err}"),
             }
         } else if let Some(bytes) = video_bytes.as_ref() {
-            match persist_attachment(
-                user_id,
-                request_session_id,
-                "video",
-                video_mime.unwrap_or("video/mp4"),
-                None,
-                bytes,
-            )
-            .await
-            {
-                Ok(reference) => attachment_refs.push(reference),
-                Err(err) => warn!("Failed to persist video attachment: {err}"),
+            match resolved_runtime_media_mime(video_mime, "video/", "persisted video") {
+                Ok(resolved_mime) => {
+                    match persist_attachment(
+                        user_id,
+                        request_session_id,
+                        "video",
+                        &resolved_mime,
+                        None,
+                        bytes,
+                    )
+                    .await
+                    {
+                        Ok(reference) => attachment_refs.push(reference),
+                        Err(err) => warn!("Failed to persist video attachment: {err}"),
+                    }
+                }
+                Err(err) => warn!("Refusing to persist video with false media identity: {err}"),
             }
         }
 
@@ -3060,6 +3139,54 @@ mod tests {
     }
 
     #[test]
+    fn media_data_urls_preserve_resolved_mime_and_fail_closed() {
+        for (mime_type, expected_prefix) in [
+            ("image/png", "data:image/png;base64,"),
+            ("image/webp", "data:image/webp;base64,"),
+            ("video/mp4", "data:video/mp4;base64,"),
+            ("video/webm", "data:video/webm;base64,"),
+            ("video/x-matroska", "data:video/x-matroska;base64,"),
+        ] {
+            let expected_kind = if mime_type.starts_with("image/") {
+                "image/"
+            } else {
+                "video/"
+            };
+            let data_url =
+                media_data_url(b"media", Some(mime_type), expected_kind, "test media").unwrap();
+            assert!(data_url.starts_with(expected_prefix), "{mime_type}");
+        }
+
+        assert!(media_data_url(b"media", None, "image/", "image").is_err());
+        assert!(media_data_url(b"media", Some("video/webm"), "image/", "image").is_err());
+        assert!(media_data_url(b"media", Some("image/png"), "video/", "video").is_err());
+    }
+
+    #[test]
+    fn audio_persistence_mime_recovers_known_filename_without_overwriting_explicit_mime() {
+        assert_eq!(
+            resolved_audio_persistence_mime(None, Some("sample.mp3")),
+            "audio/mpeg"
+        );
+        assert_eq!(
+            resolved_audio_persistence_mime(None, Some("sample.wav")),
+            "audio/wav"
+        );
+        assert_eq!(
+            resolved_audio_persistence_mime(None, Some("sample.opus")),
+            "audio/opus"
+        );
+        assert_eq!(
+            resolved_audio_persistence_mime(None, Some("sample.flac")),
+            "audio/flac"
+        );
+        assert_eq!(
+            resolved_audio_persistence_mime(Some("Audio/WebM; codecs=opus"), Some("sample.mp3")),
+            "audio/webm"
+        );
+    }
+
+    #[test]
     fn native_audio_format_mapping_is_protocol_safe() {
         for mime in ["audio/mpeg", "audio/mp3"] {
             assert_eq!(native_audio_input_format(Some(mime), None), Ok("mp3"));
@@ -3177,6 +3304,19 @@ mod tests {
                 true,
                 Some("audio/ogg"),
                 Some("voice.ogg"),
+            ),
+            Ok(AudioExecutionMode::Transcription)
+        );
+
+        assert_eq!(
+            select_audio_execution_mode(
+                &combined(
+                    (CapabilityState::Supported, fresh),
+                    (CapabilityState::Supported, fresh),
+                ),
+                true,
+                Some("audio/opus"),
+                Some("sample.opus"),
             ),
             Ok(AudioExecutionMode::Transcription)
         );
@@ -3454,6 +3594,64 @@ mod tests {
         assert_eq!(mime, "application/octet-stream");
         assert_eq!(name, "data.bin");
         assert_ne!(mime, "audio/ogg");
+    }
+
+    #[test]
+    fn mime_less_audio_resolver_drives_native_and_stt_formats_truthfully() {
+        let cases = [
+            ("sample.mp3", "audio/mpeg", "sample.mp3"),
+            ("sample.wav", "audio/wav", "sample.wav"),
+            ("sample.opus", "audio/opus", "sample.opus"),
+            ("sample.flac", "audio/flac", "sample.flac"),
+        ];
+
+        for (file_name, expected_mime, expected_name) in cases {
+            let (mime_type, safe_name) = resolve_audio_file_and_mime(None, Some(file_name));
+            assert_eq!(mime_type, expected_mime, "{file_name}");
+            assert_eq!(safe_name, expected_name, "{file_name}");
+        }
+
+        assert_eq!(
+            native_audio_input_format(Some("audio/mpeg"), Some("sample.mp3")),
+            Ok("mp3")
+        );
+        assert_eq!(
+            native_audio_input_format(Some("audio/wav"), Some("sample.wav")),
+            Ok("wav")
+        );
+        assert!(matches!(
+            native_audio_input_format(Some("audio/opus"), Some("sample.opus")),
+            Err(NativeAudioFormatError::UnsupportedKnown("opus"))
+        ));
+        assert!(matches!(
+            native_audio_input_format(Some("audio/flac"), Some("sample.flac")),
+            Err(NativeAudioFormatError::UnsupportedKnown("flac"))
+        ));
+
+        let (mime_type, safe_name) =
+            resolve_audio_file_and_mime(Some("audio/webm"), Some("sample.webm"));
+        assert_eq!(mime_type, "audio/webm");
+        assert_eq!(safe_name, "sample.webm");
+    }
+
+    #[test]
+    fn persistence_path_has_no_false_media_default() {
+        let source = include_str!("service.rs");
+        let persistence_start = source
+            .find("// Multimodal attachments are stored outside SQLite")
+            .expect("attachment persistence block");
+        let persistence_end = source[persistence_start..]
+            .find("let user_message = ChatMessage")
+            .map(|offset| persistence_start + offset)
+            .expect("attachment persistence block end");
+        let persistence = &source[persistence_start..persistence_end];
+
+        assert!(!persistence.contains("mime_type.unwrap_or(\"image/jpeg\")"));
+        assert!(!persistence.contains("video_mime.unwrap_or(\"video/mp4\")"));
+        assert!(!persistence.contains(
+            "audio_mime.unwrap_or(\"application/octet-stream\")"
+        ));
+        assert!(persistence.contains("resolved_audio_persistence_mime(audio_mime, doc_name)"));
     }
 
     #[test]
