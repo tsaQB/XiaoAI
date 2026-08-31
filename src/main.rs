@@ -2538,6 +2538,25 @@ async fn process_durable_update(
     }
 }
 
+const TELEGRAM_AUDIO_DOCUMENT_EXTENSIONS: [&str; 7] =
+    [".ogg", ".oga", ".opus", ".mp3", ".wav", ".m4a", ".flac"];
+
+fn telegram_document_is_audio(mime_type: &str, file_name: &str, remote_path: &str) -> bool {
+    if mime_type
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("audio/")
+    {
+        return true;
+    }
+
+    let file_name = file_name.to_ascii_lowercase();
+    let remote_path = remote_path.to_ascii_lowercase();
+    TELEGRAM_AUDIO_DOCUMENT_EXTENSIONS
+        .iter()
+        .any(|extension| file_name.ends_with(extension) || remote_path.ends_with(extension))
+}
+
 async fn handle_update(
     bot: &TelegramBotClient,
     ai_service: &AIChatService,
@@ -2657,11 +2676,7 @@ async fn handle_update(
                     } else {
                         d_mime
                     });
-                } else if d_mime.starts_with("audio/")
-                    || [".ogg", ".mp3", ".wav", ".m4a"]
-                        .iter()
-                        .any(|ext| path.to_lowercase().ends_with(ext))
-                {
+                } else if telegram_document_is_audio(&d_mime, &d_name, &path) {
                     audio_bytes = Some(data);
                     audio_mime = (!d_mime.is_empty()).then_some(d_mime);
                     doc_name = Some(d_name);
@@ -4311,6 +4326,66 @@ mod update_lane_tests {
         assert!(!policy.allows_stop_chat(100));
         assert!(!policy.allows_stop_chat(200));
         assert!(!policy.allows_stop_chat(999));
+    }
+
+    #[test]
+    fn telegram_document_audio_detection_is_conservative_without_mime() {
+        for file_name in [
+            "file.ogg",
+            "file.oga",
+            "file.opus",
+            "file.mp3",
+            "file.wav",
+            "file.m4a",
+            "file.flac",
+        ] {
+            assert!(
+                telegram_document_is_audio("", file_name, file_name),
+                "{file_name}"
+            );
+        }
+
+        for file_name in ["file.mp4", "file.webm", "file.mkv"] {
+            assert!(
+                !telegram_document_is_audio("", file_name, file_name),
+                "{file_name}"
+            );
+        }
+
+        assert!(telegram_document_is_audio(
+            "",
+            "voice.opus",
+            "documents/file_123"
+        ));
+        assert!(telegram_document_is_audio(
+            "",
+            "recording.flac",
+            "documents/file_456"
+        ));
+    }
+
+    #[test]
+    fn telegram_document_audio_mime_takes_precedence_over_filename() {
+        assert!(telegram_document_is_audio(
+            "audio/flac",
+            "arbitrary.bin",
+            "documents/file_123"
+        ));
+        assert!(telegram_document_is_audio(
+            "audio/opus",
+            "arbitrary.bin",
+            "documents/file_456"
+        ));
+        assert!(!telegram_document_is_audio(
+            "video/mp4",
+            "file.mp4",
+            "documents/file.mp4"
+        ));
+        assert!(!telegram_document_is_audio(
+            "",
+            "arbitrary.bin",
+            "documents/file_789"
+        ));
     }
 
     #[test]
