@@ -2958,8 +2958,7 @@ async fn handle_update(
                 audio_mime.as_deref(),
                 doc_name.as_deref(),
             );
-            handle_ai_chat(bot, ai_service, chat_id, user_id, chat_input)
-            .await;
+            handle_ai_chat(bot, ai_service, chat_id, user_id, chat_input).await;
             return;
         }
 
@@ -4412,19 +4411,58 @@ mod update_lane_tests {
     #[test]
     fn telegram_document_explicit_media_mime_overrides_conflicting_extension() {
         let cases = [
-            ("audio/webm", "file.webm", TelegramDocumentMediaKind::Audio, "audio/webm"),
-            ("audio/mp4", "file.mp4", TelegramDocumentMediaKind::Audio, "audio/mp4"),
-            ("audio/flac", "file.mkv", TelegramDocumentMediaKind::Audio, "audio/flac"),
-            ("audio/opus", "clip.webm", TelegramDocumentMediaKind::Audio, "audio/opus"),
-            ("video/mp4", "recording.mp3", TelegramDocumentMediaKind::Video, "video/mp4"),
-            ("video/webm", "voice.opus", TelegramDocumentMediaKind::Video, "video/webm"),
-            ("image/png", "movie.mp4", TelegramDocumentMediaKind::Image, "image/png"),
-            ("image/jpeg", "recording.flac", TelegramDocumentMediaKind::Image, "image/jpeg"),
+            (
+                "audio/webm",
+                "file.webm",
+                TelegramDocumentMediaKind::Audio,
+                "audio/webm",
+            ),
+            (
+                "audio/mp4",
+                "file.mp4",
+                TelegramDocumentMediaKind::Audio,
+                "audio/mp4",
+            ),
+            (
+                "audio/flac",
+                "file.mkv",
+                TelegramDocumentMediaKind::Audio,
+                "audio/flac",
+            ),
+            (
+                "audio/opus",
+                "clip.webm",
+                TelegramDocumentMediaKind::Audio,
+                "audio/opus",
+            ),
+            (
+                "video/mp4",
+                "recording.mp3",
+                TelegramDocumentMediaKind::Video,
+                "video/mp4",
+            ),
+            (
+                "video/webm",
+                "voice.opus",
+                TelegramDocumentMediaKind::Video,
+                "video/webm",
+            ),
+            (
+                "image/png",
+                "movie.mp4",
+                TelegramDocumentMediaKind::Image,
+                "image/png",
+            ),
+            (
+                "image/jpeg",
+                "recording.flac",
+                TelegramDocumentMediaKind::Image,
+                "image/jpeg",
+            ),
         ];
 
         for (mime_type, file_name, expected_kind, expected_mime) in cases {
-            let classified =
-                classify_telegram_document_media(mime_type, file_name, file_name);
+            let classified = classify_telegram_document_media(mime_type, file_name, file_name);
             assert_eq!(classified.kind, expected_kind, "{mime_type} / {file_name}");
             assert_eq!(
                 classified.mime_type.as_deref(),
@@ -4439,20 +4477,52 @@ mod update_lane_tests {
         let cases = [
             ("sample.png", TelegramDocumentMediaKind::Image, "image/png"),
             ("sample.jpg", TelegramDocumentMediaKind::Image, "image/jpeg"),
-            ("sample.jpeg", TelegramDocumentMediaKind::Image, "image/jpeg"),
-            ("sample.webp", TelegramDocumentMediaKind::Image, "image/webp"),
+            (
+                "sample.jpeg",
+                TelegramDocumentMediaKind::Image,
+                "image/jpeg",
+            ),
+            (
+                "sample.webp",
+                TelegramDocumentMediaKind::Image,
+                "image/webp",
+            ),
             ("sample.ogg", TelegramDocumentMediaKind::Audio, "audio/ogg"),
             ("sample.oga", TelegramDocumentMediaKind::Audio, "audio/ogg"),
-            ("sample.opus", TelegramDocumentMediaKind::Audio, "audio/opus"),
+            (
+                "sample.opus",
+                TelegramDocumentMediaKind::Audio,
+                "audio/opus",
+            ),
             ("sample.mp3", TelegramDocumentMediaKind::Audio, "audio/mpeg"),
             ("sample.wav", TelegramDocumentMediaKind::Audio, "audio/wav"),
             ("sample.m4a", TelegramDocumentMediaKind::Audio, "audio/mp4"),
-            ("sample.flac", TelegramDocumentMediaKind::Audio, "audio/flac"),
+            (
+                "sample.flac",
+                TelegramDocumentMediaKind::Audio,
+                "audio/flac",
+            ),
             ("sample.mp4", TelegramDocumentMediaKind::Video, "video/mp4"),
-            ("sample.webm", TelegramDocumentMediaKind::Video, "video/webm"),
-            ("sample.mov", TelegramDocumentMediaKind::Video, "video/quicktime"),
-            ("sample.avi", TelegramDocumentMediaKind::Video, "video/x-msvideo"),
-            ("sample.mkv", TelegramDocumentMediaKind::Video, "video/x-matroska"),
+            (
+                "sample.webm",
+                TelegramDocumentMediaKind::Video,
+                "video/webm",
+            ),
+            (
+                "sample.mov",
+                TelegramDocumentMediaKind::Video,
+                "video/quicktime",
+            ),
+            (
+                "sample.avi",
+                TelegramDocumentMediaKind::Video,
+                "video/x-msvideo",
+            ),
+            (
+                "sample.mkv",
+                TelegramDocumentMediaKind::Video,
+                "video/x-matroska",
+            ),
         ];
 
         for (file_name, expected_kind, expected_mime) in cases {
@@ -4465,21 +4535,18 @@ mod update_lane_tests {
             );
         }
 
-        let unknown =
-            classify_telegram_document_media("", "arbitrary.bin", "documents/file_789");
+        let unknown = classify_telegram_document_media("", "arbitrary.bin", "documents/file_789");
         assert_eq!(unknown.kind, TelegramDocumentMediaKind::Other);
         assert_eq!(unknown.mime_type, None);
     }
 
     #[test]
     fn telegram_document_remote_path_fallback_resolves_media_identity() {
-        let audio =
-            classify_telegram_document_media("", "document", "documents/file.opus");
+        let audio = classify_telegram_document_media("", "document", "documents/file.opus");
         assert_eq!(audio.kind, TelegramDocumentMediaKind::Audio);
         assert_eq!(audio.mime_type.as_deref(), Some("audio/opus"));
 
-        let video =
-            classify_telegram_document_media("", "document", "documents/video.webm");
+        let video = classify_telegram_document_media("", "document", "documents/video.webm");
         assert_eq!(video.kind, TelegramDocumentMediaKind::Video);
         assert_eq!(video.mime_type.as_deref(), Some("video/webm"));
     }
@@ -4494,8 +4561,7 @@ mod update_lane_tests {
         assert_eq!(audio.kind, TelegramDocumentMediaKind::Audio);
         assert_eq!(audio.mime_type.as_deref(), Some("audio/webm"));
 
-        let video =
-            classify_telegram_document_media("VIDEO/MP4", "file.mp3", "documents/file.mp3");
+        let video = classify_telegram_document_media("VIDEO/MP4", "file.mp3", "documents/file.mp3");
         assert_eq!(video.kind, TelegramDocumentMediaKind::Video);
         assert_eq!(video.mime_type.as_deref(), Some("video/mp4"));
 
