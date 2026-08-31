@@ -2607,12 +2607,17 @@ fn telegram_document_media_from_extension(
     remote_path: &str,
 ) -> Option<(TelegramDocumentMediaKind, &'static str)> {
     let file_name = file_name.to_ascii_lowercase();
+    if let Some((_, kind, mime_type)) = TELEGRAM_DOCUMENT_MEDIA_MAPPINGS
+        .iter()
+        .find(|(extension, _, _)| file_name.ends_with(*extension))
+    {
+        return Some((*kind, *mime_type));
+    }
+
     let remote_path = remote_path.to_ascii_lowercase();
     TELEGRAM_DOCUMENT_MEDIA_MAPPINGS
         .iter()
-        .find(|(extension, _, _)| {
-            file_name.ends_with(*extension) || remote_path.ends_with(*extension)
-        })
+        .find(|(extension, _, _)| remote_path.ends_with(*extension))
         .map(|(_, kind, mime_type)| (*kind, *mime_type))
 }
 
@@ -4549,6 +4554,19 @@ mod update_lane_tests {
         let video = classify_telegram_document_media("", "document", "documents/video.webm");
         assert_eq!(video.kind, TelegramDocumentMediaKind::Video);
         assert_eq!(video.mime_type.as_deref(), Some("video/webm"));
+    }
+
+    #[test]
+    fn telegram_document_filename_identity_wins_before_remote_path_fallback() {
+        let video =
+            classify_telegram_document_media("", "sample.webm", "documents/telegram-file.mp3");
+        assert_eq!(video.kind, TelegramDocumentMediaKind::Video);
+        assert_eq!(video.mime_type.as_deref(), Some("video/webm"));
+
+        let audio =
+            classify_telegram_document_media("", "sample.mp3", "documents/telegram-file.webm");
+        assert_eq!(audio.kind, TelegramDocumentMediaKind::Audio);
+        assert_eq!(audio.mime_type.as_deref(), Some("audio/mpeg"));
     }
 
     #[test]
