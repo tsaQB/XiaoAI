@@ -7,11 +7,13 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 
 use super::models::{
-    ApiResponse, BotCommand, EphemeralMessageParameters, FileInfo, InputRichMessage,
-    ReplyParameters, RichBlock, RichBlockTableCell, Update, User,
+    ApiResponse, BotCommand, EphemeralMessageParameters, FileInfo, InputMedia, InputRichMessage,
+    ReplyParameters, RichBlock, RichBlockCaption, RichBlockTableCell, Update, User,
 };
+use futures_util::StreamExt;
 
 const MAX_TELEGRAM_DOWNLOAD_BYTES: usize = 20 * 1024 * 1024;
+const MAX_TELEGRAM_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
 pub struct TelegramDeliveryContext {
@@ -23,6 +25,29 @@ pub struct TelegramDeliveryContext {
 
 tokio::task_local! {
     static TELEGRAM_DELIVERY_CONTEXT: TelegramDeliveryContext;
+}
+
+async fn read_bounded_json_response(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Value, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(format!("response exceeded {max_bytes} bytes"));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| reqwest_error_kind(&error).to_string())?;
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(format!("response exceeded {max_bytes} bytes"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|error| format!("invalid JSON: {error}"))
 }
 
 fn reqwest_error_kind(error: &reqwest::Error) -> &'static str {
@@ -131,15 +156,13 @@ impl TelegramBotClient {
     async fn post_json_raw(&self, method: &str, payload: Value) -> Result<Value, String> {
         let url = format!("{}/{}", self.base_url, method);
         match self.client.post(&url).json(&payload).send().await {
-            Ok(resp) => match resp.json::<Value>().await {
+            Ok(resp) => match read_bounded_json_response(resp, MAX_TELEGRAM_RESPONSE_BYTES).await {
                 Ok(json_res) => Ok(json_res),
-                Err(e) => {
-                    let err_msg = format!(
-                        "Failed to parse response JSON for {method}: {}",
-                        reqwest_error_kind(&e)
-                    );
-                    error!("{err_msg}");
-                    Err(err_msg)
+                Err(err_msg) => {
+                    error!("Failed to parse response JSON for {method}: {err_msg}");
+                    Err(format!(
+                        "Failed to parse response JSON for {method}: {err_msg}"
+                    ))
                 }
             },
             Err(e) => {
@@ -437,6 +460,644 @@ impl TelegramBotClient {
         }
     }
 
+    pub async fn download_media_bytes(
+        &self,
+        url: &str,
+        max_bytes: usize,
+    ) -> Option<(Vec<u8>, String, String)> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .build()
+            .unwrap_or_else(|_| self.client.clone());
+
+        let resp = client.get(url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+
+        if resp
+            .content_length()
+            .is_some_and(|length| length > max_bytes as u64)
+        {
+            return None;
+        }
+
+        let mut stream = resp.bytes_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk_res) = stream.next().await {
+            let chunk = chunk_res.ok()?;
+            if bytes.len().saturating_add(chunk.len()) > max_bytes {
+                return None;
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+
+        let file_name = if content_type.contains("png") || bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            "image.png"
+        } else if content_type.contains("jpeg")
+            || content_type.contains("jpg")
+            || bytes.starts_with(&[0xff, 0xd8, 0xff])
+        {
+            "image.jpg"
+        } else if content_type.contains("gif")
+            || bytes.starts_with(b"GIF87a")
+            || bytes.starts_with(b"GIF89a")
+        {
+            "image.gif"
+        } else if content_type.contains("webp")
+            || (bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP")
+        {
+            "image.webp"
+        } else if content_type.contains("ogg")
+            || content_type.contains("opus")
+            || bytes.starts_with(b"OggS")
+        {
+            "audio.ogg"
+        } else if content_type.contains("mp3")
+            || content_type.contains("mpeg")
+            || bytes.starts_with(b"ID3")
+            || bytes.starts_with(&[0xff, 0xfb])
+        {
+            "audio.mp3"
+        } else if content_type.contains("mp4") || bytes.windows(4).take(8).any(|w| w == b"ftyp") {
+            "video.mp4"
+        } else if content_type.contains("pdf") || bytes.starts_with(b"%PDF-") {
+            "document.pdf"
+        } else {
+            "file.bin"
+        };
+
+        Some((bytes, content_type, file_name.to_string()))
+    }
+
+    pub async fn send_photo(
+        &self,
+        chat_id: i64,
+        photo: &str,
+        caption: Option<&str>,
+        parse_mode: Option<&str>,
+        reply_markup: Option<Value>,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<Value, String> {
+        let mut payload = json!({
+            "chat_id": chat_id,
+            "photo": photo,
+        });
+        if let Some(cap) = caption {
+            payload["caption"] = json!(cap);
+        }
+        if let Some(pm) = parse_mode {
+            payload["parse_mode"] = json!(pm);
+        }
+        if let Some(ref rm) = reply_markup {
+            payload["reply_markup"] = rm.clone();
+        }
+        if let Some(rep) = reply_to_message_id {
+            payload["reply_parameters"] =
+                serde_json::to_value(ReplyParameters::new(rep)).unwrap_or(json!({}));
+        }
+        Self::apply_delivery_context(&mut payload, true);
+
+        match self.post_json("sendPhoto", payload).await {
+            Ok(res) => Ok(res),
+            Err(e) => {
+                if photo.starts_with("http://") || photo.starts_with("https://") {
+                    info!("sendPhoto direct URL failed ({e}); attempting download-and-upload...");
+                    if let Some((bytes, _, _)) = self
+                        .download_media_bytes(photo, MAX_TELEGRAM_DOWNLOAD_BYTES)
+                        .await
+                    {
+                        return self
+                            .send_photo_bytes(
+                                chat_id,
+                                bytes,
+                                caption,
+                                parse_mode,
+                                reply_markup,
+                                reply_to_message_id,
+                            )
+                            .await;
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    pub async fn send_media_group(
+        &self,
+        chat_id: i64,
+        media: &[InputMedia],
+        reply_to_message_id: Option<i64>,
+    ) -> Result<Value, String> {
+        if media.is_empty() {
+            return Err("sendMediaGroup requires at least 1 media item".to_string());
+        }
+
+        let media_json = serde_json::to_value(media).map_err(|e| e.to_string())?;
+        let mut payload = json!({
+            "chat_id": chat_id,
+            "media": media_json,
+        });
+        if let Some(rep) = reply_to_message_id {
+            payload["reply_parameters"] =
+                serde_json::to_value(ReplyParameters::new(rep)).unwrap_or(json!({}));
+        }
+        Self::apply_delivery_context(&mut payload, false);
+
+        match self.post_json("sendMediaGroup", payload).await {
+            Ok(res) => Ok(res),
+            Err(e) => {
+                info!("sendMediaGroup direct URL failed ({e}); attempting multipart upload...");
+                let mut form = Form::new().text("chat_id", chat_id.to_string());
+                let delivery = Self::current_delivery_context();
+                if let Some(thread_id) = delivery.message_thread_id {
+                    form = form.text("message_thread_id", thread_id.to_string());
+                }
+
+                let mut updated_media = Vec::new();
+                let mut attachments = Vec::new();
+
+                for (idx, item) in media.iter().enumerate() {
+                    let mut item_clone = item.clone();
+                    let attach_key = format!("file_{idx}");
+                    let target_url = match &item_clone {
+                        InputMedia::Photo { media, .. } => media.clone(),
+                        InputMedia::Video { media, .. } => media.clone(),
+                        InputMedia::Audio { media, .. } => media.clone(),
+                        InputMedia::Document { media, .. } => media.clone(),
+                        InputMedia::Animation { media, .. } => media.clone(),
+                        InputMedia::VoiceNote { media, .. } => media.clone(),
+                    };
+
+                    if target_url.starts_with("http://") || target_url.starts_with("https://") {
+                        if let Some((bytes, mime, fname)) = self
+                            .download_media_bytes(&target_url, MAX_TELEGRAM_DOWNLOAD_BYTES)
+                            .await
+                        {
+                            match &mut item_clone {
+                                InputMedia::Photo { media, .. }
+                                | InputMedia::Video { media, .. }
+                                | InputMedia::Audio { media, .. }
+                                | InputMedia::Document { media, .. }
+                                | InputMedia::Animation { media, .. }
+                                | InputMedia::VoiceNote { media, .. } => {
+                                    *media = format!("attach://{attach_key}");
+                                }
+                            }
+                            attachments.push((attach_key, bytes, mime, fname));
+                        }
+                    }
+                    updated_media.push(item_clone);
+                }
+
+                if attachments.is_empty() {
+                    return Err(e);
+                }
+
+                let media_json_str =
+                    serde_json::to_string(&updated_media).map_err(|e| e.to_string())?;
+                form = form.text("media", media_json_str);
+
+                for (attach_key, bytes, mime, fname) in attachments {
+                    let part = Part::bytes(bytes)
+                        .file_name(fname)
+                        .mime_str(&mime)
+                        .map_err(|e| e.to_string())?;
+                    form = form.part(attach_key, part);
+                }
+
+                let url = format!("{}/sendMediaGroup", self.base_url);
+                match self.client.post(&url).multipart(form).send().await {
+                    Ok(resp) => {
+                        let response = resp.json::<Value>().await.map_err(|e| {
+                            format!(
+                                "sendMediaGroup response decode error: {}",
+                                reqwest_error_kind(&e)
+                            )
+                        })?;
+                        if response.get("ok").and_then(Value::as_bool) == Some(true) {
+                            Ok(response)
+                        } else {
+                            Err(Self::telegram_api_error("sendMediaGroup", &response))
+                        }
+                    }
+                    Err(err) => Err(format!(
+                        "sendMediaGroup multipart error: {}",
+                        reqwest_error_kind(&err)
+                    )),
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_audio(
+        &self,
+        chat_id: i64,
+        audio: &str,
+        caption: Option<&str>,
+        parse_mode: Option<&str>,
+        title: Option<&str>,
+        performer: Option<&str>,
+        duration: Option<i32>,
+        reply_markup: Option<Value>,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<Value, String> {
+        let mut payload = json!({
+            "chat_id": chat_id,
+            "audio": audio,
+        });
+        if let Some(cap) = caption {
+            payload["caption"] = json!(cap);
+        }
+        if let Some(pm) = parse_mode {
+            payload["parse_mode"] = json!(pm);
+        }
+        if let Some(t) = title {
+            payload["title"] = json!(t);
+        }
+        if let Some(p) = performer {
+            payload["performer"] = json!(p);
+        }
+        if let Some(d) = duration {
+            payload["duration"] = json!(d);
+        }
+        if let Some(ref rm) = reply_markup {
+            payload["reply_markup"] = rm.clone();
+        }
+        if let Some(rep) = reply_to_message_id {
+            payload["reply_parameters"] =
+                serde_json::to_value(ReplyParameters::new(rep)).unwrap_or(json!({}));
+        }
+        Self::apply_delivery_context(&mut payload, true);
+
+        match self.post_json("sendAudio", payload).await {
+            Ok(res) => Ok(res),
+            Err(e) => {
+                if audio.starts_with("http://") || audio.starts_with("https://") {
+                    info!("sendAudio direct URL failed ({e}); attempting download-and-upload...");
+                    if let Some((bytes, mime, fname)) = self
+                        .download_media_bytes(audio, MAX_TELEGRAM_DOWNLOAD_BYTES)
+                        .await
+                    {
+                        let url = format!("{}/sendAudio", self.base_url);
+                        let part = Part::bytes(bytes)
+                            .file_name(fname)
+                            .mime_str(&mime)
+                            .map_err(|e| e.to_string())?;
+                        let mut form = Form::new()
+                            .text("chat_id", chat_id.to_string())
+                            .part("audio", part);
+                        if let Some(cap) = caption {
+                            form = form.text("caption", cap.to_string());
+                        }
+                        if let Some(pm) = parse_mode {
+                            form = form.text("parse_mode", pm.to_string());
+                        }
+                        if let Some(t) = title {
+                            form = form.text("title", t.to_string());
+                        }
+                        if let Some(p) = performer {
+                            form = form.text("performer", p.to_string());
+                        }
+                        if let Some(d) = duration {
+                            form = form.text("duration", d.to_string());
+                        }
+                        if let Some(rm) = reply_markup {
+                            form = form.text("reply_markup", rm.to_string());
+                        }
+                        if let Ok(resp) = self.client.post(&url).multipart(form).send().await {
+                            if let Ok(response) = resp.json::<Value>().await {
+                                if response.get("ok").and_then(Value::as_bool) == Some(true) {
+                                    return Ok(response);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_voice(
+        &self,
+        chat_id: i64,
+        voice: &str,
+        caption: Option<&str>,
+        parse_mode: Option<&str>,
+        duration: Option<i32>,
+        reply_markup: Option<Value>,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<Value, String> {
+        let mut payload = json!({
+            "chat_id": chat_id,
+            "voice": voice,
+        });
+        if let Some(cap) = caption {
+            payload["caption"] = json!(cap);
+        }
+        if let Some(pm) = parse_mode {
+            payload["parse_mode"] = json!(pm);
+        }
+        if let Some(d) = duration {
+            payload["duration"] = json!(d);
+        }
+        if let Some(ref rm) = reply_markup {
+            payload["reply_markup"] = rm.clone();
+        }
+        if let Some(rep) = reply_to_message_id {
+            payload["reply_parameters"] =
+                serde_json::to_value(ReplyParameters::new(rep)).unwrap_or(json!({}));
+        }
+        Self::apply_delivery_context(&mut payload, true);
+
+        match self.post_json("sendVoice", payload).await {
+            Ok(res) => Ok(res),
+            Err(e) => {
+                if voice.starts_with("http://") || voice.starts_with("https://") {
+                    if let Some((bytes, mime, fname)) = self
+                        .download_media_bytes(voice, MAX_TELEGRAM_DOWNLOAD_BYTES)
+                        .await
+                    {
+                        let url = format!("{}/sendVoice", self.base_url);
+                        let part = Part::bytes(bytes)
+                            .file_name(fname)
+                            .mime_str(&mime)
+                            .map_err(|e| e.to_string())?;
+                        let mut form = Form::new()
+                            .text("chat_id", chat_id.to_string())
+                            .part("voice", part);
+                        if let Some(cap) = caption {
+                            form = form.text("caption", cap.to_string());
+                        }
+                        if let Some(pm) = parse_mode {
+                            form = form.text("parse_mode", pm.to_string());
+                        }
+                        if let Some(d) = duration {
+                            form = form.text("duration", d.to_string());
+                        }
+                        if let Some(rm) = reply_markup {
+                            form = form.text("reply_markup", rm.to_string());
+                        }
+                        if let Ok(resp) = self.client.post(&url).multipart(form).send().await {
+                            if let Ok(response) = resp.json::<Value>().await {
+                                if response.get("ok").and_then(Value::as_bool) == Some(true) {
+                                    return Ok(response);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    pub async fn send_video(
+        &self,
+        chat_id: i64,
+        video: &str,
+        caption: Option<&str>,
+        parse_mode: Option<&str>,
+        reply_markup: Option<Value>,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<Value, String> {
+        let mut payload = json!({
+            "chat_id": chat_id,
+            "video": video,
+        });
+        if let Some(cap) = caption {
+            payload["caption"] = json!(cap);
+        }
+        if let Some(pm) = parse_mode {
+            payload["parse_mode"] = json!(pm);
+        }
+        if let Some(ref rm) = reply_markup {
+            payload["reply_markup"] = rm.clone();
+        }
+        if let Some(rep) = reply_to_message_id {
+            payload["reply_parameters"] =
+                serde_json::to_value(ReplyParameters::new(rep)).unwrap_or(json!({}));
+        }
+        Self::apply_delivery_context(&mut payload, true);
+
+        match self.post_json("sendVideo", payload).await {
+            Ok(res) => Ok(res),
+            Err(e) => {
+                if video.starts_with("http://") || video.starts_with("https://") {
+                    if let Some((bytes, mime, fname)) = self
+                        .download_media_bytes(video, MAX_TELEGRAM_DOWNLOAD_BYTES)
+                        .await
+                    {
+                        let url = format!("{}/sendVideo", self.base_url);
+                        let part = Part::bytes(bytes)
+                            .file_name(fname)
+                            .mime_str(&mime)
+                            .map_err(|e| e.to_string())?;
+                        let mut form = Form::new()
+                            .text("chat_id", chat_id.to_string())
+                            .part("video", part);
+                        if let Some(cap) = caption {
+                            form = form.text("caption", cap.to_string());
+                        }
+                        if let Some(pm) = parse_mode {
+                            form = form.text("parse_mode", pm.to_string());
+                        }
+                        if let Some(rm) = reply_markup {
+                            form = form.text("reply_markup", rm.to_string());
+                        }
+                        if let Ok(resp) = self.client.post(&url).multipart(form).send().await {
+                            if let Ok(response) = resp.json::<Value>().await {
+                                if response.get("ok").and_then(Value::as_bool) == Some(true) {
+                                    return Ok(response);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    pub async fn send_animation(
+        &self,
+        chat_id: i64,
+        animation: &str,
+        caption: Option<&str>,
+        parse_mode: Option<&str>,
+        reply_markup: Option<Value>,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<Value, String> {
+        let mut payload = json!({
+            "chat_id": chat_id,
+            "animation": animation,
+        });
+        if let Some(cap) = caption {
+            payload["caption"] = json!(cap);
+        }
+        if let Some(pm) = parse_mode {
+            payload["parse_mode"] = json!(pm);
+        }
+        if let Some(ref rm) = reply_markup {
+            payload["reply_markup"] = rm.clone();
+        }
+        if let Some(rep) = reply_to_message_id {
+            payload["reply_parameters"] =
+                serde_json::to_value(ReplyParameters::new(rep)).unwrap_or(json!({}));
+        }
+        Self::apply_delivery_context(&mut payload, true);
+
+        match self.post_json("sendAnimation", payload).await {
+            Ok(res) => Ok(res),
+            Err(e) => {
+                if animation.starts_with("http://") || animation.starts_with("https://") {
+                    if let Some((bytes, mime, fname)) = self
+                        .download_media_bytes(animation, MAX_TELEGRAM_DOWNLOAD_BYTES)
+                        .await
+                    {
+                        let url = format!("{}/sendAnimation", self.base_url);
+                        let part = Part::bytes(bytes)
+                            .file_name(fname)
+                            .mime_str(&mime)
+                            .map_err(|e| e.to_string())?;
+                        let mut form = Form::new()
+                            .text("chat_id", chat_id.to_string())
+                            .part("animation", part);
+                        if let Some(cap) = caption {
+                            form = form.text("caption", cap.to_string());
+                        }
+                        if let Some(pm) = parse_mode {
+                            form = form.text("parse_mode", pm.to_string());
+                        }
+                        if let Some(rm) = reply_markup {
+                            form = form.text("reply_markup", rm.to_string());
+                        }
+                        if let Ok(resp) = self.client.post(&url).multipart(form).send().await {
+                            if let Ok(response) = resp.json::<Value>().await {
+                                if response.get("ok").and_then(Value::as_bool) == Some(true) {
+                                    return Ok(response);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_location(
+        &self,
+        chat_id: i64,
+        latitude: f64,
+        longitude: f64,
+        horizontal_accuracy: Option<f64>,
+        live_period: Option<i32>,
+        reply_markup: Option<Value>,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<Value, String> {
+        let mut payload = json!({
+            "chat_id": chat_id,
+            "latitude": latitude,
+            "longitude": longitude,
+        });
+        if let Some(ha) = horizontal_accuracy {
+            payload["horizontal_accuracy"] = json!(ha);
+        }
+        if let Some(lp) = live_period {
+            payload["live_period"] = json!(lp);
+        }
+        if let Some(rm) = reply_markup {
+            payload["reply_markup"] = rm;
+        }
+        if let Some(rep) = reply_to_message_id {
+            payload["reply_parameters"] =
+                serde_json::to_value(ReplyParameters::new(rep)).unwrap_or(json!({}));
+        }
+        Self::apply_delivery_context(&mut payload, true);
+        self.post_json("sendLocation", payload).await
+    }
+
+    pub async fn send_document(
+        &self,
+        chat_id: i64,
+        document: &str,
+        caption: Option<&str>,
+        parse_mode: Option<&str>,
+        reply_markup: Option<Value>,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<Value, String> {
+        let mut payload = json!({
+            "chat_id": chat_id,
+            "document": document,
+        });
+        if let Some(cap) = caption {
+            payload["caption"] = json!(cap);
+        }
+        if let Some(pm) = parse_mode {
+            payload["parse_mode"] = json!(pm);
+        }
+        if let Some(ref rm) = reply_markup {
+            payload["reply_markup"] = rm.clone();
+        }
+        if let Some(rep) = reply_to_message_id {
+            payload["reply_parameters"] =
+                serde_json::to_value(ReplyParameters::new(rep)).unwrap_or(json!({}));
+        }
+        Self::apply_delivery_context(&mut payload, true);
+
+        match self.post_json("sendDocument", payload).await {
+            Ok(res) => Ok(res),
+            Err(e) => {
+                if document.starts_with("http://") || document.starts_with("https://") {
+                    if let Some((bytes, mime, fname)) = self
+                        .download_media_bytes(document, MAX_TELEGRAM_DOWNLOAD_BYTES)
+                        .await
+                    {
+                        let url = format!("{}/sendDocument", self.base_url);
+                        let part = Part::bytes(bytes)
+                            .file_name(fname)
+                            .mime_str(&mime)
+                            .map_err(|e| e.to_string())?;
+                        let mut form = Form::new()
+                            .text("chat_id", chat_id.to_string())
+                            .part("document", part);
+                        if let Some(cap) = caption {
+                            form = form.text("caption", cap.to_string());
+                        }
+                        if let Some(pm) = parse_mode {
+                            form = form.text("parse_mode", pm.to_string());
+                        }
+                        if let Some(rm) = reply_markup {
+                            form = form.text("reply_markup", rm.to_string());
+                        }
+                        if let Ok(resp) = self.client.post(&url).multipart(form).send().await {
+                            if let Ok(response) = resp.json::<Value>().await {
+                                if response.get("ok").and_then(Value::as_bool) == Some(true) {
+                                    return Ok(response);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
     pub async fn edit_message_text(
         &self,
         chat_id: Option<i64>,
@@ -537,6 +1198,141 @@ impl TelegramBotClient {
             reply_markup,
         )
         .await
+    }
+
+    pub async fn edit_ephemeral_message_media(
+        &self,
+        chat_id: i64,
+        receiver_user_id: i64,
+        ephemeral_message_id: i64,
+        media: &InputMedia,
+        reply_markup: Option<Value>,
+    ) -> Result<Value, String> {
+        let media_json = serde_json::to_value(media).map_err(|e| e.to_string())?;
+        let mut payload = json!({
+            "chat_id": chat_id,
+            "receiver_user_id": receiver_user_id,
+            "ephemeral_message_id": ephemeral_message_id,
+            "media": media_json,
+        });
+        if let Some(rm) = reply_markup {
+            payload["reply_markup"] = rm;
+        }
+        self.post_json("editEphemeralMessageMedia", payload).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn edit_ephemeral_message_caption(
+        &self,
+        chat_id: i64,
+        receiver_user_id: i64,
+        ephemeral_message_id: i64,
+        caption: Option<&str>,
+        parse_mode: Option<&str>,
+        show_caption_above_media: Option<bool>,
+        reply_markup: Option<Value>,
+    ) -> Result<Value, String> {
+        let mut payload = json!({
+            "chat_id": chat_id,
+            "receiver_user_id": receiver_user_id,
+            "ephemeral_message_id": ephemeral_message_id,
+        });
+        if let Some(c) = caption {
+            payload["caption"] = json!(c);
+        }
+        if let Some(pm) = parse_mode {
+            payload["parse_mode"] = json!(pm);
+        }
+        if let Some(scam) = show_caption_above_media {
+            payload["show_caption_above_media"] = json!(scam);
+        }
+        if let Some(rm) = reply_markup {
+            payload["reply_markup"] = rm;
+        }
+        self.post_json("editEphemeralMessageCaption", payload).await
+    }
+
+    pub async fn edit_ephemeral_message_reply_markup(
+        &self,
+        chat_id: i64,
+        receiver_user_id: i64,
+        ephemeral_message_id: i64,
+        reply_markup: Option<Value>,
+    ) -> Result<Value, String> {
+        let mut payload = json!({
+            "chat_id": chat_id,
+            "receiver_user_id": receiver_user_id,
+            "ephemeral_message_id": ephemeral_message_id,
+        });
+        if let Some(rm) = reply_markup {
+            payload["reply_markup"] = rm;
+        }
+        self.post_json("editEphemeralMessageReplyMarkup", payload)
+            .await
+    }
+
+    pub async fn send_rich_message_with_media(
+        &self,
+        chat_id: i64,
+        rich_message: &InputRichMessage,
+        attached_files: Vec<(String, Vec<u8>, String)>,
+        reply_markup: Option<Value>,
+        receiver_user_id: Option<i64>,
+    ) -> Result<Value, String> {
+        if attached_files.is_empty() {
+            return self
+                .send_rich_message(chat_id, rich_message, reply_markup, receiver_user_id)
+                .await;
+        }
+        rich_message.validate()?;
+        let rich_json = serde_json::to_string(rich_message).map_err(|e| e.to_string())?;
+
+        let url = format!("{}/sendRichMessage", self.base_url);
+        let mut form = Form::new()
+            .text("chat_id", chat_id.to_string())
+            .text("rich_message", rich_json);
+
+        if let Some(rm) = reply_markup {
+            form = form.text("reply_markup", rm.to_string());
+        }
+        let delivery = Self::current_delivery_context();
+        if let Some(thread_id) = delivery.message_thread_id {
+            form = form.text("message_thread_id", thread_id.to_string());
+        }
+        let effective_receiver = receiver_user_id.or(delivery.receiver_user_id);
+        if let Some(receiver_user_id) = effective_receiver {
+            let ephemeral = serde_json::to_string(&EphemeralMessageParameters {
+                receiver_user_id,
+                callback_query_id: delivery.callback_query_id.clone(),
+                replace_callback_query_message: None,
+            })
+            .map_err(|e| e.to_string())?;
+            form = form.text("ephemeral_message_parameters", ephemeral);
+        }
+
+        for (attach_name, bytes, mime) in attached_files {
+            let part = Part::bytes(bytes)
+                .file_name(attach_name.clone())
+                .mime_str(&mime)
+                .map_err(|e| e.to_string())?;
+            form = form.part(attach_name, part);
+        }
+
+        match self.client.post(&url).multipart(form).send().await {
+            Ok(resp) => {
+                let response =
+                    read_bounded_json_response(resp, MAX_TELEGRAM_RESPONSE_BYTES).await?;
+                if response.get("ok").and_then(Value::as_bool) == Some(true) {
+                    Ok(response)
+                } else {
+                    Err(Self::telegram_api_error("sendRichMessage", &response))
+                }
+            }
+            Err(e) => Err(format!(
+                "sendRichMessage multipart error: {}",
+                reqwest_error_kind(&e)
+            )),
+        }
     }
 
     pub async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<Value, String> {
@@ -928,6 +1724,7 @@ impl TelegramBotClient {
             RichBlock::Paragraph { text }
             | RichBlock::SectionHeading { text, .. }
             | RichBlock::Thinking { text } => self.rich_value_to_plain(text),
+            RichBlock::Footer { text } => format!("— {}", self.rich_value_to_plain(text)),
             RichBlock::Preformatted { text, .. } => text.clone(),
             RichBlock::List { items } => items
                 .iter()
@@ -946,18 +1743,28 @@ impl TelegramBotClient {
                     format!("{marker} {body}")
                 })
                 .collect::<Vec<_>>()
-                .join("\n"),
+                .join(
+                    "
+",
+                ),
             RichBlock::BlockQuotation { blocks } => blocks
                 .iter()
                 .map(|value| self.rich_value_to_plain(value))
                 .collect::<Vec<_>>()
-                .join("\n"),
-            RichBlock::ExpandableBlockQuotation { text, credit } => {
+                .join(
+                    "
+",
+                ),
+            RichBlock::ExpandableBlockQuotation { text, credit }
+            | RichBlock::PullQuotation { text, credit } => {
                 let mut output = self.rich_value_to_plain(text);
                 if let Some(credit) = credit {
                     let credit = self.rich_value_to_plain(credit);
                     if !credit.is_empty() {
-                        output.push_str("\n— ");
+                        output.push_str(
+                            "
+— ",
+                        );
                         output.push_str(&credit);
                     }
                 }
@@ -974,19 +1781,98 @@ impl TelegramBotClient {
                 .collect::<Vec<_>>()
                 .join(" | "),
             RichBlock::Document { document, caption } => {
-                let label = document
-                    .get("media")
-                    .and_then(Value::as_str)
-                    .unwrap_or("document");
-                let caption = caption
+                let name = caption
                     .as_ref()
-                    .map(|value| self.rich_value_to_plain(value))
-                    .unwrap_or_default();
-                if caption.is_empty() {
-                    format!("Document: {label}")
+                    .map(|cap| self.rich_value_to_plain(&cap.text))
+                    .filter(|val| !val.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        document
+                            .get("media")
+                            .and_then(Value::as_str)
+                            .map(|m| m.strip_prefix("tg://document?id=").unwrap_or(m))
+                            .unwrap_or("document")
+                            .to_string()
+                    });
+                format!("📄 {name}")
+            }
+            RichBlock::Photo { caption, .. } => {
+                let cap = self.rich_caption_to_plain(caption);
+                if cap.is_empty() {
+                    "[Photo]".to_string()
                 } else {
-                    format!("Document: {label}\n{caption}")
+                    format!("[Photo] {cap}")
                 }
+            }
+            RichBlock::Video { caption, .. } => {
+                let cap = self.rich_caption_to_plain(caption);
+                if cap.is_empty() {
+                    "[Video]".to_string()
+                } else {
+                    format!("[Video] {cap}")
+                }
+            }
+            RichBlock::Audio { caption, .. } => {
+                let cap = self.rich_caption_to_plain(caption);
+                if cap.is_empty() {
+                    "[Audio]".to_string()
+                } else {
+                    format!("[Audio] {cap}")
+                }
+            }
+            RichBlock::VoiceNote { caption, .. } => {
+                let cap = self.rich_caption_to_plain(caption);
+                if cap.is_empty() {
+                    "[Voice Note]".to_string()
+                } else {
+                    format!("[Voice Note] {cap}")
+                }
+            }
+            RichBlock::Animation { caption, .. } => {
+                let cap = self.rich_caption_to_plain(caption);
+                if cap.is_empty() {
+                    "[Animation]".to_string()
+                } else {
+                    format!("[Animation] {cap}")
+                }
+            }
+            RichBlock::Collage { blocks, caption } => {
+                let items = blocks
+                    .iter()
+                    .map(|value| self.rich_value_to_plain(value))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let cap = self.rich_caption_to_plain(caption);
+                if cap.is_empty() {
+                    format!("[Collage: {items}]")
+                } else {
+                    format!(
+                        "[Collage: {items}]
+{cap}"
+                    )
+                }
+            }
+            RichBlock::Slideshow { blocks, caption } => {
+                let items = blocks
+                    .iter()
+                    .map(|value| self.rich_value_to_plain(value))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let cap = self.rich_caption_to_plain(caption);
+                if cap.is_empty() {
+                    format!("[Slideshow: {items}]")
+                } else {
+                    format!(
+                        "[Slideshow: {items}]
+{cap}"
+                    )
+                }
+            }
+            RichBlock::Map { location, zoom, .. } => {
+                let zoom_str = zoom.map(|z| format!(" zoom={z}")).unwrap_or_default();
+                format!(
+                    "[Map: lat={}, lon={}{}]",
+                    location.latitude, location.longitude, zoom_str
+                )
             }
             RichBlock::Details {
                 summary, blocks, ..
@@ -995,10 +1881,18 @@ impl TelegramBotClient {
                     .iter()
                     .map(|value| self.rich_value_to_plain(value))
                     .collect::<Vec<_>>()
-                    .join("\n");
-                format!("{}\n{}", self.rich_value_to_plain(summary), body)
-                    .trim()
-                    .to_string()
+                    .join(
+                        "
+",
+                    );
+                format!(
+                    "{}
+{}",
+                    self.rich_value_to_plain(summary),
+                    body
+                )
+                .trim()
+                .to_string()
             }
             RichBlock::Anchor { .. } => String::new(),
         }
@@ -1019,11 +1913,26 @@ impl TelegramBotClient {
         match block {
             RichBlock::Paragraph { text } => {
                 let inner = self.rich_value_to_html(text);
-                format!("{inner}\n")
+                format!(
+                    "{inner}
+"
+                )
+            }
+            RichBlock::Footer { text } => {
+                let inner = self.rich_value_to_html(text);
+                format!(
+                    "
+— <i>{inner}</i>
+"
+                )
             }
             RichBlock::SectionHeading { text, .. } => {
                 let inner = self.rich_value_to_html(text);
-                format!("\n<b>{inner}</b>\n")
+                format!(
+                    "
+<b>{inner}</b>
+"
+                )
             }
             RichBlock::Preformatted { text, language } => {
                 let lang_attr = language
@@ -1032,7 +1941,10 @@ impl TelegramBotClient {
                     .map(|language| format!(" class=\"language-{language}\""))
                     .unwrap_or_default();
                 let esc = html_escape::encode_text(text);
-                format!("<pre{lang_attr}>{esc}</pre>\n")
+                format!(
+                    "<pre{lang_attr}>{esc}</pre>
+"
+                )
             }
             RichBlock::List { items } => {
                 let mut list_lines = Vec::new();
@@ -1050,16 +1962,23 @@ impl TelegramBotClient {
                         .unwrap_or_else(|| "•".to_string());
                     list_lines.push(format!("{marker} {item_str}"));
                 }
-                list_lines.join("\n")
+                list_lines.join(
+                    "
+",
+                )
             }
             RichBlock::BlockQuotation { blocks } => {
                 let mut q_text = String::new();
                 for b in blocks {
                     q_text.push_str(&self.rich_value_to_html(b));
                 }
-                format!("<blockquote>{q_text}</blockquote>\n")
+                format!(
+                    "<blockquote>{q_text}</blockquote>
+"
+                )
             }
-            RichBlock::ExpandableBlockQuotation { text, credit } => {
+            RichBlock::ExpandableBlockQuotation { text, credit }
+            | RichBlock::PullQuotation { text, credit } => {
                 let q_text = self.rich_value_to_html(text);
                 let credit_html = credit
                     .as_ref()
@@ -1067,19 +1986,31 @@ impl TelegramBotClient {
                     .filter(|value| !value.is_empty())
                     .map(|value| format!("<cite>{value}</cite>"))
                     .unwrap_or_default();
-                format!("<blockquote expandable>{q_text}{credit_html}</blockquote>\n")
+                format!(
+                    "<blockquote expandable>{q_text}{credit_html}</blockquote>
+"
+                )
             }
-            RichBlock::Divider {} => "────────────────────────\n".to_string(),
+            RichBlock::Divider {} => "────────────────────────
+"
+            .to_string(),
             RichBlock::MathematicalExpression { expression } => {
                 let esc = html_escape::encode_text(expression);
-                format!("<code>{esc}</code>\n")
+                format!(
+                    "<code>{esc}</code>
+"
+                )
             }
             RichBlock::Table {
                 cells, has_header, ..
             } => {
                 let ascii_tbl = self.render_table_to_ascii(cells, *has_header);
                 if !ascii_tbl.is_empty() {
-                    format!("\n{ascii_tbl}\n")
+                    format!(
+                        "
+{ascii_tbl}
+"
+                    )
                 } else {
                     String::new()
                 }
@@ -1089,12 +2020,30 @@ impl TelegramBotClient {
                 .map(|button| format!("[{}]", self.rich_value_to_html(&button.text)))
                 .collect::<Vec<_>>()
                 .join(" "),
-            RichBlock::Document { document, .. } => {
-                let label = document
+            RichBlock::Document { document, caption } => {
+                let name = caption
+                    .as_ref()
+                    .map(|cap| self.rich_value_to_html(&cap.text))
+                    .filter(|val| !val.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        let m = document
+                            .get("media")
+                            .and_then(Value::as_str)
+                            .map(|m| m.strip_prefix("tg://document?id=").unwrap_or(m))
+                            .unwrap_or("document");
+                        html_escape::encode_text(m).to_string()
+                    });
+                let media = document
                     .get("media")
                     .and_then(Value::as_str)
-                    .unwrap_or("document");
-                format!("📄 <code>{}</code>\n", html_escape::encode_text(label))
+                    .or_else(|| document.as_str())
+                    .unwrap_or_default();
+                if !media.is_empty() && !media.starts_with("tg://") {
+                    let safe_url = html_escape::encode_double_quoted_attribute(media);
+                    format!("📄 <b><a href=\"{safe_url}\">{name}</a></b>\n")
+                } else {
+                    format!("📄 <b>{name}</b>\n")
+                }
             }
             RichBlock::Details {
                 summary, blocks, ..
@@ -1111,8 +2060,186 @@ impl TelegramBotClient {
                 let t_esc = self.rich_value_to_html(text);
                 format!("<blockquote expandable>💭 <b>Thinking:</b>\n{t_esc}</blockquote>\n")
             }
+            RichBlock::Photo { photo, caption } => {
+                let cap = self.rich_caption_to_html(caption);
+                let media = photo
+                    .get("media")
+                    .and_then(Value::as_str)
+                    .or_else(|| photo.as_str())
+                    .unwrap_or_default();
+                if !media.is_empty() {
+                    let safe_url = html_escape::encode_double_quoted_attribute(media);
+                    let label = if cap.is_empty() {
+                        "Lihat Foto".to_string()
+                    } else {
+                        cap
+                    };
+                    format!("🖼️ <b><a href=\"{safe_url}\">{label}</a></b>\n")
+                } else if cap.is_empty() {
+                    "🖼️ <b>[Photo]</b>\n".to_string()
+                } else {
+                    format!("🖼️ <b>[Photo]</b>\n{cap}\n")
+                }
+            }
+            RichBlock::Video { video, caption } => {
+                let cap = self.rich_caption_to_html(caption);
+                let media = video
+                    .get("media")
+                    .and_then(Value::as_str)
+                    .or_else(|| video.as_str())
+                    .unwrap_or_default();
+                if !media.is_empty() {
+                    let safe_url = html_escape::encode_double_quoted_attribute(media);
+                    let label = if cap.is_empty() {
+                        "Lihat Video".to_string()
+                    } else {
+                        cap
+                    };
+                    format!("🎥 <b><a href=\"{safe_url}\">{label}</a></b>\n")
+                } else if cap.is_empty() {
+                    "🎥 <b>[Video]</b>\n".to_string()
+                } else {
+                    format!("🎥 <b>[Video]</b>\n{cap}\n")
+                }
+            }
+            RichBlock::Audio { audio, caption } => {
+                let cap = self.rich_caption_to_html(caption);
+                let media = audio
+                    .get("media")
+                    .and_then(Value::as_str)
+                    .or_else(|| audio.as_str())
+                    .unwrap_or_default();
+                if !media.is_empty() {
+                    let safe_url = html_escape::encode_double_quoted_attribute(media);
+                    let label = if cap.is_empty() {
+                        "Dengarkan Audio".to_string()
+                    } else {
+                        cap
+                    };
+                    format!("🎵 <b><a href=\"{safe_url}\">{label}</a></b>\n")
+                } else if cap.is_empty() {
+                    "🎵 <b>[Audio]</b>\n".to_string()
+                } else {
+                    format!("🎵 <b>[Audio]</b>\n{cap}\n")
+                }
+            }
+            RichBlock::VoiceNote {
+                voice_note,
+                caption,
+            } => {
+                let cap = self.rich_caption_to_html(caption);
+                let media = voice_note
+                    .get("media")
+                    .and_then(Value::as_str)
+                    .or_else(|| voice_note.as_str())
+                    .unwrap_or_default();
+                if !media.is_empty() {
+                    let safe_url = html_escape::encode_double_quoted_attribute(media);
+                    let label = if cap.is_empty() {
+                        "Pesan Suara".to_string()
+                    } else {
+                        cap
+                    };
+                    format!("🎤 <b><a href=\"{safe_url}\">{label}</a></b>\n")
+                } else if cap.is_empty() {
+                    "🎤 <b>[Voice Note]</b>\n".to_string()
+                } else {
+                    format!("🎤 <b>[Voice Note]</b>\n{cap}\n")
+                }
+            }
+            RichBlock::Animation { animation, caption } => {
+                let cap = self.rich_caption_to_html(caption);
+                let media = animation
+                    .get("media")
+                    .and_then(Value::as_str)
+                    .or_else(|| animation.as_str())
+                    .unwrap_or_default();
+                if !media.is_empty() {
+                    let safe_url = html_escape::encode_double_quoted_attribute(media);
+                    let label = if cap.is_empty() {
+                        "Lihat Animasi".to_string()
+                    } else {
+                        cap
+                    };
+                    format!("🎞️ <b><a href=\"{safe_url}\">{label}</a></b>\n")
+                } else if cap.is_empty() {
+                    "🎞️ <b>[Animation]</b>\n".to_string()
+                } else {
+                    format!("🎞️ <b>[Animation]</b>\n{cap}\n")
+                }
+            }
+            RichBlock::Collage { blocks, caption } | RichBlock::Slideshow { blocks, caption } => {
+                let cap = self.rich_caption_to_html(caption);
+                let label = if cap.is_empty() {
+                    "Galeri Foto".to_string()
+                } else {
+                    cap
+                };
+                let mut links = Vec::new();
+                for (i, b) in blocks.iter().enumerate() {
+                    let url = b
+                        .get("photo")
+                        .and_then(|p| p.get("media"))
+                        .and_then(Value::as_str)
+                        .or_else(|| b.get("media").and_then(Value::as_str))
+                        .or_else(|| b.as_str())
+                        .unwrap_or_default();
+                    if !url.is_empty() {
+                        let safe_url = html_escape::encode_double_quoted_attribute(url);
+                        links.push(format!("<a href=\"{safe_url}\">Foto #{}</a>", i + 1));
+                    }
+                }
+                if links.is_empty() {
+                    format!("🖼️ <b>{label}</b>\n")
+                } else {
+                    format!("🖼️ <b>{label}</b>: {}\n", links.join(" • "))
+                }
+            }
+            RichBlock::Map { location, zoom, .. } => {
+                let zoom_str = zoom.map(|z| format!("?z={z}")).unwrap_or_default();
+                let url = format!(
+                    "https://www.google.com/maps?q={},{}",
+                    location.latitude, location.longitude
+                );
+                let safe_url = html_escape::encode_double_quoted_attribute(&url);
+                format!(
+                    "📍 <b><a href=\"{safe_url}\">Lokasi Peta ({}, {}{})</a></b>\n",
+                    location.latitude, location.longitude, zoom_str
+                )
+            }
             RichBlock::Anchor { .. } => String::new(),
         }
+    }
+
+    fn rich_caption_to_plain(&self, caption: &Option<RichBlockCaption>) -> String {
+        let Some(caption) = caption else {
+            return String::new();
+        };
+        let mut text = self.rich_value_to_plain(&caption.text);
+        if let Some(credit) = &caption.credit {
+            let credit_text = self.rich_value_to_plain(credit);
+            if !credit_text.is_empty() {
+                text.push_str(" — ");
+                text.push_str(&credit_text);
+            }
+        }
+        text
+    }
+
+    fn rich_caption_to_html(&self, caption: &Option<RichBlockCaption>) -> String {
+        let Some(caption) = caption else {
+            return String::new();
+        };
+        let mut text = self.rich_value_to_html(&caption.text);
+        if let Some(credit) = &caption.credit {
+            let credit_text = self.rich_value_to_html(credit);
+            if !credit_text.is_empty() {
+                text.push_str("<cite>");
+                text.push_str(&credit_text);
+                text.push_str("</cite>");
+            }
+        }
+        text
     }
 
     fn rich_value_to_html(&self, v: &Value) -> String {
@@ -1327,6 +2454,7 @@ impl TelegramBotClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bot::models::Location;
 
     #[test]
     fn split_text_chunks_preserves_unicode_and_bounds() {
@@ -1357,6 +2485,64 @@ mod tests {
                 + chunk.matches("&quot;").count()
                 + chunk.matches("&#x27;").count()
         }));
+    }
+
+    #[test]
+    fn rich_media_blocks_render_to_plain_and_html_fallback() {
+        let client = TelegramBotClient::new("test-token");
+        let blocks = vec![
+            RichBlock::Photo {
+                photo: serde_json::json!({"type": "photo", "media": "photo_1"}),
+                caption: Some(RichBlockCaption::new(Value::String(
+                    "Foto sunset".to_string(),
+                ))),
+            },
+            RichBlock::Video {
+                video: serde_json::json!({"type": "video", "media": "video_1"}),
+                caption: Some(RichBlockCaption::new(Value::String(
+                    "Video clip".to_string(),
+                ))),
+            },
+            RichBlock::Audio {
+                audio: serde_json::json!({"type": "audio", "media": "audio_1"}),
+                caption: None,
+            },
+            RichBlock::VoiceNote {
+                voice_note: serde_json::json!({"type": "voice", "media": "voice_1"}),
+                caption: None,
+            },
+            RichBlock::Animation {
+                animation: serde_json::json!({"type": "animation", "media": "anim_1"}),
+                caption: None,
+            },
+            RichBlock::Map {
+                location: Location {
+                    latitude: -5.14,
+                    longitude: 119.43,
+                    horizontal_accuracy: None,
+                },
+                zoom: Some(12),
+                width: None,
+                height: None,
+            },
+        ];
+        let plain = client
+            .render_blocks_to_plain_chunks(&blocks, 4000)
+            .join("\n");
+        assert!(plain.contains("[Photo] Foto sunset"));
+        assert!(plain.contains("[Video] Video clip"));
+        assert!(plain.contains("[Audio]"));
+        assert!(plain.contains("[Voice Note]"));
+        assert!(plain.contains("[Animation]"));
+        assert!(plain.contains("[Map: lat=-5.14, lon=119.43 zoom=12]"));
+
+        let html = client.render_blocks_to_html(&blocks);
+        assert!(html.contains("🖼️ <b><a href=\"photo_1\">Foto sunset</a></b>"));
+        assert!(html.contains("🎥 <b><a href=\"video_1\">Video clip</a></b>"));
+        assert!(html.contains("🎵 <b><a href=\"audio_1\">Dengarkan Audio</a></b>"));
+        assert!(html.contains("🎤 <b><a href=\"voice_1\">Pesan Suara</a></b>"));
+        assert!(html.contains("🎞️ <b><a href=\"anim_1\">Lihat Animasi</a></b>"));
+        assert!(html.contains("📍 <b><a href=\"https://www.google.com/maps?q=-5.14,119.43\">Lokasi Peta (-5.14, 119.43?z=12)</a></b>"));
     }
 
     #[test]

@@ -7,6 +7,203 @@ use serde_json::Value;
 // Inline & Reply Keyboards
 // ==========================================
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Location {
+    pub latitude: f64,
+    pub longitude: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub horizontal_accuracy: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LoginUrl {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forward_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot_username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_write_access: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwitchInlineQueryChosenChat {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_user_chats: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_bot_chats: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_group_chats: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_channel_chats: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum InputMedia {
+    #[serde(rename = "photo")]
+    Photo {
+        media: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parse_mode: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        show_caption_above_media: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        has_spoiler: Option<bool>,
+    },
+    #[serde(rename = "video")]
+    Video {
+        media: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parse_mode: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        show_caption_above_media: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        width: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        height: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        has_spoiler: Option<bool>,
+    },
+    #[serde(rename = "animation")]
+    Animation {
+        media: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parse_mode: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        show_caption_above_media: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        width: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        height: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        has_spoiler: Option<bool>,
+    },
+    #[serde(rename = "audio")]
+    Audio {
+        media: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parse_mode: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        performer: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+    #[serde(rename = "document")]
+    Document {
+        media: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parse_mode: Option<String>,
+    },
+    #[serde(rename = "voice")]
+    VoiceNote {
+        media: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parse_mode: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration: Option<i32>,
+    },
+}
+
+impl InputMedia {
+    pub fn photo(
+        media: impl Into<String>,
+        caption: Option<String>,
+        parse_mode: Option<String>,
+    ) -> Self {
+        InputMedia::Photo {
+            media: media.into(),
+            caption,
+            parse_mode,
+            show_caption_above_media: None,
+            has_spoiler: None,
+        }
+    }
+
+    pub fn video(
+        media: impl Into<String>,
+        caption: Option<String>,
+        parse_mode: Option<String>,
+    ) -> Self {
+        InputMedia::Video {
+            media: media.into(),
+            caption,
+            parse_mode,
+            show_caption_above_media: None,
+            width: None,
+            height: None,
+            duration: None,
+            has_spoiler: None,
+        }
+    }
+
+    pub fn audio(
+        media: impl Into<String>,
+        caption: Option<String>,
+        parse_mode: Option<String>,
+        title: Option<String>,
+        performer: Option<String>,
+    ) -> Self {
+        InputMedia::Audio {
+            media: media.into(),
+            caption,
+            parse_mode,
+            duration: None,
+            performer,
+            title,
+        }
+    }
+
+    pub fn document(
+        media: impl Into<String>,
+        caption: Option<String>,
+        parse_mode: Option<String>,
+    ) -> Self {
+        InputMedia::Document {
+            media: media.into(),
+            caption,
+            parse_mode,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputRichMessageMedia {
+    pub id: String,
+    pub media: InputMedia,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CopyTextButton {
+    pub text: String,
+}
+
+impl CopyTextButton {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self { text: text.into() }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InlineKeyboardButton {
     pub text: String,
@@ -19,6 +216,16 @@ pub struct InlineKeyboardButton {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub web_app: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub copy_text: Option<CopyTextButton>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub login_url: Option<LoginUrl>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switch_inline_query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switch_inline_query_current_chat: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switch_inline_query_chosen_chat: Option<SwitchInlineQueryChosenChat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled: Option<Value>,
 }
 
@@ -30,6 +237,11 @@ impl InlineKeyboardButton {
             callback_data: Some(callback_data.into()),
             url: None,
             web_app: None,
+            copy_text: None,
+            login_url: None,
+            switch_inline_query: None,
+            switch_inline_query_current_chat: None,
+            switch_inline_query_chosen_chat: None,
             disabled: None,
         }
     }
@@ -51,6 +263,27 @@ impl InlineKeyboardButton {
             callback_data: None,
             url: Some(url.into()),
             web_app: None,
+            copy_text: None,
+            login_url: None,
+            switch_inline_query: None,
+            switch_inline_query_current_chat: None,
+            switch_inline_query_chosen_chat: None,
+            disabled: None,
+        }
+    }
+
+    pub fn copy(text: impl Into<String>, copy_text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: None,
+            callback_data: None,
+            url: None,
+            web_app: None,
+            copy_text: Some(CopyTextButton::new(copy_text)),
+            login_url: None,
+            switch_inline_query: None,
+            switch_inline_query_current_chat: None,
+            switch_inline_query_chosen_chat: None,
             disabled: None,
         }
     }
@@ -62,6 +295,11 @@ impl InlineKeyboardButton {
             callback_data: None,
             url: None,
             web_app: None,
+            copy_text: None,
+            login_url: None,
+            switch_inline_query: None,
+            switch_inline_query_current_chat: None,
+            switch_inline_query_chosen_chat: None,
             disabled: Some(serde_json::json!({})),
         }
     }
@@ -189,6 +427,11 @@ impl BotCommand {
 // ==========================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RichTextButton {
+    pub button: RichMessageButton,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RichMessageButton {
     pub text: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -199,6 +442,16 @@ pub struct RichMessageButton {
     pub callback_data: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub web_app: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub copy_text: Option<CopyTextButton>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub login_url: Option<LoginUrl>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switch_inline_query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switch_inline_query_current_chat: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switch_inline_query_chosen_chat: Option<SwitchInlineQueryChosenChat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled: Option<Value>,
 }
@@ -211,6 +464,11 @@ impl RichMessageButton {
             url: None,
             callback_data: Some(callback_data.into()),
             web_app: None,
+            copy_text: None,
+            login_url: None,
+            switch_inline_query: None,
+            switch_inline_query_current_chat: None,
+            switch_inline_query_chosen_chat: None,
             disabled: None,
         }
     }
@@ -232,6 +490,27 @@ impl RichMessageButton {
             url: Some(url.into()),
             callback_data: None,
             web_app: None,
+            copy_text: None,
+            login_url: None,
+            switch_inline_query: None,
+            switch_inline_query_current_chat: None,
+            switch_inline_query_chosen_chat: None,
+            disabled: None,
+        }
+    }
+
+    pub fn copy(text: impl Into<String>, copy_text: impl Into<String>) -> Self {
+        Self {
+            text: Value::String(text.into()),
+            style: None,
+            url: None,
+            callback_data: None,
+            web_app: None,
+            copy_text: Some(CopyTextButton::new(copy_text)),
+            login_url: None,
+            switch_inline_query: None,
+            switch_inline_query_current_chat: None,
+            switch_inline_query_chosen_chat: None,
             disabled: None,
         }
     }
@@ -243,6 +522,11 @@ impl RichMessageButton {
             url: None,
             callback_data: None,
             web_app: None,
+            copy_text: None,
+            login_url: None,
+            switch_inline_query: None,
+            switch_inline_query_current_chat: None,
+            switch_inline_query_chosen_chat: None,
             disabled: Some(serde_json::json!({})),
         }
     }
@@ -251,13 +535,46 @@ impl RichMessageButton {
         let action_count = usize::from(self.url.is_some())
             + usize::from(self.callback_data.is_some())
             + usize::from(self.web_app.is_some())
+            + usize::from(self.copy_text.is_some())
+            + usize::from(self.login_url.is_some())
+            + usize::from(self.switch_inline_query.is_some())
+            + usize::from(self.switch_inline_query_current_chat.is_some())
+            + usize::from(self.switch_inline_query_chosen_chat.is_some())
             + usize::from(self.disabled.is_some());
         if action_count != 1 {
             return Err(format!(
                 "RichMessageButton must contain exactly one action, found {action_count}"
             ));
         }
+        if let Some(copy_button) = &self.copy_text {
+            let len = copy_button.text.chars().count();
+            if len == 0 || len > 256 {
+                return Err(format!(
+                    "RichMessageButton copy_text must contain 1-256 characters, found {len}"
+                ));
+            }
+        }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RichBlockCaption {
+    pub text: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit: Option<Value>,
+}
+
+impl RichBlockCaption {
+    pub fn new(text: Value) -> Self {
+        Self { text, credit: None }
+    }
+
+    pub fn with_credit(text: Value, credit: Value) -> Self {
+        Self {
+            text,
+            credit: Some(credit),
+        }
     }
 }
 
@@ -347,6 +664,9 @@ pub enum RichBlock {
         language: Option<String>,
     },
 
+    #[serde(rename = "footer")]
+    Footer { text: Value },
+
     #[serde(rename = "list")]
     List { items: Vec<RichBlockListItem> },
 
@@ -357,6 +677,13 @@ pub enum RichBlock {
 
     #[serde(rename = "expandable_blockquote")]
     ExpandableBlockQuotation {
+        text: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        credit: Option<Value>,
+    },
+
+    #[serde(rename = "pullquote")]
+    PullQuotation {
         text: Value,
         #[serde(skip_serializing_if = "Option::is_none")]
         credit: Option<Value>,
@@ -391,7 +718,67 @@ pub enum RichBlock {
     Document {
         document: Value,
         #[serde(skip_serializing_if = "Option::is_none")]
-        caption: Option<Value>,
+        caption: Option<RichBlockCaption>,
+    },
+
+    #[serde(rename = "photo")]
+    Photo {
+        photo: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption: Option<RichBlockCaption>,
+    },
+
+    #[serde(rename = "video")]
+    Video {
+        video: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption: Option<RichBlockCaption>,
+    },
+
+    #[serde(rename = "audio")]
+    Audio {
+        audio: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption: Option<RichBlockCaption>,
+    },
+
+    #[serde(rename = "voice_note")]
+    VoiceNote {
+        voice_note: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption: Option<RichBlockCaption>,
+    },
+
+    #[serde(rename = "animation")]
+    Animation {
+        animation: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption: Option<RichBlockCaption>,
+    },
+
+    #[serde(rename = "collage")]
+    Collage {
+        blocks: Vec<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption: Option<RichBlockCaption>,
+    },
+
+    #[serde(rename = "slideshow")]
+    Slideshow {
+        blocks: Vec<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption: Option<RichBlockCaption>,
+    },
+
+    #[serde(rename = "map")]
+    Map {
+        location: Location,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        zoom: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        width: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        height: Option<i32>,
     },
 
     #[serde(rename = "details")]
@@ -407,6 +794,23 @@ pub enum RichBlock {
 
     #[serde(rename = "thinking")]
     Thinking { text: Value },
+}
+
+impl RichBlock {
+    pub fn is_media(&self) -> bool {
+        matches!(
+            self,
+            RichBlock::Photo { .. }
+                | RichBlock::Video { .. }
+                | RichBlock::Audio { .. }
+                | RichBlock::VoiceNote { .. }
+                | RichBlock::Animation { .. }
+                | RichBlock::Collage { .. }
+                | RichBlock::Slideshow { .. }
+                | RichBlock::Map { .. }
+                | RichBlock::Document { .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -472,9 +876,11 @@ fn is_nested_block_type(kind: &str) -> bool {
         "paragraph"
             | "heading"
             | "pre"
+            | "footer"
             | "list"
             | "blockquote"
             | "expandable_blockquote"
+            | "pullquote"
             | "divider"
             | "mathematical_expression"
             | "table"
@@ -483,6 +889,14 @@ fn is_nested_block_type(kind: &str) -> bool {
             | "details"
             | "anchor"
             | "thinking"
+            | "photo"
+            | "video"
+            | "audio"
+            | "voice_note"
+            | "animation"
+            | "collage"
+            | "slideshow"
+            | "map"
     )
 }
 
@@ -556,7 +970,8 @@ impl InputRichMessage {
             match block {
                 RichBlock::Paragraph { text }
                 | RichBlock::SectionHeading { text, .. }
-                | RichBlock::Thinking { text } => {
+                | RichBlock::Thinking { text }
+                | RichBlock::Footer { text } => {
                     stats.text_chars += value_text_chars(text);
                     collect_nested_value_stats(text, 1, &mut stats);
                 }
@@ -579,7 +994,8 @@ impl InputRichMessage {
                         collect_nested_value_stats(value, 1, &mut stats);
                     }
                 }
-                RichBlock::ExpandableBlockQuotation { text, credit } => {
+                RichBlock::ExpandableBlockQuotation { text, credit }
+                | RichBlock::PullQuotation { text, credit } => {
                     stats.text_chars += value_text_chars(text);
                     if let Some(credit) = credit {
                         stats.text_chars += value_text_chars(credit);
@@ -623,11 +1039,34 @@ impl InputRichMessage {
                         stats.text_chars += value_text_chars(&button.text);
                     }
                 }
-                RichBlock::Document { caption, .. } => {
+                RichBlock::Document { caption, .. }
+                | RichBlock::Photo { caption, .. }
+                | RichBlock::Video { caption, .. }
+                | RichBlock::Audio { caption, .. }
+                | RichBlock::VoiceNote { caption, .. }
+                | RichBlock::Animation { caption, .. } => {
                     if let Some(caption) = caption {
-                        stats.text_chars += value_text_chars(caption);
+                        stats.text_chars += value_text_chars(&caption.text);
+                        if let Some(credit) = &caption.credit {
+                            stats.text_chars += value_text_chars(credit);
+                        }
                     }
                 }
+                RichBlock::Collage { blocks, caption }
+                | RichBlock::Slideshow { blocks, caption } => {
+                    stats.blocks += blocks.len();
+                    for val in blocks {
+                        stats.text_chars += value_text_chars(val);
+                        collect_nested_value_stats(val, 1, &mut stats);
+                    }
+                    if let Some(caption) = caption {
+                        stats.text_chars += value_text_chars(&caption.text);
+                        if let Some(credit) = &caption.credit {
+                            stats.text_chars += value_text_chars(credit);
+                        }
+                    }
+                }
+                RichBlock::Map { .. } => {}
                 RichBlock::Details {
                     summary, blocks, ..
                 } => {
@@ -1046,6 +1485,45 @@ mod tests {
     }
 
     #[test]
+    fn rich_message_copy_text_button_validates_length_and_action() {
+        let button = RichMessageButton::copy("Salin", "teks yang disalin");
+        assert!(button.validate().is_ok());
+
+        let value = serde_json::to_value(&button).unwrap();
+        assert_eq!(value["copy_text"]["text"], "teks yang disalin");
+
+        let inline_button = InlineKeyboardButton::copy("Salin Prompt", "prompt text");
+        let inline_value = serde_json::to_value(&inline_button).unwrap();
+        assert_eq!(inline_value["copy_text"]["text"], "prompt text");
+
+        let mut invalid_button = RichMessageButton::copy("Salin", "a".repeat(257));
+        assert!(invalid_button.validate().is_err());
+
+        invalid_button.copy_text = Some(CopyTextButton::new(""));
+        assert!(invalid_button.validate().is_err());
+    }
+
+    #[test]
+    fn footer_and_pullquote_serialize_and_validate() {
+        let message = InputRichMessage::new(vec![
+            RichBlock::PullQuotation {
+                text: Value::String("Kutipan penting".to_string()),
+                credit: Some(Value::String("Penulis".to_string())),
+            },
+            RichBlock::Footer {
+                text: Value::String("⚡ gpt-4o".to_string()),
+            },
+        ]);
+        assert!(message.validate().is_ok());
+
+        let serialized = serde_json::to_value(&message).unwrap();
+        assert_eq!(serialized["blocks"][0]["type"], "pullquote");
+        assert_eq!(serialized["blocks"][0]["text"], "Kutipan penting");
+        assert_eq!(serialized["blocks"][1]["type"], "footer");
+        assert_eq!(serialized["blocks"][1]["text"], "⚡ gpt-4o");
+    }
+
+    #[test]
     fn rich_message_button_requires_exactly_one_action() {
         let mut button = RichMessageButton::callback("Open", "open");
         assert!(button.validate().is_ok());
@@ -1204,6 +1682,71 @@ mod tests {
             "summary": "nested",
             "blocks": [nested_details(depth - 1)]
         })
+    }
+
+    #[test]
+    fn rich_media_blocks_serialize_and_validate() {
+        let msg = InputRichMessage::new(vec![
+            RichBlock::Photo {
+                photo: serde_json::json!({"type": "photo", "media": "attach://photo1"}),
+                caption: Some(RichBlockCaption::new(Value::String(
+                    "Pemandangan".to_string(),
+                ))),
+            },
+            RichBlock::Video {
+                video: serde_json::json!({"type": "video", "media": "attach://video1"}),
+                caption: None,
+            },
+            RichBlock::Map {
+                location: Location {
+                    latitude: -5.147665,
+                    longitude: 119.432732,
+                    horizontal_accuracy: Some(10.0),
+                },
+                zoom: Some(15),
+                width: Some(600),
+                height: Some(400),
+            },
+        ]);
+        assert!(msg.validate().is_ok());
+
+        let val = serde_json::to_value(&msg).unwrap();
+        assert_eq!(val["blocks"][0]["type"], "photo");
+        assert_eq!(val["blocks"][0]["caption"]["text"], "Pemandangan");
+        assert_eq!(val["blocks"][1]["type"], "video");
+        assert_eq!(val["blocks"][2]["type"], "map");
+        assert_eq!(val["blocks"][2]["location"]["latitude"], -5.147665);
+    }
+
+    #[test]
+    fn extended_button_actions_serialize_and_validate() {
+        let mut btn = RichMessageButton::callback("Click", "data");
+        assert!(btn.validate().is_ok());
+
+        btn.callback_data = None;
+        btn.login_url = Some(LoginUrl {
+            url: "https://auth.example.com/login".to_string(),
+            forward_text: Some("Log in".to_string()),
+            bot_username: Some("xiao_bot".to_string()),
+            request_write_access: Some(true),
+        });
+        assert!(btn.validate().is_ok());
+
+        btn.login_url = None;
+        btn.switch_inline_query_chosen_chat = Some(SwitchInlineQueryChosenChat {
+            query: Some("search query".to_string()),
+            allow_user_chats: Some(true),
+            allow_bot_chats: Some(false),
+            allow_group_chats: Some(true),
+            allow_channel_chats: Some(false),
+        });
+        assert!(btn.validate().is_ok());
+
+        let text_btn = RichTextButton {
+            button: btn.clone(),
+        };
+        let text_val = serde_json::to_value(&text_btn).unwrap();
+        assert!(text_val.get("button").is_some());
     }
 
     #[test]

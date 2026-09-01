@@ -1,7 +1,9 @@
 use regex::Regex;
 use serde_json::{json, Value};
 
-use crate::bot::models::{InputRichMessage, RichBlock, RichBlockListItem, RichBlockTableCell};
+use crate::bot::models::{
+    InputRichMessage, Location, RichBlock, RichBlockCaption, RichBlockListItem, RichBlockTableCell,
+};
 
 pub fn parse_inline(input_str: &str) -> Value {
     if input_str.is_empty() {
@@ -188,6 +190,214 @@ fn is_border_line(line: &str) -> bool {
     }
     s.chars()
         .all(|c| "┌╔┏┬┰├┝┼╂└╚┗┴┸┤┥─━═+-=_ \t┐┘┒┙╗╝┚┖┓┛│|║┃".contains(c))
+}
+
+fn try_parse_map_block(line: &str) -> Option<RichBlock> {
+    let s = line.trim();
+    if let Some(inner) = s
+        .strip_prefix("[map:")
+        .or_else(|| s.strip_prefix("[location:"))
+        .and_then(|r| r.strip_suffix(']'))
+    {
+        let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+        if parts.len() >= 2 {
+            let lat = parts[0].parse::<f64>().ok()?;
+            let lon = parts[1].parse::<f64>().ok()?;
+            let zoom = parts.get(2).and_then(|z| {
+                z.strip_prefix("zoom=")
+                    .unwrap_or(z)
+                    .trim()
+                    .parse::<i32>()
+                    .ok()
+            });
+            return Some(RichBlock::Map {
+                location: Location {
+                    latitude: lat,
+                    longitude: lon,
+                    horizontal_accuracy: None,
+                },
+                zoom,
+                width: None,
+                height: None,
+            });
+        }
+    } else if let Some(geo) = s
+        .strip_prefix("![map](geo:")
+        .or_else(|| s.strip_prefix("![location](geo:"))
+        .and_then(|r| r.strip_suffix(')'))
+    {
+        let (coords, zoom_part) = match geo.split_once("?z=") {
+            Some((c, z)) => (c, z.parse::<i32>().ok()),
+            None => (geo, None),
+        };
+        let (lat_s, lon_s) = coords.split_once(',')?;
+        let lat = lat_s.trim().parse::<f64>().ok()?;
+        let lon = lon_s.trim().parse::<f64>().ok()?;
+        return Some(RichBlock::Map {
+            location: Location {
+                latitude: lat,
+                longitude: lon,
+                horizontal_accuracy: None,
+            },
+            zoom: zoom_part,
+            width: None,
+            height: None,
+        });
+    }
+    None
+}
+
+fn split_bracket_and_parenthesis(text: &str) -> Option<(&str, &str)> {
+    let (left, right) = text.split_once(']')?;
+    let right = right.trim();
+    let inner_right = right.strip_prefix('(')?.strip_suffix(')')?.trim();
+    Some((left.trim(), inner_right))
+}
+
+fn try_parse_doc_block(line: &str) -> Option<RichBlock> {
+    let s = line.trim();
+    if let Some(rest) = s.strip_prefix("[document:") {
+        if let Some((name, link)) = split_bracket_and_parenthesis(rest) {
+            return Some(RichBlock::Document {
+                document: json!({"type": "document", "media": link}),
+                caption: (!name.is_empty()).then(|| RichBlockCaption::new(parse_inline(name))),
+            });
+        }
+    }
+    None
+}
+
+fn try_parse_media_block(line: &str) -> Option<RichBlock> {
+    let s = line.trim();
+    let prefixes = [
+        ("[photo:", "photo"),
+        ("![photo:", "photo"),
+        ("[video:", "video"),
+        ("![video:", "video"),
+        ("[audio:", "audio"),
+        ("![audio:", "audio"),
+        ("[voice:", "voice"),
+        ("[voicenote:", "voice"),
+        ("[animation:", "animation"),
+        ("![animation:", "animation"),
+    ];
+
+    for (prefix, kind) in prefixes {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            if let Some((name, link)) = split_bracket_and_parenthesis(rest) {
+                let caption = (!name.is_empty()).then(|| RichBlockCaption::new(parse_inline(name)));
+                let payload = json!({"type": kind, "media": link});
+                return match kind {
+                    "photo" => Some(RichBlock::Photo {
+                        photo: payload,
+                        caption,
+                    }),
+                    "video" => Some(RichBlock::Video {
+                        video: payload,
+                        caption,
+                    }),
+                    "audio" => Some(RichBlock::Audio {
+                        audio: payload,
+                        caption,
+                    }),
+                    "voice" => Some(RichBlock::VoiceNote {
+                        voice_note: payload,
+                        caption,
+                    }),
+                    "animation" => Some(RichBlock::Animation {
+                        animation: payload,
+                        caption,
+                    }),
+                    _ => None,
+                };
+            }
+        }
+    }
+
+    if let Some(rest) = s
+        .strip_prefix("[collage:")
+        .or_else(|| s.strip_prefix("[gallery:"))
+        .or_else(|| s.strip_prefix("![collage:"))
+        .or_else(|| s.strip_prefix("![gallery:"))
+    {
+        if let Some((cap, urls_str)) = split_bracket_and_parenthesis(rest) {
+            let urls: Vec<&str> = urls_str
+                .split(',')
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .collect();
+            let blocks: Vec<Value> = urls
+                .into_iter()
+                .map(|u| json!({"type": "photo", "photo": {"type": "photo", "media": u}}))
+                .collect();
+            let caption = (!cap.is_empty()).then(|| RichBlockCaption::new(parse_inline(cap)));
+            return Some(RichBlock::Collage { blocks, caption });
+        }
+    }
+
+    if let Some(rest) = s
+        .strip_prefix("[slideshow:")
+        .or_else(|| s.strip_prefix("![slideshow:"))
+    {
+        if let Some((cap, urls_str)) = split_bracket_and_parenthesis(rest) {
+            let urls: Vec<&str> = urls_str
+                .split(',')
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .collect();
+            let blocks: Vec<Value> = urls
+                .into_iter()
+                .map(|u| json!({"type": "photo", "photo": {"type": "photo", "media": u}}))
+                .collect();
+            let caption = (!cap.is_empty()).then(|| RichBlockCaption::new(parse_inline(cap)));
+            return Some(RichBlock::Slideshow { blocks, caption });
+        }
+    }
+
+    if let Some(rest) = s.strip_prefix("![") {
+        if !s.starts_with("![map]") && !s.starts_with("![location]") {
+            if let Some((alt, link)) = split_bracket_and_parenthesis(rest) {
+                if link.starts_with("http://")
+                    || link.starts_with("https://")
+                    || link.starts_with("tg://")
+                {
+                    let lower_link = link.to_lowercase();
+                    let caption =
+                        (!alt.is_empty()).then(|| RichBlockCaption::new(parse_inline(alt)));
+                    if lower_link.ends_with(".mp4")
+                        || lower_link.ends_with(".webm")
+                        || lower_link.ends_with(".mov")
+                    {
+                        return Some(RichBlock::Video {
+                            video: json!({"type": "video", "media": link}),
+                            caption,
+                        });
+                    } else if lower_link.ends_with(".mp3")
+                        || lower_link.ends_with(".ogg")
+                        || lower_link.ends_with(".wav")
+                        || lower_link.ends_with(".m4a")
+                    {
+                        return Some(RichBlock::Audio {
+                            audio: json!({"type": "audio", "media": link}),
+                            caption,
+                        });
+                    } else if lower_link.ends_with(".gif") {
+                        return Some(RichBlock::Animation {
+                            animation: json!({"type": "animation", "media": link}),
+                            caption,
+                        });
+                    } else {
+                        return Some(RichBlock::Photo {
+                            photo: json!({"type": "photo", "media": link}),
+                            caption,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn try_parse_table(
@@ -726,6 +936,36 @@ pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
             continue;
         }
 
+        // Map Block ([map: lat, lon] or <tg-map .../>)
+        if stripped.starts_with("[map:")
+            || stripped.starts_with("[location:")
+            || stripped.starts_with("![map]")
+            || stripped.starts_with("![location]")
+            || stripped.starts_with("<tg-map")
+        {
+            if let Some(map_block) = try_parse_map_block(stripped) {
+                blocks.push(map_block);
+                i += 1;
+                continue;
+            }
+        }
+
+        // Document Block ([document: name](tg://...) or <tg-document .../>)
+        if stripped.starts_with("[document:") || stripped.starts_with("<tg-document") {
+            if let Some(doc_block) = try_parse_doc_block(stripped) {
+                blocks.push(doc_block);
+                i += 1;
+                continue;
+            }
+        }
+
+        // Media Block (Photo, Video, Audio, VoiceNote, Animation, Collage, Slideshow)
+        if let Some(media_block) = try_parse_media_block(stripped) {
+            blocks.push(media_block);
+            i += 1;
+            continue;
+        }
+
         // 4. Horizontal Divider (---, ***, ___, ───)
         if divider_re
             .as_ref()
@@ -748,6 +988,25 @@ pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
                 level: level.min(6),
             });
             i += 1;
+            continue;
+        }
+
+        // 6a. Pullquote (>>> quote)
+        if stripped.starts_with(">>>") {
+            let mut quote_lines = Vec::new();
+            while i < n && lines[i].trim().starts_with(">>>") {
+                let q = lines[i].trim();
+                let stripped_q = q.strip_prefix(">>>").unwrap_or(q).trim_start();
+                quote_lines.push(stripped_q.to_string());
+                i += 1;
+            }
+            blocks.push(RichBlock::PullQuotation {
+                text: parse_inline(&quote_lines.join(
+                    "
+",
+                )),
+                credit: None,
+            });
             continue;
         }
 
@@ -857,6 +1116,13 @@ pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
                     .as_ref()
                     .is_some_and(|regex| regex.is_match(s_curr))
                 || s_curr.starts_with('>')
+                || s_curr.starts_with(">>>")
+                || s_curr.starts_with("[map:")
+                || s_curr.starts_with("![map]")
+                || s_curr.starts_with("<tg-map")
+                || s_curr.starts_with("[document:")
+                || s_curr.starts_with("<tg-document")
+                || try_parse_media_block(s_curr).is_some()
                 || bullet_re
                     .as_ref()
                     .is_some_and(|regex| regex.is_match(s_curr))
@@ -884,11 +1150,16 @@ pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
     blocks
 }
 
-pub fn build_full_rich_message(answer_text: &str, _model_name: Option<&str>) -> InputRichMessage {
+pub fn build_full_rich_message(answer_text: &str, model_name: Option<&str>) -> InputRichMessage {
     let mut blocks = parse_markdown_to_rich_blocks(answer_text);
     if blocks.is_empty() {
         blocks.push(RichBlock::Paragraph {
             text: parse_inline(answer_text.trim()),
+        });
+    }
+    if let Some(model) = model_name.map(str::trim).filter(|m| !m.is_empty()) {
+        blocks.push(RichBlock::Footer {
+            text: parse_inline(&format!("⚡ {model}")),
         });
     }
     InputRichMessage::new(blocks)
@@ -982,6 +1253,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn collage_slideshow_audio_voice_parse_correctly() {
+        let text = "[audio: Judul Musik](https://example.com/song.mp3)
+
+[voice: Rekaman Suara](tg://audio?id=rec1)
+
+[collage: Galeri](url1, url2)
+
+[slideshow: Slide](url3, url4)";
+        let blocks = parse_markdown_to_rich_blocks(text);
+        assert!(blocks.iter().any(|b| matches!(b, RichBlock::Audio { .. })));
+        assert!(blocks
+            .iter()
+            .any(|b| matches!(b, RichBlock::VoiceNote { .. })));
+        assert!(blocks
+            .iter()
+            .any(|b| matches!(b, RichBlock::Collage { .. })));
+        assert!(blocks
+            .iter()
+            .any(|b| matches!(b, RichBlock::Slideshow { .. })));
+    }
+
+    #[test]
+    fn media_blocks_tolerate_whitespace_between_bracket_and_parenthesis() {
+        let text = "[audio: Suara Contoh] (https://upload.wikimedia.org/wikipedia/commons/c/c8/Example.ogg)\n\n[photo: Foto Indah]  (https://example.com/pic.jpg)\n\n[collage: Galeri] (url1, url2)";
+        let blocks = parse_markdown_to_rich_blocks(text);
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(blocks[0], RichBlock::Audio { .. }));
+        assert!(matches!(blocks[1], RichBlock::Photo { .. }));
+        assert!(matches!(blocks[2], RichBlock::Collage { .. }));
+    }
+
+    #[test]
+    fn map_and_document_blocks_parse_correctly() {
+        let text = "[map: -6.175392, 106.827153, zoom=15]
+
+[document: Laporan.pdf](tg://document?id=laporan_1)";
+        let blocks = parse_markdown_to_rich_blocks(text);
+        assert!(blocks.iter().any(|b| matches!(b, RichBlock::Map { .. })));
+        assert!(blocks
+            .iter()
+            .any(|b| matches!(b, RichBlock::Document { .. })));
+    }
+
+    #[test]
+    fn pullquote_and_footer_parse_correctly() {
+        let text = ">>> Ini adalah kutipan penting
+
+Paragraf normal";
+        let blocks = parse_markdown_to_rich_blocks(text);
+        assert!(blocks
+            .iter()
+            .any(|b| matches!(b, RichBlock::PullQuotation { .. })));
+
+        let full = build_full_rich_message("Jawaban AI", Some("openai/gpt-4o"));
+        assert!(full
+            .blocks
+            .iter()
+            .any(|b| matches!(b, RichBlock::Footer { .. })));
+    }
+
+    #[test]
+    fn markdown_image_and_media_is_media_check() {
+        let text = "Penjelasan aurora:\n\n![Cahaya Aurora](https://picsum.photos/1000/600)\n\n[photo: Tromso](https://picsum.photos/800/600)";
+        let blocks = parse_markdown_to_rich_blocks(text);
+        assert_eq!(blocks.len(), 3);
+        assert!(!blocks[0].is_media());
+        assert!(blocks[1].is_media());
+        assert!(blocks[2].is_media());
+        assert!(matches!(blocks[1], RichBlock::Photo { .. }));
+        assert!(matches!(blocks[2], RichBlock::Photo { .. }));
     }
 
     #[test]

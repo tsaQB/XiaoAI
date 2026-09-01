@@ -1006,6 +1006,13 @@ fn enqueue_telegram_update_on_conn(
 
 fn pending_telegram_updates_db(limit: usize) -> rusqlite::Result<Vec<TelegramInboxRecord>> {
     let conn = open_session_db()?;
+    pending_telegram_updates_on_conn(&conn, limit)
+}
+
+fn pending_telegram_updates_on_conn(
+    conn: &Connection,
+    limit: usize,
+) -> rusqlite::Result<Vec<TelegramInboxRecord>> {
     let mut stmt = conn.prepare(
         "SELECT update_id,payload_json
          FROM telegram_inbox
@@ -1013,15 +1020,13 @@ fn pending_telegram_updates_db(limit: usize) -> rusqlite::Result<Vec<TelegramInb
          ORDER BY update_id
          LIMIT ?1",
     )?;
-    let rows = stmt
-        .query_map(params![limit as i64], |row| {
-            Ok(TelegramInboxRecord {
-                update_id: row.get(0)?,
-                payload_json: row.get(1)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    let rows = stmt.query_map(params![limit as i64], |row| {
+        Ok(TelegramInboxRecord {
+            update_id: row.get(0)?,
+            payload_json: row.get(1)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
 }
 
 fn recover_telegram_processing_db() -> rusqlite::Result<usize> {
@@ -2034,6 +2039,29 @@ mod tests {
             .unwrap();
         assert_eq!(completed.0, "completed");
         assert!(!completed.1.contains("hello"));
+    }
+
+    #[test]
+    fn telegram_pending_updates_replayed_and_marked_processing_then_processed() {
+        let mut conn = session_test_conn();
+        assert!(enqueue_telegram_update_on_conn(&mut conn, 10, r#"{"update_id":10}"#).unwrap());
+        assert!(enqueue_telegram_update_on_conn(&mut conn, 11, r#"{"update_id":11}"#).unwrap());
+
+        let pending = pending_telegram_updates_on_conn(&conn, 10).unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].update_id, 10);
+        assert_eq!(pending[1].update_id, 11);
+
+        assert!(mark_telegram_processing_on_conn(&conn, 10).unwrap());
+        let pending_after_first = pending_telegram_updates_on_conn(&conn, 10).unwrap();
+        assert_eq!(pending_after_first.len(), 1);
+        assert_eq!(pending_after_first[0].update_id, 11);
+
+        assert!(mark_telegram_processed_on_conn(&conn, 10).unwrap());
+        assert_eq!(
+            pending_telegram_updates_on_conn(&conn, 10).unwrap().len(),
+            1
+        );
     }
 
     #[test]

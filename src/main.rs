@@ -2126,16 +2126,22 @@ async fn handle_image_generation(
         generated.primary_failure.as_deref(),
     );
 
-    let img_kb = InlineKeyboardMarkup::new(vec![
-        vec![
-            InlineKeyboardButton::callback("🔄 Buat Ulang (Regenerate)", "img_regen"),
-            InlineKeyboardButton::callback("🫟 Gambar Baru", "img_new"),
-        ],
-        vec![InlineKeyboardButton::callback(
+    let mut img_kb_rows = vec![vec![
+        InlineKeyboardButton::callback("🔄 Buat Ulang (Regenerate)", "img_regen"),
+        InlineKeyboardButton::callback("🫟 Gambar Baru", "img_new"),
+    ]];
+    if !clean_prompt.is_empty() && clean_prompt.chars().count() <= 256 {
+        img_kb_rows.push(vec![
+            InlineKeyboardButton::copy("📋 Salin Prompt", &clean_prompt),
+            InlineKeyboardButton::callback("📱 Buka Menu", "action_menu"),
+        ]);
+    } else {
+        img_kb_rows.push(vec![InlineKeyboardButton::callback(
             "📱 Buka Menu",
             "action_menu",
-        )],
-    ]);
+        )]);
+    }
+    let img_kb = InlineKeyboardMarkup::new(img_kb_rows);
 
     let delivery = deliver_generated_image_with(
         &generated.bytes,
@@ -2377,10 +2383,35 @@ enum UpdateLane {
 }
 
 fn command_matches(text: &str, command: &str) -> bool {
-    text == command
-        || text
-            .strip_prefix(command)
-            .is_some_and(|rest| rest.starts_with(' ') || rest.starts_with('@'))
+    command_args(text, command).is_some()
+}
+
+fn command_args<'a>(text: &'a str, command: &str) -> Option<&'a str> {
+    let text = text.trim();
+    let rest = text.strip_prefix(command)?;
+    if rest.is_empty() {
+        return Some("");
+    }
+    if rest.chars().next().is_some_and(char::is_whitespace) {
+        return Some(rest.trim_start());
+    }
+    let mention = rest.strip_prefix('@')?;
+    let mention_end = mention
+        .char_indices()
+        .find(|(_, character)| character.is_whitespace())
+        .map(|(index, _)| index)
+        .unwrap_or(mention.len());
+    if mention_end == 0 {
+        return None;
+    }
+    Some(mention[mention_end..].trim_start())
+}
+
+fn callback_prefix_matches(data: &str, prefix: &str) -> bool {
+    data == prefix
+        || data
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with(':'))
 }
 
 fn is_control_message_text(text: &str) -> bool {
@@ -2710,6 +2741,8 @@ async fn handle_update(
 
         let has_video = msg.video.is_some() || msg.video_note.is_some();
         let has_photo = msg.photo.is_some();
+        let has_audio = msg.voice.is_some() || msg.audio.is_some();
+        let has_document = msg.document.is_some();
 
         if let Some(v) = msg.voice {
             audio_duration = v.duration;
@@ -2823,6 +2856,54 @@ async fn handle_update(
                     }
                 }
             }
+        }
+
+        if has_audio && audio_bytes.is_none() {
+            let _ = bot
+                .send_message(
+                    chat_id,
+                    "⚠️ <b>Gagal mengunduh audio dari Telegram.</b> Silakan kirim ulang pesan suara/audio.",
+                    Some("HTML"),
+                    Some(get_main_menu_keyboard()),
+                    None,
+                    None,
+                )
+                .await;
+            return;
+        }
+        if has_document
+            && image_bytes.is_none()
+            && audio_bytes.is_none()
+            && video_bytes.is_none()
+            && doc_text.is_none()
+            && document_images
+                .as_ref()
+                .is_none_or(|pages| pages.is_empty())
+        {
+            let _ = bot
+                .send_message(
+                    chat_id,
+                    "⚠️ <b>Gagal mengunduh dokumen dari Telegram.</b> Silakan kirim ulang file tersebut.",
+                    Some("HTML"),
+                    Some(get_main_menu_keyboard()),
+                    None,
+                    None,
+                )
+                .await;
+            return;
+        }
+        if text.is_empty()
+            && image_bytes.is_none()
+            && audio_bytes.is_none()
+            && video_bytes.is_none()
+            && doc_text.is_none()
+            && document_images
+                .as_ref()
+                .is_none_or(|pages| pages.is_empty())
+        {
+            // Ignore Telegram service/metadata messages instead of turning an
+            // empty payload into an unsolicited AI generation.
+            return;
         }
 
         // Wizard state handler
@@ -3029,7 +3110,7 @@ async fn handle_update(
         }
 
         // Navigation Commands
-        if text.starts_with("/start") {
+        if command_matches(&text, "/start") {
             send_welcome(bot, ai_service, chat_id, user_id).await;
         } else if [
             "📱 Menu",
@@ -3045,7 +3126,7 @@ async fn handle_update(
         .contains(&text.as_str())
         {
             send_menu(bot, ai_service, chat_id, user_id).await;
-        } else if text.starts_with("/new")
+        } else if command_matches(&text, "/new")
             || [
                 "ɴᴇᴡ",
                 "➕ ɴᴇᴡ",
@@ -3096,7 +3177,7 @@ async fn handle_update(
             let _ = bot.send_rich_message(chat_id, &rich, None, None).await;
             send_or_update_session_manager(bot, ai_service, chat_id, user_id, None, target_page)
                 .await;
-        } else if (text == "/session" || text.starts_with("/session "))
+        } else if command_matches(&text, "/session")
             || [
                 "📑 Session",
                 "Session",
@@ -3255,7 +3336,7 @@ async fn handle_update(
                     .await;
                 }
             }
-        } else if text.starts_with("/context")
+        } else if command_matches(&text, "/context")
             || [
                 "ᴄᴏɴᴛᴇxᴛ",
                 "🧠 ᴄᴏɴᴛᴇxᴛ",
@@ -3268,7 +3349,7 @@ async fn handle_update(
             .contains(&text.as_str())
         {
             send_or_update_context_monitor(bot, ai_service, chat_id, user_id, None).await;
-        } else if text.starts_with("/model")
+        } else if command_matches(&text, "/model")
             || [
                 "ᴍᴏᴅᴇʟ",
                 "⚙️ ᴍᴏᴅᴇʟ",
@@ -3281,10 +3362,7 @@ async fn handle_update(
             .contains(&text.as_str())
         {
             if ai_service.has_configured_provider(user_id).await {
-                let query = text
-                    .strip_prefix("/model")
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty());
+                let query = command_args(&text, "/model").filter(|value| !value.is_empty());
                 if let Some(query) = query {
                     ai_service
                         .model_picker_query
@@ -3360,7 +3438,7 @@ async fn handle_update(
                 )
                 .await;
             }
-        } else if text.starts_with("/image")
+        } else if command_matches(&text, "/image")
             || [
                 "🫟 Buat Gambar",
                 "🫟 Generate Gambar",
@@ -3370,11 +3448,7 @@ async fn handle_update(
             ]
             .contains(&text.as_str())
         {
-            let prompt_arg = if text.starts_with("/image") {
-                text.strip_prefix("/image").unwrap_or("").trim()
-            } else {
-                ""
-            };
+            let prompt_arg = command_args(&text, "/image").unwrap_or("");
             let explicit_intent = if prompt_arg.is_empty() {
                 None
             } else {
@@ -3397,12 +3471,12 @@ async fn handle_update(
                 explanation_prompt,
             )
             .await;
-        } else if text.starts_with("/clear")
+        } else if command_matches(&text, "/clear")
             || ["🗑️ Reset Chat", "🗑️ Reset Obrolan"].contains(&text.as_str())
         {
             let rich = build_clear_confirmation_ui();
             let _ = bot.send_rich_message(chat_id, &rich, None, None).await;
-        } else if text.starts_with("/help")
+        } else if command_matches(&text, "/help")
             || ["📖 Bantuan", "📖 Bantuan & Info"].contains(&text.as_str())
         {
             let rich = build_help_ui();
@@ -3455,6 +3529,9 @@ async fn handle_update(
         let user_id = cq.from.id;
         let chat_id = cq.message.as_ref().map(|m| m.chat.id).unwrap_or(user_id);
         if !access.allows(user_id, chat_id) {
+            let _ = bot
+                .answer_callback_query(&cq_id, Some("Aksi tidak diizinkan."), true)
+                .await;
             return;
         }
         let msg_id = cq.message.as_ref().map(|m| m.message_id);
@@ -3478,7 +3555,10 @@ async fn handle_update(
                 "provider_models",
                 "noop",
             ];
-            if !allowed_cqs.iter().any(|pref| cq_data.starts_with(pref)) {
+            if !allowed_cqs
+                .iter()
+                .any(|prefix| callback_prefix_matches(&cq_data, prefix))
+            {
                 let _ = bot
                     .answer_callback_query(&cq_id, Some("🔒 Menu terkunci! Jalankan `xiao provider` di terminal terlebih dahulu."), true)
                     .await;
@@ -3957,6 +4037,14 @@ async fn handle_update(
         } else if cq_data == "action_menu" {
             let _ = bot.answer_callback_query(&cq_id, None, false).await;
             send_menu(bot, ai_service, chat_id, user_id).await;
+        } else {
+            let _ = bot
+                .answer_callback_query(
+                    &cq_id,
+                    Some("Aksi sudah kedaluwarsa. Buka menu lagi."),
+                    false,
+                )
+                .await;
         }
     }
 }
@@ -4137,14 +4225,26 @@ async fn main() {
     for record in ai::storage::pending_telegram_updates_async(500).await {
         match serde_json::from_str::<Update>(&record.payload_json) {
             Ok(update) => {
-                let lane = classify_update_lane(&ai_service, &update).await;
-                let send_result = match lane {
-                    UpdateLane::Control => control_tx.send(update).await,
-                    UpdateLane::Generation => generation_tx.send(update).await,
-                };
-                if send_result.is_err() {
-                    error!("Update worker stopped while replaying durable inbox");
-                    return;
+                if update.stopped_message_generation.is_some() {
+                    // Native Stop bypasses both queues for immediate cancellation.
+                    process_durable_update(
+                        &bot,
+                        &ai_service,
+                        &user_last_image_prompt,
+                        &access,
+                        update,
+                    )
+                    .await;
+                } else {
+                    let lane = classify_update_lane(&ai_service, &update).await;
+                    let send_result = match lane {
+                        UpdateLane::Control => control_tx.send(update).await,
+                        UpdateLane::Generation => generation_tx.send(update).await,
+                    };
+                    if send_result.is_err() {
+                        error!("Update worker stopped while replaying durable inbox");
+                        return;
+                    }
                 }
             }
             Err(error) => {
@@ -4288,6 +4388,16 @@ mod update_lane_tests {
         ] {
             assert!(!is_control_message_text(text), "{text}");
         }
+    }
+
+    #[test]
+    fn command_matching_requires_a_real_token_boundary() {
+        assert!(command_matches("/model", "/model"));
+        assert_eq!(command_args("/model gpt-4o", "/model"), Some("gpt-4o"));
+        assert!(command_matches("/model@xiaobot gpt-4o", "/model"));
+        assert!(!command_matches("/modelled", "/model"));
+        assert!(!command_matches("/imagegen", "/image"));
+        assert!(!command_matches("/startling", "/start"));
     }
 
     #[test]
@@ -4790,6 +4900,22 @@ mod update_lane_tests {
             .expect("compound explanation");
         assert!(failure_return < explanation);
         assert!(handler[failure_return..explanation].contains("return;"));
+    }
+
+    #[test]
+    fn scanned_pdf_with_rendered_pages_does_not_trigger_download_failure_guard() {
+        let source = include_str!("main.rs");
+        let doc_guard_start = source
+            .find("if has_document")
+            .expect("document failure guard");
+        let doc_guard_end = source[doc_guard_start..]
+            .find("if text.is_empty()")
+            .map(|offset| doc_guard_start + offset)
+            .expect("document failure guard end");
+        let doc_guard = &source[doc_guard_start..doc_guard_end];
+
+        assert!(doc_guard.contains("document_images"));
+        assert!(doc_guard.contains("is_none_or(|pages| pages.is_empty())"));
     }
 
     #[test]

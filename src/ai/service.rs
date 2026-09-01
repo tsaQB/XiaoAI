@@ -477,6 +477,12 @@ fn parse_generated_image_url(url: &str) -> Result<url::Url, ImageGenerationError
             "provider image URL must use http or https with a host",
         ));
     }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ImageGenerationError::new(
+            ImageGenerationErrorKind::UnsafeImageUrl,
+            "provider image URL must not contain embedded credentials",
+        ));
+    }
     Ok(parsed)
 }
 
@@ -491,6 +497,20 @@ fn signal_generation_cancel(sender: Option<GenerationCancelSender>) -> bool {
     sender
         .map(|sender| sender.send(true).is_ok())
         .unwrap_or(false)
+}
+
+async fn cancelled_chat_result(
+    timeline: Option<&Arc<ExecutionTimeline>>,
+) -> (Option<String>, String, bool) {
+    if let Some(timeline) = timeline {
+        timeline.fail_current("Stopped by user".to_string()).await;
+        timeline.stop_ticker();
+    }
+    (
+        None,
+        "⏹️ Generasi dihentikan oleh pengguna.".to_string(),
+        true,
+    )
 }
 
 pub(super) async fn download_generated_image(url: &str) -> Result<Vec<u8>, ImageGenerationError> {
@@ -527,7 +547,10 @@ pub(super) async fn download_generated_image(url: &str) -> Result<Vec<u8>, Image
     let client = reqwest::Client::builder()
         .connect_timeout(timeout_from_env(IMAGE_PROVIDER_CONNECT_TIMEOUT_ENV, 10))
         .timeout(timeout_from_env(IMAGE_DOWNLOAD_TIMEOUT_ENV, 30))
-        .redirect(reqwest::redirect::Policy::limited(10))
+        // Redirect targets cannot be revalidated against the DNS/IP policy
+        // above without a custom resolver. Disable redirects to prevent a
+        // trusted public URL from pivoting into a private network address.
+        .redirect(reqwest::redirect::Policy::none())
         .resolve(host, resolved[0])
         .build()
         .map_err(|_| {
@@ -643,10 +666,7 @@ fn specialist_chat_payload(model: &str, content: Vec<Value>) -> Value {
 }
 
 fn external_image_fallback_enabled(value: &str) -> bool {
-    let clean = value.trim();
-    !(clean.eq_ignore_ascii_case("none")
-        || clean.eq_ignore_ascii_case("false")
-        || clean.eq_ignore_ascii_case("off"))
+    value.trim().eq_ignore_ascii_case("pollinations")
 }
 
 fn bounded_timeout_secs(raw: Option<&str>, default_secs: u64) -> u64 {
@@ -1711,6 +1731,10 @@ impl AIChatService {
             video_duration,
         } = input;
 
+        if *cancel_rx.borrow() {
+            return cancelled_chat_result(timeline).await;
+        }
+
         let main = match Self::resolve_model_route_from_snapshot(snapshot, ModelRole::Main) {
             Ok(route) => route,
             Err(error) => return (None, format!("Main Model is unavailable: {error}"), false),
@@ -1811,15 +1835,21 @@ impl AIChatService {
             let Some(bytes) = audio_bytes.clone() else {
                 return (None, "Audio input is missing.".to_string(), false);
             };
-            let transcript = match self
-                .transcribe_audio_resolved(
+            let transcript_result = tokio::select! {
+                changed = cancel_rx.changed() => {
+                    if changed.is_ok() && *cancel_rx.borrow() {
+                        return cancelled_chat_result(timeline).await;
+                    }
+                    Err("Kanal pembatalan audio ditutup.".to_string())
+                }
+                result = self.transcribe_audio_resolved(
                     &specialist,
                     bytes,
                     doc_name.unwrap_or("audio"),
                     audio_mime,
-                )
-                .await
-            {
+                ) => result
+            };
+            let transcript = match transcript_result {
                 Ok(transcript) => transcript,
                 Err(error) => return (None, error, false),
             };
@@ -1881,8 +1911,34 @@ impl AIChatService {
                 .await;
         }
 
-        let observation = match self
-            .run_specialist_observation(
+        let required_capability = match role {
+            ModelRole::Vision => Some((CapabilityKind::ImageInput, "vision/image")),
+            ModelRole::Video => Some((CapabilityKind::VideoInput, "video")),
+            ModelRole::AudioStt | ModelRole::Main | ModelRole::ImageGeneration => None,
+        };
+        if let Some((kind, name)) = required_capability {
+            if let Err(error) =
+                require_verified_capability(Some(&specialist.capability), kind, name)
+            {
+                return (
+                    None,
+                    format!(
+                        "{} / {} tidak dapat memproses media: {error}.",
+                        specialist.provider.name, specialist.model
+                    ),
+                    false,
+                );
+            }
+        }
+
+        let observation_result = tokio::select! {
+            changed = cancel_rx.changed() => {
+                if changed.is_ok() && *cancel_rx.borrow() {
+                    return cancelled_chat_result(timeline).await;
+                }
+                Err("Kanal pembatalan media ditutup.".to_string())
+            }
+            result = self.run_specialist_observation(
                 &specialist,
                 SpecialistObservationInput {
                     prompt,
@@ -1892,9 +1948,9 @@ impl AIChatService {
                     video_bytes: video_bytes.as_deref(),
                     video_mime,
                 },
-            )
-            .await
-        {
+            ) => result
+        };
+        let observation = match observation_result {
             Ok(observation) => observation,
             Err(error) => return (None, error, false),
         };
@@ -2100,7 +2156,16 @@ impl AIChatService {
                         Dokumen Xiao diekstrak menjadi teks bila memungkinkan; PDF scan dapat diberikan sebagai halaman hasil render untuk OCR visual. \
                         Lakukan penalaran secara internal dan berikan hanya jawaban yang berguna bagi pengguna; jangan menampilkan chain-of-thought tersembunyi. \
                         Gunakan gaya bahasa yang alami dan format teks yang elegan. \
-                        Jika membuat tabel atau data berkolom, gunakan Markdown Table standar agar Xiao dapat merendernya sebagai tabel Telegram."
+                        Jika membuat tabel atau data berkolom, gunakan Markdown Table standar agar Xiao dapat merendernya sebagai tabel Telegram. \
+                        Jika diminta menyajikan visual atau media publik yang relevan, kamu dapat menyisipkan format blok media berikut:\n\
+                        - Foto: [photo: Judul](https://url-gambar) atau ![Judul](https://url-gambar)\n\
+                        - Galeri/Kolase Foto: [collage: Judul](https://url-1, https://url-2)\n\
+                        - Slide Foto: [slideshow: Judul](https://url-1, https://url-2)\n\
+                        - Audio/Musik: [audio: Judul Lagu](https://url-audio)\n\
+                        - Rekaman Suara: [voice: Catatan Suara](https://url-audio)\n\
+                        - Video: [video: Judul Video](https://url-video)\n\
+                        - Peta/Lokasi: [map: latitude, longitude]\n\
+                        - Dokumen: [document: Nama Dokumen](https://url-dokumen)"
         })];
 
         messages.extend(history);
@@ -2908,7 +2973,7 @@ impl AIChatService {
             Err(error) if error.kind == ImageGenerationErrorKind::Timeout => return Err(error),
             Err(provider_error) => {
                 let fallback =
-                    std::env::var("IMAGE_FALLBACK_PROVIDER").unwrap_or_else(|_| "auto".to_string());
+                    std::env::var("IMAGE_FALLBACK_PROVIDER").unwrap_or_else(|_| "none".to_string());
                 if !external_image_fallback_enabled(&fallback) {
                     return Err(provider_error);
                 }
@@ -3630,8 +3695,8 @@ mod tests {
     fn external_image_fallback_is_explicit_opt_in_only() {
         assert!(external_image_fallback_enabled("pollinations"));
         assert!(external_image_fallback_enabled(" POLLINATIONS "));
-        assert!(external_image_fallback_enabled("auto"));
-        assert!(external_image_fallback_enabled(""));
+        assert!(!external_image_fallback_enabled("auto"));
+        assert!(!external_image_fallback_enabled(""));
         assert!(!external_image_fallback_enabled("none"));
         assert!(!external_image_fallback_enabled("false"));
         assert!(!external_image_fallback_enabled("off"));
