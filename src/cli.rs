@@ -178,6 +178,7 @@ pub fn terminal_interactive_select(
     }
 }
 
+#[allow(dead_code)]
 pub fn terminal_interactive_multi_select(
     title: &str,
     items: &[String],
@@ -685,13 +686,22 @@ pub(crate) async fn run_cli_status(ai_service: &AIChatService) {
                 .unwrap_or("no evidence");
             match state {
                 CapabilityState::Supported => {
-                    format!("    • {:<16}: \x1b[32m✔ Supported\x1b[0m   \x1b[38;5;244m({src})\x1b[0m", name)
+                    format!(
+                        "    • {:<16}: \x1b[32m✔ Supported\x1b[0m   \x1b[38;5;244m({src})\x1b[0m",
+                        name
+                    )
                 }
                 CapabilityState::Unsupported => {
-                    format!("    • {:<16}: \x1b[31m✖ Unsupported\x1b[0m \x1b[38;5;244m({src})\x1b[0m", name)
+                    format!(
+                        "    • {:<16}: \x1b[31m✖ Unsupported\x1b[0m \x1b[38;5;244m({src})\x1b[0m",
+                        name
+                    )
                 }
                 CapabilityState::Unknown => {
-                    format!("    • {:<16}: \x1b[38;5;244m○ Unknown       ({src})\x1b[0m", name)
+                    format!(
+                        "    • {:<16}: \x1b[38;5;244m○ Unknown       ({src})\x1b[0m",
+                        name
+                    )
                 }
             }
         };
@@ -717,7 +727,10 @@ pub(crate) async fn run_cli_status(ai_service: &AIChatService) {
             format_cap_line("Tools / JSON", tools_state, CapabilityKind::Tools)
         );
         if let Some(ctx) = cap_record.as_ref().and_then(|r| r.context_window) {
-            println!("    • {:<16}: \x1b[36m{} tokens\x1b[0m", "Context Limit", ctx);
+            println!(
+                "    • {:<16}: \x1b[36m{} tokens\x1b[0m",
+                "Context Limit", ctx
+            );
         }
     } else {
         println!("  Provider     ○ Belum ada AI Provider (Jalankan 'xiao provider')");
@@ -1408,7 +1421,11 @@ pub(crate) async fn run_cli_model_picker(ai_service: &AIChatService, initial_fil
                 println!("\n\x1b[31m✖ Error: Gagal memuat ulang provider di runtime.\x1b[0m\n");
                 return;
             }
-            let chosen_prov = updated_store.providers.iter().find(|p| &p.id == prov_id).cloned();
+            let chosen_prov = updated_store
+                .providers
+                .iter()
+                .find(|p| &p.id == prov_id)
+                .cloned();
             if let Some(prov) = chosen_prov {
                 let _ = run_persisted_capability_probe(ai_service, &prov, chosen_model).await;
             }
@@ -1750,7 +1767,9 @@ async fn run_cli_addon_test_all_routes(ai_service: &AIChatService) {
                         );
                     }
                     ProbeOutcome::Unsupported => {
-                        println!("    \x1b[31m✖ Model menolak kapabilitas ini (Unsupported).\x1b[0m");
+                        println!(
+                            "    \x1b[31m✖ Model menolak kapabilitas ini (Unsupported).\x1b[0m"
+                        );
                     }
                     _ => {
                         println!(
@@ -1891,18 +1910,41 @@ async fn run_cli_probe_all_active(ai_service: &AIChatService) {
         println!("  ● Provider: \x1b[1m{}\x1b[0m ({})", prov.name, model);
         if let Some(record) = run_persisted_capability_probe(ai_service, prov, model).await {
             println!("    \x1b[1;37mRingkasan Kapabilitas Terverifikasi:\x1b[0m");
-            println!("      • Text Chat        : {}", format_cap_bool_badge(record.supports_text_chat));
-            println!("      • Vision (Image)   : {}", format_cap_bool_badge(record.supports_image_input));
-            println!("      • Structured JSON  : {}", format_cap_bool_badge(record.supports_structured_output));
-            println!("      • Tools / Function : {}", format_cap_bool_badge(record.supports_tools));
-            println!("      • Audio Native     : {}", format_cap_bool_badge(record.supports_audio_input));
-            println!("      • Audio STT        : {}", format_cap_bool_badge(record.supports_audio_transcription));
-            println!("      • Video Frames     : {}", format_cap_bool_badge(record.supports_video_input));
+            println!(
+                "      • Text Chat        : {}",
+                format_cap_bool_badge(record.supports_text_chat)
+            );
+            println!(
+                "      • Vision (Image)   : {}",
+                format_cap_bool_badge(record.supports_image_input)
+            );
+            println!(
+                "      • Structured JSON  : {}",
+                format_cap_bool_badge(record.supports_structured_output)
+            );
+            println!(
+                "      • Tools / Function : {}",
+                format_cap_bool_badge(record.supports_tools)
+            );
+            println!(
+                "      • Audio Native     : {}",
+                format_cap_bool_badge(record.supports_audio_input)
+            );
+            println!(
+                "      • Audio STT        : {}",
+                format_cap_bool_badge(record.supports_audio_transcription)
+            );
+            println!(
+                "      • Video Frames     : {}",
+                format_cap_bool_badge(record.supports_video_input)
+            );
             if let Some(ctx) = record.context_window {
                 println!("      • Context Limit    : \x1b[36m{} tokens\x1b[0m", ctx);
             }
         } else {
-            println!("    \x1b[31m✖ Verifikasi kapabilitas gagal / endpoint tidak merespons.\x1b[0m");
+            println!(
+                "    \x1b[31m✖ Verifikasi kapabilitas gagal / endpoint tidak merespons.\x1b[0m"
+            );
         }
         println!();
     }
@@ -1995,14 +2037,33 @@ async fn run_cli_probe_show_registry() {
         registry.models.len()
     );
     if registry.models.is_empty() {
-        println!("  \x1b[38;5;244mBelum ada kapabilitas model yang tersimpan di registry.\x1b[0m\n");
+        println!(
+            "  \x1b[38;5;244mBelum ada kapabilitas model yang tersimpan di registry.\x1b[0m\n"
+        );
         return;
     }
     for r in &registry.models {
-        let vision = if r.supports_image_input == Some(true) { "\x1b[32m✔ Vision\x1b[0m" } else { "\x1b[38;5;244m○ Vision\x1b[0m" };
-        let audio = if r.supports_audio_input == Some(true) || r.supports_audio_transcription == Some(true) { "\x1b[32m✔ Audio\x1b[0m" } else { "\x1b[38;5;244m○ Audio\x1b[0m" };
-        let tools = if r.supports_tools == Some(true) { "\x1b[32m✔ Tools\x1b[0m" } else { "\x1b[38;5;244m○ Tools\x1b[0m" };
-        let ctx_str = r.context_window.map(|c| format!(" · Ctx: {c}")).unwrap_or_default();
+        let vision = if r.supports_image_input == Some(true) {
+            "\x1b[32m✔ Vision\x1b[0m"
+        } else {
+            "\x1b[38;5;244m○ Vision\x1b[0m"
+        };
+        let audio = if r.supports_audio_input == Some(true)
+            || r.supports_audio_transcription == Some(true)
+        {
+            "\x1b[32m✔ Audio\x1b[0m"
+        } else {
+            "\x1b[38;5;244m○ Audio\x1b[0m"
+        };
+        let tools = if r.supports_tools == Some(true) {
+            "\x1b[32m✔ Tools\x1b[0m"
+        } else {
+            "\x1b[38;5;244m○ Tools\x1b[0m"
+        };
+        let ctx_str = r
+            .context_window
+            .map(|c| format!(" · Ctx: {c}"))
+            .unwrap_or_default();
         println!(
             "  ● \x1b[1m{}\x1b[0m ({})\n    [{vision} · {audio} · {tools}{ctx_str}] \x1b[38;5;244m· {}\x1b[0m",
             r.model, r.provider_name, r.checked_at

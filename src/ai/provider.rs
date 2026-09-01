@@ -132,6 +132,7 @@ impl CapabilityProbeResponse {
     }
 }
 
+#[allow(dead_code)]
 fn catalog_presence_text_chat_claim() -> Option<bool> {
     // Being present in GET /models is catalog evidence only.
     None
@@ -690,12 +691,15 @@ impl AIChatService {
                 Self::effective_capability_state(record, CapabilityKind::VideoInput)
             }
             ModelRole::ImageGeneration => {
-                let state = Self::effective_capability_state(record, CapabilityKind::ImageGeneration);
+                let state =
+                    Self::effective_capability_state(record, CapabilityKind::ImageGeneration);
                 if state == CapabilityState::Supported {
                     CapabilityState::Supported
                 } else if state == CapabilityState::Unsupported {
                     CapabilityState::Unsupported
-                } else if !record.model.is_empty() && record.supports_image_generation != Some(false) {
+                } else if !record.model.is_empty()
+                    && record.supports_image_generation != Some(false)
+                {
                     CapabilityState::Supported
                 } else {
                     state
@@ -1047,7 +1051,10 @@ impl AIChatService {
         let status = response.status().as_u16();
         if status == 404 || status == 405 {
             // Adaptive Chat Fallback probe: cek apakah model chat aktif
-            let chat_url = format!("{}/chat/completions", provider.endpoint.trim_end_matches('/'));
+            let chat_url = format!(
+                "{}/chat/completions",
+                provider.endpoint.trim_end_matches('/')
+            );
             let mut chat_req = self
                 .client
                 .post(&chat_url)
@@ -1908,10 +1915,7 @@ impl AIChatService {
                                     let record_checked_at = Local::now().to_rfc3339();
                                     let mut metadata_evidence = Vec::new();
                                     for (cap, val) in [
-                                        (
-                                            CapabilityKind::TextChat,
-                                            Some(true),
-                                        ),
+                                        (CapabilityKind::TextChat, Some(true)),
                                         (
                                             CapabilityKind::ImageInput,
                                             (modalities.contains("image")

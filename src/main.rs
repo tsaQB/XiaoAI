@@ -2949,7 +2949,9 @@ async fn handle_update(
         // would bypass the configured Audio STT Model route.
         if let Some(a_bytes) = audio_bytes {
             let prompt_audio = if !text.is_empty() {
-                format!("Dengarkan rekaman/audio terlampir dan tanggapi permintaan berikut:\n\n{text}")
+                format!(
+                    "Dengarkan rekaman/audio terlampir dan tanggapi permintaan berikut:\n\n{text}"
+                )
             } else {
                 format!(
                     "Dengarkan pesan suara/audio ini ({} detik) dan jawab pertanyaan atau tanggapi maksud di dalamnya secara jelas dan mendalam.",
@@ -4020,6 +4022,10 @@ async fn main() {
             } else {
                 run_cli_model_picker(&ai_service, filter_arg).await;
             }
+            return;
+        }
+        "pick" => {
+            run_cli_telegram_pick(&ai_service).await;
             return;
         }
         "addon" => {

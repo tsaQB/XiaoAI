@@ -871,9 +871,17 @@ pub struct Message {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplyParameters {
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_flexible_opt_i64")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_flexible_opt_i64"
+    )]
     pub message_id: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_flexible_opt_i64")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_flexible_opt_i64"
+    )]
     pub ephemeral_message_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_sending_without_reply: Option<bool>,

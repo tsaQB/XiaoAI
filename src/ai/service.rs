@@ -644,11 +644,9 @@ fn specialist_chat_payload(model: &str, content: Vec<Value>) -> Value {
 
 fn external_image_fallback_enabled(value: &str) -> bool {
     let clean = value.trim();
-    if clean.eq_ignore_ascii_case("none") || clean.eq_ignore_ascii_case("false") || clean.eq_ignore_ascii_case("off") {
-        false
-    } else {
-        true
-    }
+    !(clean.eq_ignore_ascii_case("none")
+        || clean.eq_ignore_ascii_case("false")
+        || clean.eq_ignore_ascii_case("off"))
 }
 
 fn bounded_timeout_secs(raw: Option<&str>, default_secs: u64) -> u64 {
@@ -3074,7 +3072,9 @@ impl AIChatService {
             if let Some(comma_pos) = reply_text[data_pos..].find(',') {
                 let after_comma = &reply_text[data_pos + comma_pos + 1..];
                 let b64_end = after_comma
-                    .find(|c: char| c.is_whitespace() || c == ')' || c == '"' || c == '\'' || c == ']')
+                    .find(|c: char| {
+                        c.is_whitespace() || c == ')' || c == '"' || c == '\'' || c == ']'
+                    })
                     .unwrap_or(after_comma.len());
                 let b64_str = after_comma[..b64_end].trim();
                 if let Ok(bytes) = decode_generated_image_base64(b64_str) {
@@ -3142,7 +3142,9 @@ fn extract_image_url(text: &str) -> Option<String> {
         }
     }
     for word in text.split_whitespace() {
-        let clean = word.trim_matches(|c: char| c == '(' || c == ')' || c == '"' || c == '\'' || c == '<' || c == '>');
+        let clean = word.trim_matches(|c: char| {
+            c == '(' || c == ')' || c == '"' || c == '\'' || c == '<' || c == '>'
+        });
         if clean.starts_with("https://") || clean.starts_with("http://") {
             let lower = clean.to_ascii_lowercase();
             if lower.ends_with(".png")
@@ -3376,10 +3378,22 @@ mod tests {
         for mime in ["audio/ogg", "application/ogg"] {
             assert_eq!(native_audio_input_format(Some(mime), None), Ok("ogg"));
         }
-        assert_eq!(native_audio_input_format(Some("audio/opus"), None), Ok("opus"));
-        assert_eq!(native_audio_input_format(Some("audio/m4a"), None), Ok("m4a"));
-        assert_eq!(native_audio_input_format(Some("audio/flac"), None), Ok("flac"));
-        assert_eq!(native_audio_input_format(Some("audio/webm"), None), Ok("webm"));
+        assert_eq!(
+            native_audio_input_format(Some("audio/opus"), None),
+            Ok("opus")
+        );
+        assert_eq!(
+            native_audio_input_format(Some("audio/m4a"), None),
+            Ok("m4a")
+        );
+        assert_eq!(
+            native_audio_input_format(Some("audio/flac"), None),
+            Ok("flac")
+        );
+        assert_eq!(
+            native_audio_input_format(Some("audio/webm"), None),
+            Ok("webm")
+        );
 
         assert_eq!(
             native_audio_input_format(None, Some("voice.wav")),
@@ -3434,9 +3448,8 @@ mod tests {
             Some("wav")
         );
 
-        let ogg_part =
-            historical_native_audio_input_part(b"audio", "audio/ogg", Some("voice.ogg"))
-                .expect("ogg should be native-safe");
+        let ogg_part = historical_native_audio_input_part(b"audio", "audio/ogg", Some("voice.ogg"))
+            .expect("ogg should be native-safe");
         assert_eq!(
             ogg_part
                 .get("input_audio")
