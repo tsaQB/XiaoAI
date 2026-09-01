@@ -15,16 +15,16 @@ Run before declaring a change ready:
 
 ## Essential CLI Commands
 
-- `xiao start`
-- `xiao setup`
-- `xiao provider [add] [del] [status]`
-- `xiao telegram [check] [bind] [change]`
-- `xiao telegram owner <telegram_user_id>`
-- `xiao model [query]`
-- `xiao model probe`
-- `xiao model pick`
-- `xiao model addon [list|set|reset|disable|show|probe|test]`
-- `xiao status`
+- `xiao start` — Run Telegram bot daemon
+- `xiao setup` — 2-step setup wizard (AI Provider -> Gateway)
+- `xiao status` — System health & routing status dashboard
+- `xiao gateway` — Interactive chat gateway manager (Telegram token & owner)
+- `xiao provider` — Interactive AI provider manager (list, switch, add, rm)
+- `xiao model [query]` — Interactive Main Model selector with live search
+- `xiao pick` — Interactive Telegram menu model whitelist picker (max 10)
+- `xiao addon` — Interactive multimodal specialist routing (Vision, Video, Audio STT, Image Gen)
+- `xiao probe` — Interactive capability diagnostic & live testing center
+- `xiao help` — Display official command guide
 
 ## Security & Session Invariants
 

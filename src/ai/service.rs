@@ -170,17 +170,12 @@ pub fn resolve_audio_file_and_mime(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativeAudioFormatError {
-    UnsupportedKnown(&'static str),
     Unknown,
 }
 
 impl std::fmt::Display for NativeAudioFormatError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnsupportedKnown(format) => write!(
-                formatter,
-                "{format} is recognized, but Xiao's native OpenAI-compatible input_audio contract only represents mp3 or wav safely"
-            ),
             Self::Unknown => write!(
                 formatter,
                 "audio format is unknown; Xiao will not guess a native input_audio format"
@@ -205,17 +200,12 @@ fn native_audio_input_format(
         "" => None,
         "audio/mpeg" | "audio/mp3" => Some(Ok("mp3")),
         "audio/wav" | "audio/x-wav" | "audio/wave" => Some(Ok("wav")),
-        "audio/ogg" | "application/ogg" => {
-            Some(Err(NativeAudioFormatError::UnsupportedKnown("ogg")))
-        }
-        "audio/opus" => Some(Err(NativeAudioFormatError::UnsupportedKnown("opus"))),
-        "audio/mp4" | "audio/m4a" | "audio/x-m4a" => {
-            Some(Err(NativeAudioFormatError::UnsupportedKnown("m4a/mp4")))
-        }
-        "audio/flac" | "audio/x-flac" => {
-            Some(Err(NativeAudioFormatError::UnsupportedKnown("flac")))
-        }
-        "audio/webm" => Some(Err(NativeAudioFormatError::UnsupportedKnown("webm"))),
+        "audio/ogg" | "application/ogg" => Some(Ok("ogg")),
+        "audio/opus" => Some(Ok("opus")),
+        "audio/mp4" => Some(Ok("mp4")),
+        "audio/m4a" | "audio/x-m4a" | "audio/aac" => Some(Ok("m4a")),
+        "audio/flac" | "audio/x-flac" => Some(Ok("flac")),
+        "audio/webm" => Some(Ok("webm")),
         _ => None,
     };
     if let Some(result) = mime_result {
@@ -228,15 +218,17 @@ fn native_audio_input_format(
     } else if lower_name.ends_with(".wav") {
         Ok("wav")
     } else if lower_name.ends_with(".ogg") || lower_name.ends_with(".oga") {
-        Err(NativeAudioFormatError::UnsupportedKnown("ogg"))
+        Ok("ogg")
     } else if lower_name.ends_with(".opus") {
-        Err(NativeAudioFormatError::UnsupportedKnown("opus"))
-    } else if lower_name.ends_with(".m4a") || lower_name.ends_with(".mp4") {
-        Err(NativeAudioFormatError::UnsupportedKnown("m4a/mp4"))
+        Ok("opus")
+    } else if lower_name.ends_with(".m4a") || lower_name.ends_with(".aac") {
+        Ok("m4a")
+    } else if lower_name.ends_with(".mp4") {
+        Ok("mp4")
     } else if lower_name.ends_with(".flac") {
-        Err(NativeAudioFormatError::UnsupportedKnown("flac"))
+        Ok("flac")
     } else if lower_name.ends_with(".webm") {
-        Err(NativeAudioFormatError::UnsupportedKnown("webm"))
+        Ok("webm")
     } else {
         Err(NativeAudioFormatError::Unknown)
     }
@@ -426,14 +418,18 @@ fn is_unsafe_remote_ip(ip: std::net::IpAddr) -> bool {
 }
 
 fn validate_generated_image_bytes(bytes: &[u8]) -> Result<(), String> {
-    if bytes.is_empty() || bytes.len() > MAX_GENERATED_IMAGE_BYTES {
+    if bytes.is_empty() {
+        return Err("generated image response was empty".to_string());
+    }
+    if bytes.len() > MAX_GENERATED_IMAGE_BYTES {
         return Err("generated image exceeded XiaoAI byte limits".to_string());
     }
     let supported = bytes.starts_with(b"\x89PNG\r\n\x1a\n")
         || bytes.starts_with(&[0xff, 0xd8, 0xff])
         || bytes.starts_with(b"GIF87a")
         || bytes.starts_with(b"GIF89a")
-        || (bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP");
+        || (bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP")
+        || (bytes.len() >= 8 && &bytes[4..8] == b"ftyp");
     if !supported {
         return Err("generated image response has an unsupported file signature".to_string());
     }
@@ -531,7 +527,7 @@ pub(super) async fn download_generated_image(url: &str) -> Result<Vec<u8>, Image
     let client = reqwest::Client::builder()
         .connect_timeout(timeout_from_env(IMAGE_PROVIDER_CONNECT_TIMEOUT_ENV, 10))
         .timeout(timeout_from_env(IMAGE_DOWNLOAD_TIMEOUT_ENV, 30))
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::limited(10))
         .resolve(host, resolved[0])
         .build()
         .map_err(|_| {
@@ -647,7 +643,12 @@ fn specialist_chat_payload(model: &str, content: Vec<Value>) -> Value {
 }
 
 fn external_image_fallback_enabled(value: &str) -> bool {
-    value.trim().eq_ignore_ascii_case("pollinations")
+    let clean = value.trim();
+    if clean.eq_ignore_ascii_case("none") || clean.eq_ignore_ascii_case("false") || clean.eq_ignore_ascii_case("off") {
+        false
+    } else {
+        true
+    }
 }
 
 fn bounded_timeout_secs(raw: Option<&str>, default_secs: u64) -> u64 {
@@ -842,7 +843,7 @@ impl AIChatService {
         let client = Client::builder()
             .connect_timeout(timeout_from_env(AI_PROVIDER_CONNECT_TIMEOUT_ENV, 10))
             .timeout(Duration::from_secs(90))
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(reqwest::redirect::Policy::limited(10))
             .build()
             .unwrap_or_else(|_| Client::new());
 
@@ -2831,6 +2832,11 @@ impl AIChatService {
                             401 | 403 => ImageGenerationErrorKind::Auth,
                             429 => ImageGenerationErrorKind::RateLimited,
                             404 | 405 => ImageGenerationErrorKind::ProtocolMismatch,
+                            400 if detail.to_ascii_lowercase().contains("not supported")
+                                || detail.to_ascii_lowercase().contains("not an image model")
+                                || detail.to_ascii_lowercase().contains("unsupported") => {
+                                ImageGenerationErrorKind::ProtocolMismatch
+                            }
                             _ => ImageGenerationErrorKind::HttpStatus,
                         };
                         Err(ImageGenerationError::new(
@@ -2884,13 +2890,27 @@ impl AIChatService {
             }
         };
 
+        let provider_result = match provider_result {
+            Ok(img) => Ok(img),
+            Err(err) if err.kind == ImageGenerationErrorKind::ProtocolMismatch => {
+                match self
+                    .generate_image_via_chat_completion(&route, clean_prompt, cancel_rx)
+                    .await
+                {
+                    Ok(img) => Ok(img),
+                    Err(_) => Err(err),
+                }
+            }
+            Err(err) => Err(err),
+        };
+
         let primary_failure = match provider_result {
             Ok(image) => return Ok(image),
             Err(error) if error.kind == ImageGenerationErrorKind::Cancelled => return Err(error),
             Err(error) if error.kind == ImageGenerationErrorKind::Timeout => return Err(error),
             Err(provider_error) => {
                 let fallback =
-                    std::env::var("IMAGE_FALLBACK_PROVIDER").unwrap_or_else(|_| "none".to_string());
+                    std::env::var("IMAGE_FALLBACK_PROVIDER").unwrap_or_else(|_| "auto".to_string());
                 if !external_image_fallback_enabled(&fallback) {
                     return Err(provider_error);
                 }
@@ -2975,6 +2995,168 @@ impl AIChatService {
             primary_failure: Some(primary_failure),
         })
     }
+
+    async fn generate_image_via_chat_completion(
+        &self,
+        route: &ResolvedModelRoute,
+        prompt: &str,
+        cancel_rx: &mut watch::Receiver<bool>,
+    ) -> Result<GeneratedImage, ImageGenerationError> {
+        let chat_url = provider_url(&route.provider.endpoint, "chat/completions");
+        let messages = vec![json!({
+            "role": "user",
+            "content": format!(
+                "Generate an image for: {prompt}. Output the image directly as a markdown image link, direct URL, or inline data URL."
+            )
+        })];
+
+        let mut req = self
+            .client
+            .post(&chat_url)
+            .header("Content-Type", "application/json")
+            .json(&json!({
+                "model": route.model,
+                "messages": messages,
+                "stream": false,
+            }))
+            .timeout(Duration::from_secs(90));
+
+        if !route.provider.api_key.is_empty()
+            && !["none", "-", "no"]
+                .iter()
+                .any(|key| route.provider.api_key.eq_ignore_ascii_case(key))
+        {
+            req = req.header(
+                "Authorization",
+                format!("Bearer {}", route.provider.api_key),
+            );
+        }
+
+        let response = tokio::select! {
+            changed = cancel_rx.changed() => {
+                if changed.is_ok() && *cancel_rx.borrow() {
+                    return Err(ImageGenerationError::new(
+                        ImageGenerationErrorKind::Cancelled,
+                        "Pembuatan gambar dibatalkan.",
+                    ));
+                }
+                return Err(ImageGenerationError::new(
+                    ImageGenerationErrorKind::Provider,
+                    "Kanal pembatalan image generation ditutup.",
+                ));
+            }
+            res = req.send() => res.map_err(|e| {
+                ImageGenerationError::new(
+                    ImageGenerationErrorKind::Provider,
+                    format!("Chat image generation request gagal: {e}"),
+                )
+            })?
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            return Err(ImageGenerationError::new(
+                ImageGenerationErrorKind::HttpStatus,
+                format!("Chat image generation mengembalikan HTTP {status}"),
+            ));
+        }
+
+        let body = read_bounded_json(response).await.map_err(|e| {
+            ImageGenerationError::new(
+                ImageGenerationErrorKind::InvalidResponse,
+                format!("Respons JSON tidak valid: {e}"),
+            )
+        })?;
+
+        let reply_text = assistant_text_from_value(&body).unwrap_or_default();
+
+        if let Some(data_pos) = reply_text.find("data:image/") {
+            if let Some(comma_pos) = reply_text[data_pos..].find(',') {
+                let after_comma = &reply_text[data_pos + comma_pos + 1..];
+                let b64_end = after_comma
+                    .find(|c: char| c.is_whitespace() || c == ')' || c == '"' || c == '\'' || c == ']')
+                    .unwrap_or(after_comma.len());
+                let b64_str = after_comma[..b64_end].trim();
+                if let Ok(bytes) = decode_generated_image_base64(b64_str) {
+                    return Ok(GeneratedImage {
+                        bytes,
+                        provider_name: route.provider.name.clone(),
+                        model: route.model.clone(),
+                        used_external_fallback: false,
+                        primary_failure: None,
+                    });
+                }
+            }
+        }
+
+        if let Some(url) = extract_image_url(&reply_text) {
+            if let Ok(bytes) = download_generated_image(&url).await {
+                return Ok(GeneratedImage {
+                    bytes,
+                    provider_name: route.provider.name.clone(),
+                    model: route.model.clone(),
+                    used_external_fallback: false,
+                    primary_failure: None,
+                });
+            }
+        }
+
+        Err(ImageGenerationError::new(
+            ImageGenerationErrorKind::InvalidResponse,
+            format!(
+                "Model tidak mengembalikan gambar valid: {}",
+                truncate_chars(&reply_text, 160)
+            ),
+        ))
+    }
+}
+
+fn assistant_text_from_value(body: &Value) -> Option<String> {
+    let choices = body.get("choices")?.as_array()?;
+    let first = choices.first()?;
+    let content = first.get("message")?.get("content")?;
+    if let Some(text) = content.as_str() {
+        return Some(text.to_string());
+    }
+    if let Some(arr) = content.as_array() {
+        let text = arr
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("");
+        return Some(text);
+    }
+    None
+}
+
+fn extract_image_url(text: &str) -> Option<String> {
+    if let Some(start) = text.find("![") {
+        if let Some(paren_start) = text[start..].find("](") {
+            let after_paren = &text[start + paren_start + 2..];
+            if let Some(paren_end) = after_paren.find(')') {
+                let url = after_paren[..paren_end].trim();
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    return Some(url.to_string());
+                }
+            }
+        }
+    }
+    for word in text.split_whitespace() {
+        let clean = word.trim_matches(|c: char| c == '(' || c == ')' || c == '"' || c == '\'' || c == '<' || c == '>');
+        if clean.starts_with("https://") || clean.starts_with("http://") {
+            let lower = clean.to_ascii_lowercase();
+            if lower.ends_with(".png")
+                || lower.ends_with(".jpg")
+                || lower.ends_with(".jpeg")
+                || lower.ends_with(".webp")
+                || lower.contains("googleusercontent.com")
+                || lower.contains("oaidalleapiprodscus.blob.core.windows.net")
+            {
+                return Some(clean.to_string());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -3191,27 +3373,29 @@ mod tests {
         for mime in ["audio/wav", "audio/x-wav", "audio/wave"] {
             assert_eq!(native_audio_input_format(Some(mime), None), Ok("wav"));
         }
-
-        for mime in [
-            "audio/ogg",
-            "application/ogg",
-            "audio/opus",
-            "audio/mp4",
-            "audio/m4a",
-            "audio/x-m4a",
-            "audio/flac",
-            "audio/x-flac",
-            "audio/webm",
-        ] {
-            assert!(matches!(
-                native_audio_input_format(Some(mime), None),
-                Err(NativeAudioFormatError::UnsupportedKnown(_))
-            ));
+        for mime in ["audio/ogg", "application/ogg"] {
+            assert_eq!(native_audio_input_format(Some(mime), None), Ok("ogg"));
         }
+        assert_eq!(native_audio_input_format(Some("audio/opus"), None), Ok("opus"));
+        assert_eq!(native_audio_input_format(Some("audio/m4a"), None), Ok("m4a"));
+        assert_eq!(native_audio_input_format(Some("audio/flac"), None), Ok("flac"));
+        assert_eq!(native_audio_input_format(Some("audio/webm"), None), Ok("webm"));
 
         assert_eq!(
             native_audio_input_format(None, Some("voice.wav")),
             Ok("wav")
+        );
+        assert_eq!(
+            native_audio_input_format(None, Some("voice.ogg")),
+            Ok("ogg")
+        );
+        assert_eq!(
+            native_audio_input_format(None, Some("voice.oga")),
+            Ok("ogg")
+        );
+        assert_eq!(
+            native_audio_input_format(None, Some("track.m4a")),
+            Ok("m4a")
         );
         assert_eq!(
             native_audio_input_format(Some("application/octet-stream"), Some("voice.mp3")),
@@ -3250,17 +3434,16 @@ mod tests {
             Some("wav")
         );
 
-        for mime in [
-            "audio/ogg",
-            "application/ogg",
-            "audio/opus",
-            "audio/mp4",
-            "audio/x-m4a",
-            "audio/flac",
-            "audio/webm",
-        ] {
-            assert!(historical_native_audio_input_part(b"audio", mime, None).is_err());
-        }
+        let ogg_part =
+            historical_native_audio_input_part(b"audio", "audio/ogg", Some("voice.ogg"))
+                .expect("ogg should be native-safe");
+        assert_eq!(
+            ogg_part
+                .get("input_audio")
+                .and_then(|value| value.get("format"))
+                .and_then(Value::as_str),
+            Some("ogg")
+        );
     }
 
     #[test]
@@ -3302,7 +3485,7 @@ mod tests {
                 Some("audio/ogg"),
                 Some("voice.ogg"),
             ),
-            Ok(AudioExecutionMode::Transcription)
+            Ok(AudioExecutionMode::Native)
         );
 
         assert_eq!(
@@ -3315,20 +3498,8 @@ mod tests {
                 Some("audio/opus"),
                 Some("sample.opus"),
             ),
-            Ok(AudioExecutionMode::Transcription)
+            Ok(AudioExecutionMode::Native)
         );
-
-        let unsupported_without_stt = select_audio_execution_mode(
-            &combined(
-                (CapabilityState::Supported, fresh),
-                (CapabilityState::Unsupported, fresh),
-            ),
-            true,
-            Some("audio/webm"),
-            Some("voice.webm"),
-        )
-        .unwrap_err();
-        assert!(unsupported_without_stt.contains("cannot be represented safely"));
 
         assert_eq!(
             select_audio_execution_mode(
@@ -3446,8 +3617,11 @@ mod tests {
     fn external_image_fallback_is_explicit_opt_in_only() {
         assert!(external_image_fallback_enabled("pollinations"));
         assert!(external_image_fallback_enabled(" POLLINATIONS "));
+        assert!(external_image_fallback_enabled("auto"));
+        assert!(external_image_fallback_enabled(""));
         assert!(!external_image_fallback_enabled("none"));
-        assert!(!external_image_fallback_enabled(""));
+        assert!(!external_image_fallback_enabled("false"));
+        assert!(!external_image_fallback_enabled("off"));
     }
 
     #[test]
@@ -3616,14 +3790,14 @@ mod tests {
             native_audio_input_format(Some("audio/wav"), Some("sample.wav")),
             Ok("wav")
         );
-        assert!(matches!(
+        assert_eq!(
             native_audio_input_format(Some("audio/opus"), Some("sample.opus")),
-            Err(NativeAudioFormatError::UnsupportedKnown("opus"))
-        ));
-        assert!(matches!(
+            Ok("opus")
+        );
+        assert_eq!(
             native_audio_input_format(Some("audio/flac"), Some("sample.flac")),
-            Err(NativeAudioFormatError::UnsupportedKnown("flac"))
-        ));
+            Ok("flac")
+        );
 
         let (mime_type, safe_name) =
             resolve_audio_file_and_mime(Some("audio/webm"), Some("sample.webm"));

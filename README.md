@@ -53,7 +53,7 @@ xiaochat v0.3.0 memakai subset Telegram Bot API 10.3 yang relevan untuk UI/AI fl
 `OWNER_USER_ID` adalah hard invariant. XiaoAI menolak start jika owner belum dikonfigurasi.
 
 ```bash
-xiao telegram owner 123456789
+xiao gateway
 # atau
 xiao setup
 ```
@@ -129,29 +129,26 @@ XiaoAI/
 ## Perintah CLI
 
 ```bash
-xiao start
-xiao setup
-xiao provider [add] [del] [status]
-xiao telegram [check] [bind] [change]
-xiao telegram owner <telegram_user_id>
-xiao model [name]
-xiao model probe
-xiao model pick
-xiao model addon
-xiao model addon set vision main
-xiao model addon set image_gen provider_id::model
-xiao model addon reset <vision|video|audio_stt|image_gen|all>
-xiao model addon disable <vision|video|audio_stt|image_gen>
-xiao model addon show <vision|video|audio_stt|image_gen>
-xiao model addon probe [role]
-xiao model addon test <role>
-xiao status
-xiao help
+xiao start          # Jalankan bot daemon
+xiao setup          # Wizard konfigurasi awal (AI Provider ➔ Gateway)
+xiao status         # Dashboard status sistem lengkap & ringkas
+
+xiao gateway        # Kelola gateway chat (Telegram token & owner) [Full Interaktif]
+xiao provider       # Kelola AI provider (List, Tambah, Hapus, Switch) [Full Interaktif]
+
+xiao model [query]  # Pilih atau cari Main Model aktif [Full Interaktif]
+xiao pick           # Pilih daftar model untuk menu Telegram (maks 10) [Full Interaktif]
+xiao addon          # Kelola routing spesialis multimodal (Vision/Audio/..) [Full Interaktif]
+
+xiao probe          # Pusat diagnostik kapabilitas & live functional test [Full Interaktif]
+xiao help           # Tampilkan panduan perintah resmi
 ```
 
-`xiao model addon probe [role]` memperbarui dan menyimpan evidence capability yang aman; active image-generation probe tidak dijalankan oleh command ini. `xiao model addon test <role>` mengirim sample fungsional ke route yang sudah tersimpan tanpa mengubah routing; khusus Image Generation, test eksplisit dapat memakai kredit dan menyimpan evidence hasilnya.
+`xiao addon` menyediakan antarmuka TUI interaktif untuk mengarahkan specialist multimodal (*Vision, Video, Audio STT, Image Gen*) ke Main Model, menonaktifkannya (*Disabled*), atau memilih model spesifik.
 
-`xiao model pick` mengelola whitelist model Telegram di SQLite. File JSON legacy hanya digunakan sebagai sumber migrasi kompatibilitas bila masih ditemukan. Environment/.env dapat menjadi bootstrap input, tetapi SQLite adalah runtime source of truth.
+`xiao probe` menyediakan pusat pengujian diagnostik interaktif untuk mengaudit kapabilitas seluruh model aktif, melakukan live test sampel gambar/suara, serta mengecek cache kapabilitas SQLite.
+
+`xiao pick` mengelola whitelist model Telegram di SQLite. File JSON legacy hanya digunakan sebagai sumber migrasi kompatibilitas bila masih ditemukan. Environment/.env dapat menjadi bootstrap input, tetapi SQLite adalah runtime source of truth.
 
 ## Konfigurasi Environment
 

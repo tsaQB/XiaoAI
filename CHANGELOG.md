@@ -1,6 +1,14 @@
 # Changelog
 
-## xiaochat v0.3.0 — 2026-08-30 — role-based multimodal routing
+## xiaochat v0.3.0 — 2026-08-30 — role-based multimodal routing & modern minimalist CLI
+
+### Modern CLI Architecture
+- Streamline CLI commands into a clean, flat, single canonical set (`start`, `setup`, `status`, `gateway`, `provider`, `model`, `pick`, `addon`, `probe`, `help`).
+- Make all major configuration workflows full interactive TUI (`xiao gateway`, `xiao addon`, `xiao probe`, `xiao provider`, `xiao model`, `xiao pick`).
+- Re-architect `xiao setup` into a streamlined 2-step frictionless wizard (AI Provider & Main Model -> Gateway Confirmation & Selector).
+- Unify capability diagnostics and functional live tests into an interactive Diagnostic Center (`xiao probe`).
+- Eliminate deeply-nested subcommands (`xiao model addon set ...`, `xiao telegram bind ...`) and implement strict global rejection for unknown commands.
+- Standardize minimalist visual UI with modern status indicators (`●`, `○`, `◆`, `✔`, `✖`, `❯`) and aligned columns.
 
 ### Model routing
 - Add five explicit roles: Main Model, Vision Model, Video Model, Audio STT Model, and Image Generation Model.

@@ -661,6 +661,158 @@ impl InputRichMessage {
     }
 }
 
+pub fn deserialize_flexible_i64<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct FlexibleI64Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for FlexibleI64Visitor {
+        type Value = i64;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("an integer or a string representing an integer")
+        }
+
+        fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(v)
+        }
+
+        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            i64::try_from(v).map_err(serde::de::Error::custom)
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            v.trim().parse::<i64>().map_err(serde::de::Error::custom)
+        }
+    }
+
+    deserializer.deserialize_any(FlexibleI64Visitor)
+}
+
+pub fn deserialize_flexible_opt_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct FlexibleOptI64Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for FlexibleOptI64Visitor {
+        type Value = Option<i64>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("an optional integer or a string representing an integer")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserialize_flexible_i64(deserializer).map(Some)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_option(FlexibleOptI64Visitor)
+}
+
+pub fn deserialize_flexible_i32<'de, D>(deserializer: D) -> Result<i32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct FlexibleI32Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for FlexibleI32Visitor {
+        type Value = i32;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("an integer or a string representing an integer")
+        }
+
+        fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            i32::try_from(v).map_err(serde::de::Error::custom)
+        }
+
+        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            i32::try_from(v).map_err(serde::de::Error::custom)
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            v.trim().parse::<i32>().map_err(serde::de::Error::custom)
+        }
+    }
+
+    deserializer.deserialize_any(FlexibleI32Visitor)
+}
+
+pub fn deserialize_flexible_opt_i32<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct FlexibleOptI32Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for FlexibleOptI32Visitor {
+        type Value = Option<i32>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("an optional integer or a string representing an integer")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserialize_flexible_i32(deserializer).map(Some)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_option(FlexibleOptI32Visitor)
+}
+
 // ==========================================
 // Telegram Updates & Message Payloads
 // ==========================================
@@ -670,11 +822,13 @@ pub struct ApiResponse<T> {
     pub ok: bool,
     pub result: Option<T>,
     pub description: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_flexible_opt_i64")]
     pub error_code: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Update {
+    #[serde(deserialize_with = "deserialize_flexible_i64")]
     pub update_id: i64,
     pub message: Option<Message>,
     pub callback_query: Option<CallbackQuery>,
@@ -684,18 +838,24 @@ pub struct Update {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageGenerationStopped {
     pub chat: Chat,
+    #[serde(default, deserialize_with = "deserialize_flexible_opt_i64")]
     pub message_thread_id: Option<i64>,
+    #[serde(deserialize_with = "deserialize_flexible_i64")]
     pub draft_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
+    #[serde(deserialize_with = "deserialize_flexible_i64")]
     pub message_id: i64,
     pub from: Option<User>,
     pub chat: Chat,
+    #[serde(deserialize_with = "deserialize_flexible_i64")]
     pub date: i64,
+    #[serde(default, deserialize_with = "deserialize_flexible_opt_i64")]
     pub message_thread_id: Option<i64>,
     pub receiver_user: Option<User>,
+    #[serde(default, deserialize_with = "deserialize_flexible_opt_i64")]
     pub ephemeral_message_id: Option<i64>,
     pub text: Option<String>,
     pub caption: Option<String>,
@@ -711,9 +871,9 @@ pub struct Message {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplyParameters {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_flexible_opt_i64")]
     pub message_id: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_flexible_opt_i64")]
     pub ephemeral_message_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_sending_without_reply: Option<bool>,
@@ -739,6 +899,7 @@ impl ReplyParameters {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EphemeralMessageParameters {
+    #[serde(deserialize_with = "deserialize_flexible_i64")]
     pub receiver_user_id: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callback_query_id: Option<String>,
@@ -748,6 +909,7 @@ pub struct EphemeralMessageParameters {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
+    #[serde(deserialize_with = "deserialize_flexible_i64")]
     pub id: i64,
     pub is_bot: bool,
     pub first_name: String,
@@ -757,6 +919,7 @@ pub struct User {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chat {
+    #[serde(deserialize_with = "deserialize_flexible_i64")]
     pub id: i64,
     #[serde(rename = "type")]
     pub chat_type: String,
@@ -770,8 +933,11 @@ pub struct Chat {
 pub struct PhotoSize {
     pub file_id: String,
     pub file_unique_id: String,
+    #[serde(deserialize_with = "deserialize_flexible_i32")]
     pub width: i32,
+    #[serde(deserialize_with = "deserialize_flexible_i32")]
     pub height: i32,
+    #[serde(default, deserialize_with = "deserialize_flexible_opt_i64")]
     pub file_size: Option<i64>,
 }
 
@@ -780,44 +946,56 @@ pub struct Document {
     pub file_id: String,
     pub file_name: Option<String>,
     pub mime_type: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_flexible_opt_i64")]
     pub file_size: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Voice {
     pub file_id: String,
+    #[serde(deserialize_with = "deserialize_flexible_i32")]
     pub duration: i32,
     pub mime_type: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_flexible_opt_i64")]
     pub file_size: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Audio {
     pub file_id: String,
+    #[serde(deserialize_with = "deserialize_flexible_i32")]
     pub duration: i32,
     pub performer: Option<String>,
     pub title: Option<String>,
     pub file_name: Option<String>,
     pub mime_type: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_flexible_opt_i64")]
     pub file_size: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Video {
     pub file_id: String,
+    #[serde(deserialize_with = "deserialize_flexible_i32")]
     pub width: i32,
+    #[serde(deserialize_with = "deserialize_flexible_i32")]
     pub height: i32,
+    #[serde(deserialize_with = "deserialize_flexible_i32")]
     pub duration: i32,
     pub file_name: Option<String>,
     pub mime_type: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_flexible_opt_i64")]
     pub file_size: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoNote {
     pub file_id: String,
+    #[serde(deserialize_with = "deserialize_flexible_i32")]
     pub length: i32,
+    #[serde(deserialize_with = "deserialize_flexible_i32")]
     pub duration: i32,
+    #[serde(default, deserialize_with = "deserialize_flexible_opt_i64")]
     pub file_size: Option<i64>,
 }
 
@@ -833,6 +1011,7 @@ pub struct CallbackQuery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileInfo {
     pub file_id: String,
+    #[serde(default, deserialize_with = "deserialize_flexible_opt_i64")]
     pub file_size: Option<i64>,
     pub file_path: Option<String>,
 }

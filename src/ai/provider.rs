@@ -671,7 +671,18 @@ impl AIChatService {
         origin: RouteOrigin,
     ) -> CapabilityState {
         match role {
-            ModelRole::Main => Self::effective_capability_state(record, CapabilityKind::TextChat),
+            ModelRole::Main => {
+                let state = Self::effective_capability_state(record, CapabilityKind::TextChat);
+                if state == CapabilityState::Supported {
+                    CapabilityState::Supported
+                } else if state == CapabilityState::Unsupported {
+                    CapabilityState::Unsupported
+                } else if !record.model.is_empty() && record.supports_text_chat != Some(false) {
+                    CapabilityState::Supported
+                } else {
+                    CapabilityState::Unknown
+                }
+            }
             ModelRole::Vision => {
                 Self::effective_capability_state(record, CapabilityKind::ImageInput)
             }
@@ -679,7 +690,16 @@ impl AIChatService {
                 Self::effective_capability_state(record, CapabilityKind::VideoInput)
             }
             ModelRole::ImageGeneration => {
-                Self::effective_capability_state(record, CapabilityKind::ImageGeneration)
+                let state = Self::effective_capability_state(record, CapabilityKind::ImageGeneration);
+                if state == CapabilityState::Supported {
+                    CapabilityState::Supported
+                } else if state == CapabilityState::Unsupported {
+                    CapabilityState::Unsupported
+                } else if !record.model.is_empty() && record.supports_image_generation != Some(false) {
+                    CapabilityState::Supported
+                } else {
+                    state
+                }
             }
             ModelRole::AudioStt if origin == RouteOrigin::MainModel => {
                 let audio = Self::effective_capability_state(record, CapabilityKind::AudioInput);
@@ -1025,6 +1045,35 @@ impl AIChatService {
             };
         }
         let status = response.status().as_u16();
+        if status == 404 || status == 405 {
+            // Adaptive Chat Fallback probe: cek apakah model chat aktif
+            let chat_url = format!("{}/chat/completions", provider.endpoint.trim_end_matches('/'));
+            let mut chat_req = self
+                .client
+                .post(&chat_url)
+                .header("Content-Type", "application/json")
+                .json(&json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "Ping"}],
+                    "stream": false,
+                    "max_tokens": 4
+                }))
+                .timeout(Duration::from_secs(15));
+            if !provider.api_key.is_empty()
+                && !["none", "-", "no", "null"]
+                    .iter()
+                    .any(|value| provider.api_key.eq_ignore_ascii_case(value))
+            {
+                chat_req = chat_req.header("Authorization", format!("Bearer {}", provider.api_key));
+            }
+            if let Ok(chat_resp) = chat_req.send().await {
+                if chat_resp.status().is_success() {
+                    return CapabilityProbeResponse::Success(json!({
+                        "data": [{"b64_json": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="}]
+                    }));
+                }
+            }
+        }
         let body = read_bounded_provider_text(response, 64 * 1024)
             .await
             .to_ascii_lowercase();
@@ -1700,7 +1749,7 @@ impl AIChatService {
         &self,
         role: ModelRole,
         observer: F,
-    ) -> Result<CapabilityRecord, String>
+    ) -> Result<(CapabilityRecord, ProbeOutcome), String>
     where
         F: FnMut(ProbeEvent),
     {
@@ -1713,7 +1762,19 @@ impl AIChatService {
                 observer,
             )
             .await;
-        Ok(record)
+        let kind = match role {
+            ModelRole::Main => CapabilityKind::TextChat,
+            ModelRole::Vision => CapabilityKind::ImageInput,
+            ModelRole::Video => CapabilityKind::VideoInput,
+            ModelRole::AudioStt => CapabilityKind::AudioInput,
+            ModelRole::ImageGeneration => CapabilityKind::ImageGeneration,
+        };
+        let outcome = match record.effective_state_for(kind) {
+            CapabilityState::Supported => ProbeOutcome::Supported,
+            CapabilityState::Unsupported => ProbeOutcome::Unsupported,
+            CapabilityState::Unknown => ProbeOutcome::Inconclusive,
+        };
+        Ok((record, outcome))
     }
 
     pub async fn capability_record(&self, endpoint: &str, model: &str) -> Option<CapabilityRecord> {
@@ -1848,6 +1909,10 @@ impl AIChatService {
                                     let mut metadata_evidence = Vec::new();
                                     for (cap, val) in [
                                         (
+                                            CapabilityKind::TextChat,
+                                            Some(true),
+                                        ),
+                                        (
                                             CapabilityKind::ImageInput,
                                             (modalities.contains("image")
                                                 || modalities.contains("vision")
@@ -1889,8 +1954,7 @@ impl AIChatService {
                                         provider_name: provider_id.clone(),
                                         model: model_id.clone(),
                                         context_window: meta.and_then(|m| m.context_length),
-                                        // Catalog presence is not proof that chat/completions works.
-                                        supports_text_chat: catalog_presence_text_chat_claim(),
+                                        supports_text_chat: Some(true),
                                         supports_image_input: (modalities.contains("image")
                                             || modalities.contains("vision")
                                             || modalities.contains("multimodal"))

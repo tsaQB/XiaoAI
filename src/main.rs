@@ -198,7 +198,7 @@ async fn build_provider_model_picker(
 
     if providers.is_empty() {
         return (
-            "<b>Belum ada AI Provider yang dikonfigurasi.</b>\n\nSilakan jalankan <code>xiao provider add</code> di terminal.".to_string(),
+            "<b>Belum ada AI Provider yang dikonfigurasi.</b>\n\nSilakan jalankan <code>xiao provider</code> di terminal.".to_string(),
             InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback("Close", "provider_close")]]),
         );
     }
@@ -853,7 +853,7 @@ fn build_help_ui() -> InputRichMessage {
             is_open: Some(false),
         },
         RichBlock::Paragraph {
-            text: Value::String("Advanced routing configuration: xiao model addon".to_string()),
+            text: Value::String("Advanced routing configuration: xiao addon".to_string()),
         },
         RichBlock::Buttons {
             buttons: vec![RichMessageButton::callback("Menu", "action_menu")],
@@ -1188,7 +1188,7 @@ async fn build_model_dashboard_ui(ai_service: &AIChatService, user_id: i64) -> I
         RichBlock::BlockQuotation {
             blocks: vec![json!({
                 "type":"paragraph",
-                "text":"Addon routes are read-only in Telegram v0.3.0. Configure them with xiao model addon; changing Main never overwrites Specific routes."
+                "text":"Addon routes are read-only in Telegram v0.3.0. Configure them with xiao addon; changing Main never overwrites Specific routes."
             })],
         },
         RichBlock::Buttons {
@@ -2096,7 +2096,7 @@ async fn handle_image_generation(
                 blocks.push(RichBlock::BlockQuotation {
                     blocks: vec![json!({
                         "type":"paragraph",
-                        "text":"Check the Image Generation Model route with: xiao model addon show image_gen. Configure it with: xiao model addon set image_gen"
+                        "text":"Configure specialist Image Generation route with: xiao addon"
                     })],
                 });
             }
@@ -2944,15 +2944,15 @@ async fn handle_update(
             return;
         }
 
-        // Voice audio processing is role-routed inside AIChatService.
+        // Voice & audio file processing is role-routed inside AIChatService.
         // Do not pre-transcribe against the active provider here because that
         // would bypass the configured Audio STT Model route.
         if let Some(a_bytes) = audio_bytes {
             let prompt_audio = if !text.is_empty() {
-                text.clone()
+                format!("Dengarkan rekaman/audio terlampir dan tanggapi permintaan berikut:\n\n{text}")
             } else {
                 format!(
-                    "Dengarkan pesan suara ini ({} detik) dan jawab pertanyaan atau tanggapi maksud di dalamnya secara jelas dan mendalam.",
+                    "Dengarkan pesan suara/audio ini ({} detik) dan jawab pertanyaan atau tanggapi maksud di dalamnya secara jelas dan mendalam.",
                     audio_duration
                 )
             };
@@ -3484,7 +3484,7 @@ async fn handle_update(
             ];
             if !allowed_cqs.iter().any(|pref| cq_data.starts_with(pref)) {
                 let _ = bot
-                    .answer_callback_query(&cq_id, Some("🔒 Menu terkunci! Jalankan `xiao provider add` di terminal terlebih dahulu."), true)
+                    .answer_callback_query(&cq_id, Some("🔒 Menu terkunci! Jalankan `xiao provider` di terminal terlebih dahulu."), true)
                     .await;
                 return;
             }
@@ -3996,8 +3996,16 @@ async fn main() {
     let ai_service = Arc::new(AIChatService::new());
 
     match subcommand {
-        "setup" | "quickstart" => {
+        "setup" => {
             let _ = run_cli_quickstart_wizard(&ai_service).await;
+            return;
+        }
+        "status" => {
+            run_cli_status(&ai_service).await;
+            return;
+        }
+        "gateway" => {
+            run_cli_gateway_menu().await;
             return;
         }
         "provider" => {
@@ -4005,29 +4013,21 @@ async fn main() {
             run_cli_provider_menu(&ai_service, action_arg).await;
             return;
         }
-        "telegram" | "tg" => {
-            let action_arg = args.get(2).map(|s| s.as_str());
-            let extra_arg = args.get(3).map(|s| s.as_str());
-            run_cli_telegram_menu(action_arg, extra_arg).await;
-            return;
-        }
         "model" => {
-            let is_pick = args.get(2).map(|s| s.as_str()) == Some("pick")
-                || args.get(3).map(|s| s.as_str()) == Some("pick");
-            if args.get(2).map(|s| s.as_str()) == Some("addon") {
-                run_cli_model_addon(&ai_service, &args[3..]).await;
-            } else if args.get(2).map(|s| s.as_str()) == Some("probe") {
-                run_cli_model_probe(&ai_service).await;
-            } else if is_pick {
-                run_cli_telegram_pick(&ai_service).await;
+            let filter_arg = args.get(2).map(|s| s.as_str());
+            if filter_arg == Some("addon") || filter_arg == Some("addons") {
+                run_cli_addon_menu(&ai_service).await;
             } else {
-                let filter_arg = args.get(2).map(|s| s.as_str());
                 run_cli_model_picker(&ai_service, filter_arg).await;
             }
             return;
         }
-        "status" => {
-            run_cli_status(&ai_service).await;
+        "addon" => {
+            run_cli_addon_menu(&ai_service).await;
+            return;
+        }
+        "probe" => {
+            run_cli_probe_menu(&ai_service).await;
             return;
         }
         "help" | "--help" | "-h" => {
@@ -4038,9 +4038,8 @@ async fn main() {
             // Proceed to run bot server
         }
         unknown => {
-            println!("⚠️ Perintah tidak dikenal: '{unknown}'");
-            print_cli_help();
-            return;
+            println!("\x1b[31m✖ Error: Perintah '{unknown}' tidak dikenal. Jalankan 'xiao help' untuk bantuan.\x1b[0m");
+            std::process::exit(1);
         }
     }
 
@@ -4051,7 +4050,7 @@ async fn main() {
     };
 
     let Some(owner_user_id) = get_configured_owner_id() else {
-        error!("OWNER_USER_ID belum dikonfigurasi. Jalankan `xiao telegram owner <telegram_user_id>` atau `xiao setup`.");
+        error!("OWNER_USER_ID belum dikonfigurasi. Jalankan `xiao gateway` atau `xiao setup`.");
         return;
     };
     let access = Arc::new(AccessPolicy {
@@ -4373,7 +4372,7 @@ mod update_lane_tests {
         assert!(serialized.contains("\"type\":\"table\""));
         assert!(serialized.contains("\"type\":\"details\""));
         assert!(serialized.contains("read-only"));
-        assert!(serialized.contains("xiao model addon"));
+        assert!(serialized.contains("xiao addon"));
     }
 
     #[test]

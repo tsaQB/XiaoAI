@@ -11,6 +11,7 @@ pub enum ModelRole {
 }
 
 impl ModelRole {
+    #[allow(dead_code)]
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "main" => Some(Self::Main),

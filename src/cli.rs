@@ -17,8 +17,8 @@ use crossterm::{
 };
 
 use crate::ai::service::{
-    load_provider_store, save_provider_store, CapabilityKind, ModelRole, ModelRoute, ProbeEvent,
-    ProbeOutcome, ProviderConfig,
+    load_provider_store, save_provider_store, CapabilityKind, CapabilityState, ModelRole,
+    ModelRoute, ProbeEvent, ProbeOutcome, ProviderConfig,
 };
 
 struct CleanRawMode;
@@ -54,11 +54,10 @@ pub fn terminal_interactive_select(
 
     let mut query = initial_query.unwrap_or("").to_string();
     let mut selected_pos = initial_idx.min(items.len() - 1);
-    let page_size = 25usize;
+    let page_size = 20usize;
     let mut top_idx = 0usize;
 
     loop {
-        // Filter items based on query
         let filtered: Vec<(usize, &String)> = if query.is_empty() {
             items.iter().enumerate().collect()
         } else {
@@ -80,17 +79,15 @@ pub fn terminal_interactive_select(
             top_idx = selected_pos + 1 - page_size;
         }
 
-        // Render screen
         let mut buffer = Vec::new();
-        buffer.push(format!("\x1b[1;38;5;39m{}\x1b[0m", title));
+        buffer.push(format!("\x1b[1;36m{}\x1b[0m", title));
         if allow_search {
             buffer.push(format!(
-                "\x1b[38;5;214mFilter:\x1b[0m \x1b[1;37m{}\x1b[38;5;244m_  \x1b[38;5;240m[▲/▼ Navigate • Enter Select • Esc Back]\x1b[0m",
+                "\x1b[33mFilter:\x1b[0m \x1b[1;37m{}\x1b[38;5;244m_  \x1b[38;5;240m[▲/▼ Geser · Enter Pilih · Esc Batal]\x1b[0m",
                 query
             ));
         } else {
-            buffer
-                .push("\x1b[38;5;243m[▲/▼ Navigate • Enter Select • Esc Back]\x1b[0m".to_string());
+            buffer.push("\x1b[38;5;243m[▲/▼ Geser · Enter Pilih · Esc Batal]\x1b[0m".to_string());
         }
         buffer.push(
             "\x1b[38;5;238m────────────────────────────────────────────────────────────\x1b[0m"
@@ -98,18 +95,18 @@ pub fn terminal_interactive_select(
         );
 
         if filtered.is_empty() {
-            buffer.push("  \x1b[38;5;203mNo items matching filter.\x1b[0m".to_string());
+            buffer.push("  \x1b[31mTidak ada pilihan yang cocok dengan filter.\x1b[0m".to_string());
         } else {
             let end_idx = (top_idx + page_size).min(filtered.len());
             if top_idx > 0 {
-                buffer.push("  \x1b[38;5;240m▲ (more items above)\x1b[0m".to_string());
+                buffer.push("  \x1b[38;5;240m▲ (lebih banyak di atas)\x1b[0m".to_string());
             }
             for (curr_idx, (orig_idx, item_text)) in filtered[top_idx..end_idx].iter().enumerate() {
                 let actual_idx = top_idx + curr_idx;
                 let is_sel = actual_idx == selected_pos;
                 if is_sel {
                     buffer.push(format!(
-                        "\x1b[1;38;5;42m ❯ \x1b[1;37m{:>2}. {}\x1b[0m",
+                        "\x1b[1;32m ❯ \x1b[1;37m{:>2}. {}\x1b[0m",
                         orig_idx + 1,
                         item_text
                     ));
@@ -123,7 +120,7 @@ pub fn terminal_interactive_select(
             }
             if end_idx < filtered.len() {
                 buffer.push(format!(
-                    "  \x1b[38;5;240m▼ ({} more items below)\x1b[0m",
+                    "  \x1b[38;5;240m▼ ({} pilihan lagi di bawah)\x1b[0m",
                     filtered.len() - end_idx
                 ));
             }
@@ -133,7 +130,6 @@ pub fn terminal_interactive_select(
                 .to_string(),
         );
 
-        // Clear and print at top of alternate screen
         let _ = execute!(
             stdout,
             cursor::MoveTo(0, 0),
@@ -142,7 +138,6 @@ pub fn terminal_interactive_select(
         );
         let _ = stdout.flush();
 
-        // Read event
         if let Ok(Event::Key(KeyEvent {
             code, modifiers, ..
         })) = event::read()
@@ -151,25 +146,19 @@ pub fn terminal_interactive_select(
                 return None;
             }
             match code {
-                KeyCode::Esc => {
-                    return None;
-                }
+                KeyCode::Esc => return None,
                 KeyCode::Enter => {
                     if let Some(&(orig_idx, _)) = filtered.get(selected_pos) {
                         return Some(orig_idx);
                     }
                 }
-                KeyCode::Up => {
-                    selected_pos = selected_pos.saturating_sub(1);
-                }
+                KeyCode::Up => selected_pos = selected_pos.saturating_sub(1),
                 KeyCode::Down => {
                     if !filtered.is_empty() && selected_pos + 1 < filtered.len() {
                         selected_pos += 1;
                     }
                 }
-                KeyCode::PageUp => {
-                    selected_pos = selected_pos.saturating_sub(page_size);
-                }
+                KeyCode::PageUp => selected_pos = selected_pos.saturating_sub(page_size),
                 KeyCode::PageDown => {
                     if !filtered.is_empty() {
                         selected_pos = (selected_pos + page_size).min(filtered.len() - 1);
@@ -189,7 +178,7 @@ pub fn terminal_interactive_select(
     }
 }
 
-fn terminal_interactive_multi_select(
+pub fn terminal_interactive_multi_select(
     title: &str,
     items: &[String],
     selected: &[bool],
@@ -202,7 +191,7 @@ fn terminal_interactive_multi_select(
     let mut stdout = io::stdout();
     let mut cursor_idx = 0usize;
     let mut top_idx = 0usize;
-    let page_size = 25usize;
+    let page_size = 20usize;
     let mut query = String::new();
     let mut picked = selected.to_vec();
     picked.resize(items.len(), false);
@@ -231,10 +220,13 @@ fn terminal_interactive_multi_select(
             }
         }
         let end_idx = (top_idx + page_size).min(filtered.len());
-        let mut buffer = vec![format!("\x1b[1;38;5;39m{}\x1b[0m", title)];
-        buffer.push(format!("\x1b[38;5;214mFilter:\x1b[0m \x1b[1;37m{}_\x1b[0m  \x1b[38;5;240m[▲/▼ Navigate • Space Toggle • Enter Save • Esc Save]\x1b[0m", query));
+        let mut buffer = vec![format!("\x1b[1;36m{}\x1b[0m", title)];
         buffer.push(format!(
-            "\x1b[38;5;244mSelected: {}/{} • Showing {}-{} of {}\x1b[0m",
+            "\x1b[33mFilter:\x1b[0m \x1b[1;37m{}_\x1b[0m  \x1b[38;5;240m[▲/▼ Geser · Spasi Centang · Enter Simpan · Esc Batal]\x1b[0m",
+            query
+        ));
+        buffer.push(format!(
+            "\x1b[38;5;244mTerpilih: {}/{} · Menampilkan {}-{} dari {}\x1b[0m",
             picked.iter().filter(|v| **v).count(),
             max_selected,
             if filtered.is_empty() { 0 } else { top_idx + 1 },
@@ -250,7 +242,7 @@ fn terminal_interactive_multi_select(
             let is_cursor = top_idx + display_idx == cursor_idx;
             if is_cursor {
                 buffer.push(format!(
-                    "\x1b[1;38;5;42m > \x1b[1;37m{} {:>3}. {}\x1b[0m",
+                    "\x1b[1;32m ❯ \x1b[1;37m{} {:>3}. {}\x1b[0m",
                     marker,
                     idx + 1,
                     items[*idx]
@@ -264,29 +256,11 @@ fn terminal_interactive_multi_select(
                 ));
             }
         }
-        let chosen: Vec<&str> = picked
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, value)| value.then_some(items[idx].as_str()))
-            .collect();
-        if !chosen.is_empty() {
-            buffer.push(
-                "\x1b[38;5;238m────────────────────────────────────────────────────────────\x1b[0m"
-                    .to_string(),
-            );
-            buffer.push("\x1b[38;5;214mPicked:\x1b[0m".to_string());
-            for model in chosen {
-                buffer.push(format!("  \x1b[38;5;250m- {}\x1b[0m", model));
-            }
-        }
         buffer.push(
             "\x1b[38;5;238m────────────────────────────────────────────────────────────\x1b[0m"
                 .to_string(),
         );
-        buffer.push(
-            "\x1b[38;5;238m────────────────────────────────────────────────────────────\x1b[0m"
-                .to_string(),
-        );
+
         let _ = execute!(
             stdout,
             cursor::MoveTo(0, 0),
@@ -295,17 +269,15 @@ fn terminal_interactive_multi_select(
         );
         let _ = stdout.flush();
 
-        if let Ok(Event::Key(KeyEvent { code, .. })) = event::read() {
+        if let Ok(Event::Key(KeyEvent {
+            code, modifiers, ..
+        })) = event::read()
+        {
+            if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
+                return None;
+            }
             match code {
-                KeyCode::Esc => {
-                    return Some(
-                        picked
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(idx, chosen)| chosen.then_some(idx))
-                            .collect(),
-                    )
-                }
+                KeyCode::Esc => return None,
                 KeyCode::Up => cursor_idx = cursor_idx.saturating_sub(1),
                 KeyCode::Down => {
                     cursor_idx = (cursor_idx + 1).min(filtered.len().saturating_sub(1))
@@ -347,38 +319,33 @@ fn terminal_interactive_multi_select(
 }
 
 pub(crate) async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Option<String> {
-    println!("\n\x1b[1;36m== XiaoAI Quickstart Setup Wizard ==\x1b[0m");
-    println!("\x1b[38;5;244mThis wizard will configure your Main Model, addon model routing, and Telegram Bot.\x1b[0m");
+    println!("\n\x1b[1;36mXiaoAI Setup Wizard\x1b[0m");
+    println!(
+        "\x1b[38;5;244mKonfigurasi awal AI Provider dan Gateway. Tekan Ctrl+C untuk batal.\x1b[0m"
+    );
     println!("\x1b[38;5;238m────────────────────────────────────────────────────────────\x1b[0m");
 
     let stdin = io::stdin();
     let mut reader = stdin.lock();
 
-    // Step 1: AI Provider Endpoint
-    println!("\n\x1b[1;37m[1/4] Configure AI Provider & Main Model\x1b[0m");
-    println!("\x1b[38;5;244mCommon Endpoints:\x1b[0m");
-    println!("  \x1b[38;5;246m• https://api.openai.com/v1\x1b[0m");
-    println!("  \x1b[38;5;246m• https://openrouter.ai/api/v1\x1b[0m");
-    println!("  \x1b[38;5;246m• https://api.groq.com/openai/v1\x1b[0m");
-    println!("  \x1b[38;5;246m• http://127.0.0.1:8317/v1 (Local Cliproxy / Ollama)\x1b[0m");
-
+    // Step 1: AI Provider & Main Model
+    println!("\n\x1b[1;37m[1/2] AI Provider & Main Model\x1b[0m");
     let endpoint = loop {
-        print!("\n\x1b[1;37mEndpoint URL:\x1b[0m ");
+        print!("  \x1b[1;37mEndpoint URL\x1b[0m \x1b[38;5;244m(e.g. https://openrouter.ai/api/v1):\x1b[0m ");
         let _ = io::stdout().flush();
         let mut input = String::new();
         if reader.read_line(&mut input).is_err() {
-            println!("\n\x1b[38;5;244mSetup cancelled.\x1b[0m");
+            println!("\n\x1b[38;5;244mSetup dibatalkan.\x1b[0m");
             return None;
         }
         let clean = input.trim().trim_end_matches('/').to_string();
         if clean.starts_with("http://") || clean.starts_with("https://") {
             break clean;
         }
-        println!("\x1b[1;31m[ERROR] Endpoint must start with http:// or https://\x1b[0m");
+        println!("  \x1b[31m✖ Error: Endpoint harus diawali dengan http:// atau https://\x1b[0m");
     };
 
-    // Step 2: API Key (Optional)
-    print!("\x1b[1;37mAPI Key\x1b[0m \x1b[38;5;244m(Optional - press Enter if none):\x1b[0m ");
+    print!("  \x1b[1;37mAPI Key\x1b[0m \x1b[38;5;244m(Enter jika lokal / tanpa key):\x1b[0m ");
     let _ = io::stdout().flush();
     let mut key_input = String::new();
     let _ = reader.read_line(&mut key_input);
@@ -387,8 +354,7 @@ pub(crate) async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Opt
         api_key = "none".to_string();
     }
 
-    // Step 3: Provider Alias (Optional)
-    print!("\x1b[1;37mProvider Alias/Name\x1b[0m \x1b[38;5;244m(Optional - press Enter for default):\x1b[0m ");
+    print!("  \x1b[1;37mProvider Name\x1b[0m \x1b[38;5;244m(Enter untuk default):\x1b[0m ");
     let _ = io::stdout().flush();
     let mut alias_input = String::new();
     let _ = reader.read_line(&mut alias_input);
@@ -403,26 +369,24 @@ pub(crate) async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Opt
         raw_alias.to_string()
     };
 
-    // Step 4: Fetch & Select Model via Arrow Keys
-    println!("\n\x1b[38;5;244mConnecting to endpoint {endpoint} & fetching models...\x1b[0m");
+    println!("  \x1b[38;5;244mMenghubungkan ke endpoint...\x1b[0m");
     let (ok, res) = ai_service
         .fetch_models_from_endpoint(&endpoint, &api_key)
         .await;
-
     if !ok {
         let err = res.err().unwrap_or_else(|| "Unknown error".to_string());
-        println!("\x1b[1;31m[FAIL] Could not connect to provider: {err}\x1b[0m");
+        println!("  \x1b[31m✖ Error: Gagal terhubung ke provider ({err})\x1b[0m");
         return None;
     }
 
     let models = res.unwrap_or_else(|_| vec!["gpt-4o".to_string()]);
     println!(
-        "\x1b[1;32m[OK] Connected! Found {} models.\x1b[0m",
+        "  \x1b[1;32m✔ Terhubung! Ditemukan {} model.\x1b[0m",
         models.len()
     );
 
     let selected_idx = terminal_interactive_select(
-        "⚡ Select Active AI Model for This Provider:",
+        "Pilih Main Model untuk Provider Ini:",
         &models,
         0,
         true,
@@ -459,216 +423,148 @@ pub(crate) async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Opt
     store.providers.push(provider.clone());
     store.active_id = Some(provider_id);
     if let Err(error) = save_provider_store(&store) {
-        println!("\x1b[1;31m[ERROR] Provider configuration was not saved: {error}\x1b[0m");
+        println!("  \x1b[31m✖ Error: Konfigurasi provider gagal disimpan: {error}\x1b[0m");
         return None;
     }
     if !ai_service.reload_provider_store().await {
-        println!("\x1b[1;31m[ERROR] Provider was committed but runtime reload failed. Restart XiaoAI before continuing.\x1b[0m");
+        println!("  \x1b[31m✖ Error: Gagal memuat ulang provider di memori runtime.\x1b[0m");
         return None;
     }
-    println!("\n\x1b[38;5;244mChecking Main Model capabilities...\x1b[0m");
-    if let Some(probe) = run_persisted_capability_probe(ai_service, &provider, &active_model).await
-    {
-        println!(
-            "\x1b[38;5;244mSaved Main capability state: text={:?}, vision={:?}, video={:?}, audio={:?}, stt={:?}, image_gen={:?}\x1b[0m",
-            probe.supports_text_chat,
-            probe.supports_image_input,
-            probe.supports_video_input,
-            probe.supports_audio_input,
-            probe.supports_audio_transcription,
-            probe.supports_image_generation,
-        );
+    let _ = run_persisted_capability_probe(ai_service, &provider, &active_model).await;
+
+    // Preserving existing routes: only initialize missing routes to Main Model (additive setup)
+    let existing_routing = ai_service.model_routing_config().await;
+    for role in ModelRole::addon_roles() {
+        if existing_routing.route(role).is_none() {
+            if let Err(err) = ai_service
+                .set_model_route(role, ModelRoute::MainModel)
+                .await
+            {
+                println!(
+                    "  \x1b[31m✖ Error: Gagal menginisialisasi route {}: {err}\x1b[0m",
+                    role.display_name()
+                );
+                return None;
+            }
+        }
     }
 
-    println!(
-        "\x1b[1;32m[OK] AI Provider '{}' configured with Main Model '{}'!\x1b[0m",
-        clean_alias, active_model
-    );
+    println!("  \x1b[1;32m✔ Main Model diset ke: {}\x1b[0m", active_model);
 
-    // Step 2: Addon model routing. Fresh/default route is always Main Model.
-    println!("\n\x1b[1;37m[2/4] Configure Addon Model Routing\x1b[0m");
-    println!("\x1b[38;5;244mPress Enter for Main Model. Addons are optional overrides and can be changed later with `xiao model addon ...`.\x1b[0m");
-    for role in ModelRole::addon_roles() {
-        loop {
-            print!(
-                "\n\x1b[1;37m{}\x1b[0m \x1b[38;5;244m[Enter=Main Model, s=Specific, d=Disabled]:\x1b[0m ",
-                role.display_name()
-            );
+    // Step 2: Gateway Setup
+    println!("\n\x1b[1;37m[2/2] Gateway Setup\x1b[0m");
+    print!("  \x1b[1;37mKonfigurasi Gateway sekarang? [Y/n]:\x1b[0m ");
+    let _ = io::stdout().flush();
+    let mut gateway_ans = String::new();
+    let _ = reader.read_line(&mut gateway_ans);
+
+    let mut bot_username_opt = None;
+    let mut final_token_opt = None;
+    let owner_id_opt;
+
+    if !gateway_ans.trim().eq_ignore_ascii_case("n") {
+        println!("\n  \x1b[1;36mPilih Gateway:\x1b[0m");
+        println!("    \x1b[1;32m❯ • Telegram\x1b[0m\n");
+
+        let (final_token, bot_username) = loop {
+            print!("  \x1b[1;37mTelegram Bot Token:\x1b[0m ");
             let _ = io::stdout().flush();
             let mut input = String::new();
             if reader.read_line(&mut input).is_err() {
-                println!("\n\x1b[38;5;244mSetup cancelled.\x1b[0m");
+                println!("\n\x1b[38;5;244mSetup dibatalkan.\x1b[0m");
                 return None;
             }
-            let choice = input.trim().to_ascii_lowercase();
-            let route = match choice.as_str() {
-                "" | "m" | "main" => ModelRoute::MainModel,
-                "d" | "disabled" => ModelRoute::Disabled,
-                "s" | "specific" => {
-                    let providers = ai_service.get_user_providers(0).await;
-                    let mut catalog = Vec::new();
-                    for candidate_provider in &providers {
-                        for candidate_model in &candidate_provider.models {
-                            catalog.push((
-                                candidate_provider.id.clone(),
-                                candidate_model.clone(),
-                                format!("{} :: {}", candidate_provider.name, candidate_model),
-                            ));
-                        }
-                    }
-                    if catalog.is_empty() {
-                        println!("\x1b[1;31m[ERROR] No provider models are available for a Specific route.\x1b[0m");
-                        continue;
-                    }
-                    let labels: Vec<String> = catalog.iter().map(|entry| entry.2.clone()).collect();
-                    let Some(index) = terminal_interactive_select(
-                        &format!("Select {}", role.display_name()),
-                        &labels,
-                        0,
-                        true,
-                        None,
-                    ) else {
+            let user_token = input.trim().to_string();
+            if user_token.is_empty() {
+                println!("  \x1b[31m✖ Error: Token tidak boleh kosong.\x1b[0m");
+                continue;
+            }
+
+            let temp_bot = TelegramBotClient::new(&user_token);
+            match temp_bot.get_me().await {
+                Ok(resp) if resp.ok => {
+                    let Some(bot_info) = resp.result else {
                         println!(
-                            "\x1b[38;5;244mSpecific selection cancelled; choose again.\x1b[0m"
+                            "  \x1b[31m✖ Error: Telegram tidak mengembalikan info bot.\x1b[0m"
                         );
                         continue;
                     };
-                    let (provider_id, model, _) = catalog[index].clone();
-                    ModelRoute::Specific { provider_id, model }
-                }
-                _ => {
-                    println!("\x1b[1;31m[ERROR] Choose Enter/Main, Specific, or Disabled.\x1b[0m");
-                    continue;
-                }
-            };
-
-            if let Err(error) = ai_service.set_model_route(role, route.clone()).await {
-                println!(
-                    "\x1b[1;31m[ERROR] {} was not saved: {}\x1b[0m",
-                    role.display_name(),
-                    error
-                );
-                continue;
-            }
-            let route_label = match &route {
-                ModelRoute::MainModel => "Main Model".to_string(),
-                ModelRoute::Disabled => "Disabled".to_string(),
-                ModelRoute::Specific { provider_id, model } => {
-                    format!("{} :: {}", provider_id, model)
-                }
-            };
-            match ai_service.resolve_model_route(role).await {
-                Ok(resolved) => println!(
-                    "\x1b[1;32m[OK] {} -> {} (available: {} / {})\x1b[0m",
-                    role.display_name(),
-                    route_label,
-                    resolved.provider.name,
-                    resolved.model
-                ),
-                Err(error) => println!(
-                    "\x1b[38;5;214m[WARN] {} -> {} saved, but currently unavailable: {}\x1b[0m",
-                    role.display_name(),
-                    route_label,
-                    error
-                ),
-            }
-            break;
-        }
-    }
-
-    // Step 3: Telegram Bot Token
-    println!("\n\x1b[1;37m[3/4] Configure Telegram Bot Token\x1b[0m");
-    println!("\x1b[38;5;244mHow to get your Bot Token:\x1b[0m");
-    println!("  \x1b[38;5;246m1. Open Telegram and search for @BotFather\x1b[0m");
-    println!("  \x1b[38;5;246m2. Send /newbot and follow instructions\x1b[0m");
-    println!("  \x1b[38;5;246m3. Copy the API token provided\x1b[0m");
-    println!("\x1b[38;5;238m────────────────────────────────────────────────────────────\x1b[0m");
-
-    let (final_token, bot_username) = loop {
-        print!("\n\x1b[1;37mEnter Telegram Bot Token:\x1b[0m ");
-        let _ = io::stdout().flush();
-
-        let mut input = String::new();
-        if reader.read_line(&mut input).is_err() {
-            println!("\n\x1b[38;5;244mSetup cancelled.\x1b[0m");
-            return None;
-        }
-
-        let user_token = input.trim().to_string();
-        if user_token.is_empty() {
-            println!("\x1b[1;31m[ERROR] Token cannot be empty.\x1b[0m");
-            continue;
-        }
-
-        println!("\x1b[38;5;244mVerifying token with Telegram API...\x1b[0m");
-        let temp_bot = TelegramBotClient::new(&user_token);
-        match temp_bot.get_me().await {
-            Ok(resp) if resp.ok => {
-                let Some(bot_info) = resp.result else {
-                    println!("\x1b[1;31m[FAIL] Telegram returned ok=true without bot information.\x1b[0m");
-                    continue;
-                };
-                let username = bot_info.username.unwrap_or_else(|| "Unknown".to_string());
-                println!(
-                    "\x1b[1;32m[OK] Token valid! Connected to @{} ({})\x1b[0m",
-                    username, bot_info.first_name
-                );
-
-                if let Err(error) = save_token_to_env(&user_token) {
+                    let uname = bot_info.username.unwrap_or_else(|| "Unknown".to_string());
+                    if let Err(e) = save_token_to_env(&user_token) {
+                        println!("  \x1b[31m✖ Error: Gagal menyimpan token ke storage: {e}\x1b[0m");
+                        return None;
+                    }
                     println!(
-                        "\x1b[1;31m[ERROR] Token valid but could not be saved: {error}\x1b[0m"
+                        "  \x1b[1;32m✔ Token valid! Terhubung ke @{} ({})\x1b[0m",
+                        uname, bot_info.first_name
                     );
-                    return None;
+                    break (user_token, uname);
                 }
-                break (user_token, username);
+                Ok(resp) => {
+                    let desc = resp
+                        .description
+                        .unwrap_or_else(|| "Invalid token".to_string());
+                    println!("  \x1b[31m✖ Error: Token tidak valid ({desc})\x1b[0m");
+                }
+                Err(e) => {
+                    println!("  \x1b[31m✖ Error: Gagal terhubung ke Telegram API ({e})\x1b[0m");
+                }
             }
-            Ok(resp) => {
-                let desc = resp
-                    .description
-                    .unwrap_or_else(|| "Invalid token".to_string());
-                println!("\x1b[1;31m[FAIL] Invalid token: {desc}\x1b[0m");
-            }
-            Err(e) => {
-                println!("\x1b[1;31m[FAIL] Verification error: {e}\x1b[0m");
-            }
-        }
-    };
+        };
 
-    println!("\n\x1b[1;37m[4/4] Configure Telegram Owner\x1b[0m");
-    println!("\x1b[38;5;244mMasukkan numeric Telegram user ID Anda. Hanya owner ini yang boleh menggunakan Xiao.\x1b[0m");
-    let owner_user_id = loop {
-        print!("\x1b[1;37mOwner User ID:\x1b[0m ");
-        let _ = io::stdout().flush();
-        let mut input = String::new();
-        if reader.read_line(&mut input).is_err() {
-            println!("\n\x1b[38;5;244mSetup cancelled.\x1b[0m");
+        let owner_user_id = loop {
+            print!("  \x1b[1;37mOwner User ID:\x1b[0m ");
+            let _ = io::stdout().flush();
+            let mut input = String::new();
+            if reader.read_line(&mut input).is_err() {
+                println!("\n\x1b[38;5;244mSetup dibatalkan.\x1b[0m");
+                return None;
+            }
+            match input.trim().parse::<i64>() {
+                Ok(value) if value > 0 => break value,
+                _ => {
+                    println!("  \x1b[31m✖ Error: Owner User ID harus berupa angka positif.\x1b[0m")
+                }
+            }
+        };
+        if let Err(e) = save_env_kv("OWNER_USER_ID", &owner_user_id.to_string()) {
+            println!("  \x1b[31m✖ Error: Gagal menyimpan Owner ID: {e}\x1b[0m");
             return None;
         }
-        match input.trim().parse::<i64>() {
-            Ok(value) if value > 0 => break value,
-            _ => println!("\x1b[1;31m[ERROR] Owner User ID harus berupa angka positif.\x1b[0m"),
+        println!("  \x1b[1;32m✔ Owner ID diset ke: {}\x1b[0m", owner_user_id);
+
+        bot_username_opt = Some(bot_username);
+        final_token_opt = Some(final_token);
+        owner_id_opt = Some(owner_user_id);
+    } else {
+        println!("  \x1b[38;5;244m○ Konfigurasi gateway dilewati.\x1b[0m");
+        // Reuse existing gateway token if present
+        if let Some(token) = get_configured_token() {
+            final_token_opt = Some(token);
         }
-    };
-    if let Err(error) = save_env_kv("OWNER_USER_ID", &owner_user_id.to_string()) {
-        println!("\x1b[1;31m[ERROR] Owner ID could not be saved: {error}\x1b[0m");
-        return None;
+        owner_id_opt = get_configured_owner_id();
     }
 
-    println!("\n\x1b[1;36m== Quickstart Setup Complete! ==\x1b[0m");
-    println!(
-        "  \x1b[1;37mBot:\x1b[0m          \x1b[1;32m@{}\x1b[0m",
-        bot_username
-    );
-    println!("  \x1b[1;37mProvider:\x1b[0m     {}", clean_alias);
-    println!(
-        "  \x1b[1;37mActive Model:\x1b[0m \x1b[1;36m{}\x1b[0m",
-        active_model
-    );
-    println!("  \x1b[1;37mEndpoint:\x1b[0m     {}", endpoint);
-    println!("  \x1b[1;37mOwner ID:\x1b[0m     {}", owner_user_id);
-    println!("\n\x1b[1;32m🎉 Everything is set up! Run 'xiao start' to launch the bot.\x1b[0m\n");
+    println!("\n\x1b[38;5;238m────────────────────────────────────────────────────────────\x1b[0m");
+    println!("\x1b[1;32mSetup Selesai!\x1b[0m\n");
+    println!("  Provider   ● {} ({})", clean_alias, endpoint);
+    println!("  Model      ◆ {}", active_model);
+    if let (Some(uname), Some(oid)) = (bot_username_opt, owner_id_opt) {
+        println!("  Gateway    ● Telegram (@{} · Owner: {})", uname, oid);
+    } else if let Some(oid) = owner_id_opt {
+        if final_token_opt.is_some() {
+            println!("  Gateway    ● Telegram (existing · Owner: {})", oid);
+        } else {
+            println!("  Gateway    ○ Belum dikonfigurasi (Gunakan 'xiao gateway')");
+        }
+    } else {
+        println!("  Gateway    ○ Belum dikonfigurasi (Gunakan 'xiao gateway')");
+    }
+    println!("  Addons     ○ Mengikuti konfigurasi addon (atur via 'xiao addon')");
+    println!("\n\x1b[1;36mJalankan bot sekarang dengan perintah:\x1b[0m");
+    println!("  \x1b[1;37mxiao start\x1b[0m\n");
 
-    Some(final_token)
+    final_token_opt
 }
 
 pub(crate) async fn get_or_prompt_token(ai_service: &AIChatService) -> Option<String> {
@@ -677,205 +573,44 @@ pub(crate) async fn get_or_prompt_token(ai_service: &AIChatService) -> Option<St
             return Some(token);
         }
     }
-    println!(
-        "\x1b[38;5;214m[WARN] Configuration missing. Starting Quickstart Setup Wizard...\x1b[0m"
-    );
+    println!("\x1b[33mKonfigurasi belum lengkap. Membuka Setup Wizard...\x1b[0m");
     run_cli_quickstart_wizard(ai_service).await
 }
 
-pub(crate) async fn run_cli_provider_add(ai_service: &AIChatService) {
-    println!("\n\x1b[1;36m== Add New AI Provider ==\x1b[0m");
-    println!("\x1b[38;5;244mCommon Endpoints:\x1b[0m");
-    println!("  \x1b[38;5;246m• https://api.openai.com/v1\x1b[0m");
-    println!("  \x1b[38;5;246m• https://openrouter.ai/api/v1\x1b[0m");
-    println!("  \x1b[38;5;246m• https://api.groq.com/openai/v1\x1b[0m");
-    println!("  \x1b[38;5;246m• http://127.0.0.1:8317/v1 (Local Cliproxy / Ollama)\x1b[0m");
-    println!("\x1b[38;5;238m────────────────────────────────────────────────────────────\x1b[0m");
-
-    let stdin = io::stdin();
-    let mut reader = stdin.lock();
-
-    print!("\n\x1b[1;37mEndpoint URL:\x1b[0m ");
-    let _ = io::stdout().flush();
-    let mut endpoint_input = String::new();
-    if reader.read_line(&mut endpoint_input).is_err() {
-        return;
-    }
-    let endpoint = endpoint_input.trim().trim_end_matches('/').to_string();
-    if endpoint.is_empty()
-        || (!endpoint.starts_with("http://") && !endpoint.starts_with("https://"))
-    {
-        println!("\x1b[1;31m[ERROR] Invalid endpoint URL format!\x1b[0m");
-        return;
-    }
-
-    print!("\x1b[1;37mAPI Key\x1b[0m \x1b[38;5;244m('none' if local/no key)\x1b[0m: ");
-    let _ = io::stdout().flush();
-    let mut key_input = String::new();
-    if reader.read_line(&mut key_input).is_err() {
-        return;
-    }
-    let api_key = key_input.trim().to_string();
-
-    print!("\x1b[1;37mProvider Alias/Name\x1b[0m \x1b[38;5;244m(e.g. OpenRouter, Groq, Local)\x1b[0m: ");
-    let _ = io::stdout().flush();
-    let mut alias_input = String::new();
-    if reader.read_line(&mut alias_input).is_err() {
-        return;
-    }
-    let alias = alias_input.trim().to_string();
-
-    println!("\n\x1b[38;5;244mConnecting to endpoint {endpoint} & fetching models...\x1b[0m");
-    let (ok, res) = ai_service
-        .fetch_models_from_endpoint(&endpoint, &api_key)
-        .await;
-
-    if !ok {
-        let err = res.err().unwrap_or_else(|| "Unknown error".to_string());
-        println!("\x1b[1;31m[FAIL] Could not connect to provider: {err}\x1b[0m");
-        return;
-    }
-
-    let models = res.unwrap_or_else(|_| vec!["gpt-4o".to_string()]);
-    println!(
-        "\x1b[1;32m[OK] Connected! Found {} models.\x1b[0m",
-        models.len()
-    );
-
-    let selected_idx = terminal_interactive_select(
-        "Select Active AI Model for This Provider:",
-        &models,
-        0,
-        true,
-        None,
-    );
-
-    let active_model = if let Some(idx) = selected_idx {
-        models[idx].clone()
-    } else {
-        models
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "gpt-4o".to_string())
-    };
-
-    let clean_alias = if alias.is_empty() {
-        if let Ok(u) = url::Url::parse(&endpoint) {
-            u.host_str().unwrap_or("Custom Provider").to_string()
-        } else {
-            "Custom Provider".to_string()
-        }
-    } else {
-        alias
-    };
-
-    let random_suffix: String = rand::thread_rng()
-        .sample_iter(&rand::distributions::Alphanumeric)
-        .take(6)
-        .map(char::from)
-        .collect();
-    let provider_id = format!("prov_{}", random_suffix.to_lowercase());
-
-    let provider = ProviderConfig {
-        id: provider_id.clone(),
-        name: clean_alias.clone(),
-        endpoint: endpoint.clone(),
-        api_key: api_key.clone(),
-        api_key_ref: None,
-        models: models.clone(),
-        active_model: active_model.clone(),
-    };
-
-    let mut store = load_provider_store();
-    store.providers.push(provider.clone());
-    store.active_id = Some(provider_id);
-    if let Err(error) = save_provider_store(&store) {
-        println!("\x1b[1;31m[ERROR] Provider configuration was not saved: {error}\x1b[0m");
-        return;
-    }
-    if !ai_service.reload_provider_store().await {
-        println!("\x1b[1;31m[ERROR] Provider was committed but runtime reload failed. Restart XiaoAI before continuing.\x1b[0m");
-        return;
-    }
-    println!("  Checking model capabilities...");
-    if let Some(probe) = run_persisted_capability_probe(ai_service, &provider, &active_model).await
-    {
-        println!(
-            "  \x1b[38;5;244mSaved capability probe: vision={:?}, tools={:?}, structured={:?}\x1b[0m",
-            probe.supports_image_input, probe.supports_tools, probe.supports_structured_output
-        );
-    }
-
-    println!(
-        "\n\x1b[1;32m[SUCCESS] Provider '{}' added and activated!\x1b[0m",
-        clean_alias
-    );
-    println!("  \x1b[1;36mActive Model:\x1b[0m \x1b[1;37m{active_model}\x1b[0m");
-    println!("  \x1b[38;5;244mConfiguration saved to SQLite (runtime source of truth)\x1b[0m\n");
-}
-
-pub(crate) async fn run_cli_provider_remove(ai_service: &AIChatService) {
-    let mut store = load_provider_store();
-    if store.providers.is_empty() {
-        println!("\n\x1b[38;5;214m[WARN] No configured providers found.\x1b[0m");
-        return;
-    }
-
-    let items: Vec<String> = store
-        .providers
-        .iter()
-        .map(|p| {
-            let is_act = store.active_id.as_deref() == Some(p.id.as_str());
-            if is_act {
-                format!("{} \x1b[1;32m[ACTIVE]\x1b[0m", p.name)
-            } else {
-                p.name.clone()
-            }
-        })
-        .collect();
-
-    let selected =
-        terminal_interactive_select("Select Provider to Remove:", &items, 0, false, None);
-
-    if let Some(idx) = selected {
-        let target = store.providers[idx].clone();
-        let dependencies = ai_service.provider_route_dependencies(&target.id).await;
-        if !dependencies.is_empty() {
-            let roles = dependencies
-                .iter()
-                .map(|role| role.display_name())
-                .collect::<Vec<_>>()
-                .join(", ");
-            println!(
-                "\n\x1b[1;31m[BLOCKED] Provider '{}' masih dipakai oleh addon Specific: {}.\x1b[0m",
-                target.name, roles
-            );
-            println!("  Reset/disable addon tersebut terlebih dahulu; Xiao tidak akan meroute ulang diam-diam.\n");
-            return;
-        }
-        let removed = store.providers.remove(idx);
-        if store.active_id.as_deref() == Some(removed.id.as_str()) {
-            store.active_id = store.providers.first().map(|provider| provider.id.clone());
-        }
-        if let Err(error) = save_provider_store(&store) {
-            println!("\n\x1b[1;31m[ERROR] Provider was not removed: {error}\x1b[0m\n");
-            return;
-        }
-        if !ai_service.reload_provider_store().await {
-            println!("\n\x1b[38;5;214m[WARN] Provider terhapus secara durable, tetapi runtime reload gagal. Restart Xiao sebelum melanjutkan.\x1b[0m\n");
-            return;
-        }
-        println!(
-            "\n\x1b[1;32m[OK] Provider '{}' successfully removed.\x1b[0m\n",
-            removed.name
-        );
-    } else {
-        println!("\n\x1b[38;5;244mCancelled.\x1b[0m\n");
-    }
-}
-
-pub(crate) async fn run_cli_provider_status(ai_service: &AIChatService) {
+pub(crate) async fn run_cli_status(ai_service: &AIChatService) {
     load_environment();
+    println!("\n\x1b[1;36mXiaoAI Status\x1b[0m\n");
+
+    let token = env::var("BOT_TOKEN")
+        .ok()
+        .or_else(|| crate::ai::service::load_app_setting("BOT_TOKEN"))
+        .unwrap_or_default();
+    let owner_id = get_configured_owner_id();
+
+    // 1. Gateway Status
+    if token.is_empty() || token == "YOUR_TELEGRAM_BOT_TOKEN_HERE" {
+        println!("  Gateway      ○ Telegram: Belum dikonfigurasi (Jalankan 'xiao gateway')");
+    } else {
+        let bot = TelegramBotClient::new(&token);
+        match bot.get_me().await {
+            Ok(resp) if resp.ok => {
+                if let Some(info) = resp.result {
+                    let uname = info.username.unwrap_or_else(|| "Unknown".to_string());
+                    let owner_str = owner_id
+                        .map(|id| format!(" · Owner: {id}"))
+                        .unwrap_or_default();
+                    println!("  Gateway      ● Telegram (@{uname}{owner_str})");
+                } else {
+                    println!("  Gateway      ✖ Telegram: Tidak ada info bot");
+                }
+            }
+            Ok(_) | Err(_) => {
+                println!("  Gateway      ✖ Telegram: Token tidak valid / Error koneksi");
+            }
+        }
+    }
+
+    // 2. Provider & Model Status (evidence-based)
     let store = load_provider_store();
     let active_p = if let Some(ref aid) = store.active_id {
         store.providers.iter().find(|p| &p.id == aid).cloned()
@@ -883,62 +618,351 @@ pub(crate) async fn run_cli_provider_status(ai_service: &AIChatService) {
         store.providers.first().cloned()
     };
 
-    println!("\n\x1b[1;36m== Active Provider Status ==\x1b[0m");
-
     if let Some(p) = active_p {
+        let (ok, res) = ai_service
+            .fetch_models_from_endpoint(&p.endpoint, &p.api_key)
+            .await;
+        let provider_health = if ok {
+            format!(
+                "\x1b[32mHealthy\x1b[0m ({} models available)",
+                res.map(|m| m.len()).unwrap_or(p.models.len())
+            )
+        } else {
+            let err = res.err().unwrap_or_else(|| "unreachable".to_string());
+            format!("\x1b[31mUnhealthy\x1b[0m ({err})")
+        };
+
         println!(
-            "  \x1b[1;37mProvider:\x1b[0m     \x1b[1;32m{}\x1b[0m",
-            p.name
+            "  Provider     ● {} ({}) — {}",
+            p.name, p.endpoint, provider_health
         );
-        println!("  \x1b[1;37mEndpoint:\x1b[0m     {}", p.endpoint);
         println!(
-            "  \x1b[1;37mActive Model:\x1b[0m \x1b[1;36m{}\x1b[0m",
-            p.active_model
-        );
-        println!(
-            "  \x1b[1;37mTotal Models:\x1b[0m {} available",
+            "  Main Model   ◆ {} ({} configured models)",
+            p.active_model,
             p.models.len()
         );
 
-        let cap = ai_service
-            .resolved_model_capability(&p.endpoint, &p.active_model)
+        let cap_record = ai_service
+            .capability_record(&p.endpoint, &p.active_model)
             .await;
-        println!("\n\x1b[1;36mCapabilities ({}):\x1b[0m", cap.family);
-        println!("  • Context:    {}", cap.context_str);
-        println!("  • Vision:     {}", cap.vision_desc);
-        println!("  • Video:      {}", cap.video_desc);
-        println!("  • Audio:      {}", cap.audio_desc);
-        println!("  • Thinking:   {}", cap.thinking_desc);
+        println!("\n  \x1b[1;37mModel Capabilities (Evidence-Based):\x1b[0m");
+
+        let text_chat_state = cap_record
+            .as_ref()
+            .map(|r| r.effective_state_for(CapabilityKind::TextChat))
+            .unwrap_or(CapabilityState::Unknown);
+        let vision_state = cap_record
+            .as_ref()
+            .map(|r| r.effective_state_for(CapabilityKind::ImageInput))
+            .unwrap_or(CapabilityState::Unknown);
+        let video_state = cap_record
+            .as_ref()
+            .map(|r| r.effective_state_for(CapabilityKind::VideoInput))
+            .unwrap_or(CapabilityState::Unknown);
+        let audio_state = cap_record
+            .as_ref()
+            .map(|r| r.effective_state_for(CapabilityKind::AudioInput))
+            .unwrap_or(CapabilityState::Unknown);
+        let tools_state = cap_record
+            .as_ref()
+            .map(|r| r.effective_state_for(CapabilityKind::Tools))
+            .unwrap_or(CapabilityState::Unknown);
+
+        let format_cap_line = |name: &str, state: CapabilityState, kind: CapabilityKind| {
+            let src = cap_record
+                .as_ref()
+                .and_then(|r| r.effective_evidence_for(kind))
+                .map(|e| match e.source {
+                    crate::ai::storage::CapabilityEvidenceSource::ProviderMetadata => {
+                        "provider metadata"
+                    }
+                    crate::ai::storage::CapabilityEvidenceSource::ActiveProbe => "active probe",
+                    crate::ai::storage::CapabilityEvidenceSource::KnownProviderProfile => {
+                        "provider profile"
+                    }
+                    crate::ai::storage::CapabilityEvidenceSource::UserOverride => "user override",
+                })
+                .unwrap_or("no evidence");
+            match state {
+                CapabilityState::Supported => {
+                    format!("    • {:<16}: \x1b[32m✔ Supported\x1b[0m   \x1b[38;5;244m({src})\x1b[0m", name)
+                }
+                CapabilityState::Unsupported => {
+                    format!("    • {:<16}: \x1b[31m✖ Unsupported\x1b[0m \x1b[38;5;244m({src})\x1b[0m", name)
+                }
+                CapabilityState::Unknown => {
+                    format!("    • {:<16}: \x1b[38;5;244m○ Unknown       ({src})\x1b[0m", name)
+                }
+            }
+        };
+
+        println!(
+            "{}",
+            format_cap_line("Text Chat", text_chat_state, CapabilityKind::TextChat)
+        );
+        println!(
+            "{}",
+            format_cap_line("Vision (Image)", vision_state, CapabilityKind::ImageInput)
+        );
+        println!(
+            "{}",
+            format_cap_line("Video Frames", video_state, CapabilityKind::VideoInput)
+        );
+        println!(
+            "{}",
+            format_cap_line("Audio Input", audio_state, CapabilityKind::AudioInput)
+        );
+        println!(
+            "{}",
+            format_cap_line("Tools / JSON", tools_state, CapabilityKind::Tools)
+        );
+        if let Some(ctx) = cap_record.as_ref().and_then(|r| r.context_window) {
+            println!("    • {:<16}: \x1b[36m{} tokens\x1b[0m", "Context Limit", ctx);
+        }
     } else {
-        println!("  \x1b[38;5;214m[WARN] No AI provider configured yet.\x1b[0m");
-        println!("  \x1b[38;5;244mRun 'xiao provider add' to configure a provider.\x1b[0m");
+        println!("  Provider     ○ Belum ada AI Provider (Jalankan 'xiao provider')");
+    }
+
+    // 3. Addon Routing
+    println!("\nAddon Routes:");
+    let providers = ai_service.get_user_providers(0).await;
+    let routing = ai_service.model_routing_config().await;
+    for role in ModelRole::addon_roles() {
+        let route = routing
+            .route(role)
+            .cloned()
+            .unwrap_or(ModelRoute::MainModel);
+        let route_text = addon_route_text(&route, &providers);
+        let health = match ai_service.resolve_model_route(role).await {
+            Ok(_) => "\x1b[32mavailable\x1b[0m",
+            Err(_) => "\x1b[38;5;244munavailable\x1b[0m",
+        };
+        println!("  {:<12} → {} ({health})", role.display_name(), route_text);
     }
     println!();
 }
 
+pub(crate) async fn run_cli_gateway_menu() {
+    load_environment();
+    loop {
+        let token = get_configured_token().unwrap_or_default();
+        let owner_id = get_configured_owner_id();
+
+        let tg_status = if token.is_empty() || token == "YOUR_TELEGRAM_BOT_TOKEN_HERE" {
+            "○ Belum Terhubung".to_string()
+        } else {
+            let bot = TelegramBotClient::new(&token);
+            match bot.get_me().await {
+                Ok(resp) if resp.ok => {
+                    let uname = resp
+                        .result
+                        .and_then(|i| i.username)
+                        .unwrap_or_else(|| "Bot".to_string());
+                    let owner_str = owner_id
+                        .map(|id| format!(" · Owner: {id}"))
+                        .unwrap_or_else(|| " · Owner: -".to_string());
+                    format!("● @{uname}{owner_str}")
+                }
+                _ => "✖ Token Tidak Valid".to_string(),
+            }
+        };
+
+        let items = vec![
+            format!("Telegram [{tg_status}]"),
+            "✕ Selesai / Keluar".to_string(),
+        ];
+
+        let sel = terminal_interactive_select("Kelola Gateway Perpesanan:", &items, 0, false, None);
+
+        let Some(idx) = sel else {
+            break;
+        };
+
+        if idx == 0 {
+            run_cli_gateway_telegram_submenu().await;
+        } else {
+            break;
+        }
+    }
+}
+
+async fn run_cli_gateway_telegram_submenu() {
+    loop {
+        let token = get_configured_token().unwrap_or_default();
+        let owner_id = get_configured_owner_id();
+
+        let summary = format!(
+            "== Gateway: Telegram ==\r\n\
+             • Token:    {}\r\n\
+             • Owner ID: {}",
+            if token.is_empty() {
+                "Belum dikonfigurasi"
+            } else {
+                "Tersimpan"
+            },
+            owner_id
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "Belum diset".to_string())
+        );
+
+        let actions = vec![
+            "🔍 Cek Koneksi / Ping Telegram API".to_string(),
+            "🔑 Ubah Telegram Bot Token".to_string(),
+            "👤 Ubah Telegram Owner User ID".to_string(),
+            "← Kembali".to_string(),
+        ];
+
+        let sel = terminal_interactive_select(&summary, &actions, 0, false, None);
+        let Some(choice) = sel else {
+            break;
+        };
+
+        match choice {
+            0 => {
+                run_cli_telegram_check().await;
+                print!("\x1b[38;5;244mTekan Enter untuk kembali...\x1b[0m");
+                let _ = io::stdout().flush();
+                let mut tmp = String::new();
+                let _ = io::stdin().read_line(&mut tmp);
+            }
+            1 => {
+                run_cli_telegram_bind(None).await;
+            }
+            2 => {
+                run_cli_telegram_owner(None).await;
+            }
+            _ => break,
+        }
+    }
+}
+
+pub(crate) async fn run_cli_telegram_check() {
+    load_environment();
+    println!("\n\x1b[1;36mTelegram Gateway Status\x1b[0m");
+
+    let token = get_configured_token().unwrap_or_default();
+    if token.is_empty() || token == "YOUR_TELEGRAM_BOT_TOKEN_HERE" {
+        println!("  \x1b[31m✖ BOT_TOKEN belum dikonfigurasi.\x1b[0m\n");
+        return;
+    }
+
+    let bot = TelegramBotClient::new(&token);
+    match bot.get_me().await {
+        Ok(resp) if resp.ok => {
+            if let Some(info) = resp.result {
+                let uname = info.username.unwrap_or_else(|| "Unknown".to_string());
+                println!("  \x1b[1;32m✔ Status:\x1b[0m   Terhubung & Terverifikasi (API 10.3)");
+                println!("  \x1b[1;37mBot Name:\x1b[0m {}", info.first_name);
+                println!("  \x1b[1;37mUsername:\x1b[0m @{}", uname);
+                println!("  \x1b[1;37mBot ID:\x1b[0m   {}", info.id);
+                if let Some(owner) = get_configured_owner_id() {
+                    println!("  \x1b[1;37mOwner ID:\x1b[0m {}", owner);
+                } else {
+                    println!("  \x1b[31m✖ OWNER_USER_ID belum dikonfigurasi.\x1b[0m");
+                }
+            }
+        }
+        Ok(resp) => {
+            println!(
+                "  \x1b[31m✖ Token tidak valid ({:?})\x1b[0m",
+                resp.description
+            );
+        }
+        Err(e) => {
+            println!("  \x1b[31m✖ Gagal terhubung ke Telegram API ({e})\x1b[0m");
+        }
+    }
+    println!();
+}
+
+pub(crate) async fn run_cli_telegram_bind(manual_token: Option<&str>) {
+    load_environment();
+    let token = if let Some(t) = manual_token {
+        t.trim().to_string()
+    } else {
+        print!("\n\x1b[1;37mMasukkan Telegram Bot Token:\x1b[0m ");
+        let _ = io::stdout().flush();
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            return;
+        }
+        input.trim().to_string()
+    };
+
+    if token.is_empty() {
+        println!("\x1b[31m✖ Token tidak boleh kosong.\x1b[0m\n");
+        return;
+    }
+
+    println!("  \x1b[38;5;244mMemverifikasi token...\x1b[0m");
+    let bot = TelegramBotClient::new(&token);
+    match bot.get_me().await {
+        Ok(resp) if resp.ok => {
+            let Some(info) = resp.result else {
+                println!("  \x1b[31m✖ Gagal membaca data bot dari Telegram.\x1b[0m\n");
+                return;
+            };
+            let uname = info.username.unwrap_or_else(|| "Unknown".to_string());
+            if let Err(e) = save_token_to_env(&token) {
+                println!("  \x1b[31m✖ Gagal menyimpan token: {e}\x1b[0m\n");
+            } else {
+                println!(
+                    "  \x1b[1;32m✔ Token valid! Terhubung ke @{} ({})\x1b[0m\n",
+                    uname, info.first_name
+                );
+            }
+        }
+        Ok(resp) => {
+            println!(
+                "  \x1b[31m✖ Token tidak valid: {:?}\x1b[0m\n",
+                resp.description
+            );
+        }
+        Err(e) => {
+            println!("  \x1b[31m✖ Error koneksi: {e}\x1b[0m\n");
+        }
+    }
+}
+
+pub(crate) async fn run_cli_telegram_owner(owner_arg: Option<&str>) {
+    let owner = if let Some(value) = owner_arg {
+        value.trim().parse::<i64>().ok()
+    } else {
+        print!("\n\x1b[1;37mMasukkan Telegram Owner User ID:\x1b[0m ");
+        let _ = io::stdout().flush();
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            None
+        } else {
+            input.trim().parse::<i64>().ok()
+        }
+    };
+
+    match owner.filter(|value| *value > 0) {
+        Some(owner_id) => match save_env_kv("OWNER_USER_ID", &owner_id.to_string()) {
+            Ok(()) => println!("  \x1b[1;32m✔ Telegram Owner ID diset ke: {owner_id}\x1b[0m\n"),
+            Err(error) => println!("  \x1b[31m✖ Gagal menyimpan Owner ID: {error}\x1b[0m\n"),
+        },
+        None => println!("  \x1b[31m✖ Owner User ID harus berupa angka positif.\x1b[0m\n"),
+    }
+}
+
 pub(crate) async fn run_cli_provider_menu(ai_service: &AIChatService, action: Option<&str>) {
     load_environment();
-    match action {
-        Some("add") | Some("new") => {
-            run_cli_provider_add(ai_service).await;
-            return;
-        }
-        Some("remove") | Some("del") | Some("delete") | Some("rm") => {
-            run_cli_provider_remove(ai_service).await;
-            return;
-        }
-        Some("status") => {
-            run_cli_provider_status(ai_service).await;
-            return;
-        }
-        _ => {}
+    if action == Some("add") {
+        run_cli_provider_add(ai_service).await;
+        return;
+    }
+    if action == Some("rm") || action == Some("remove") {
+        run_cli_provider_remove(ai_service).await;
+        return;
     }
 
     loop {
         let store = load_provider_store();
         if store.providers.is_empty() {
-            println!("\n\x1b[38;5;214m[WARN] No providers configured yet.\x1b[0m");
-            print!("\x1b[1;37mAdd a provider now? [Y/n]:\x1b[0m ");
+            println!("\n\x1b[33mBelum ada AI Provider yang terdaftar.\x1b[0m");
+            print!("Tambah provider sekarang? [Y/n]: ");
             let _ = io::stdout().flush();
             let mut ans = String::new();
             let _ = io::stdin().read_line(&mut ans);
@@ -955,19 +979,18 @@ pub(crate) async fn run_cli_provider_menu(ai_service: &AIChatService, action: Op
             .map(|p| {
                 let is_act = store.active_id.as_deref() == Some(p.id.as_str());
                 if is_act {
-                    format!("{} \x1b[1;32m[ACTIVE]\x1b[0m", p.name)
+                    format!("{} \x1b[1;32m[AKTIF]\x1b[0m ({})", p.name, p.active_model)
                 } else {
-                    p.name.clone()
+                    format!("{} ({})", p.name, p.active_model)
                 }
             })
             .collect();
 
-        menu_items.push("\x1b[1;32m+ Add Provider\x1b[0m".to_string());
-        menu_items.push("\x1b[1;31m- Remove Provider\x1b[0m".to_string());
-        menu_items.push("\x1b[38;5;244mx Exit\x1b[0m".to_string());
+        menu_items.push("➕ Tambah Provider Baru".to_string());
+        menu_items.push("🗑️  Hapus Provider".to_string());
+        menu_items.push("✕ Selesai / Keluar".to_string());
 
-        let sel =
-            terminal_interactive_select("Configured AI Providers:", &menu_items, 0, false, None);
+        let sel = terminal_interactive_select("Kelola AI Provider:", &menu_items, 0, false, None);
 
         let Some(idx) = sel else {
             break;
@@ -977,52 +1000,35 @@ pub(crate) async fn run_cli_provider_menu(ai_service: &AIChatService, action: Op
             let target_prov = &store.providers[idx];
             let is_act = store.active_id.as_deref() == Some(target_prov.id.as_str());
 
-            let cap = ai_service
-                .resolved_model_capability(&target_prov.endpoint, &target_prov.active_model)
-                .await;
-
-            let status_tag = if is_act {
-                "\x1b[1;32mACTIVE (Default)\x1b[0m"
-            } else {
-                "\x1b[38;5;244mINACTIVE\x1b[0m"
-            };
-
             let title_summary = format!(
                 "== Provider: {} ==\r\n\
-                 \x1b[38;5;244m• Endpoint:\x1b[0m     {}\r\n\
-                 \x1b[38;5;244m• Active Model:\x1b[0m \x1b[1;36m{}\x1b[0m ({})\r\n\
-                 \x1b[38;5;244m• Total Models:\x1b[0m {} models available\r\n\
-                 \x1b[38;5;244m• Context:\x1b[0m      {}\r\n\
-                 \x1b[38;5;244m• Capabilities:\x1b[0m Vision: {}, Audio: {}, Video: {}\r\n\
-                 \x1b[38;5;244m• Status:\x1b[0m       {}",
+                 • Endpoint:     {}\r\n\
+                 • Active Model: \x1b[1;36m{}\x1b[0m\r\n\
+                 • Total Models: {} models\r\n\
+                 • Status:       {}",
                 target_prov.name,
                 target_prov.endpoint,
                 target_prov.active_model,
-                cap.family,
                 target_prov.models.len(),
-                cap.context_str,
-                if cap.vision { "YES" } else { "NO" },
-                if cap.audio { "YES" } else { "NO" },
-                if cap.video { "YES" } else { "NO" },
-                status_tag
+                if is_act {
+                    "\x1b[1;32mAKTIF\x1b[0m"
+                } else {
+                    "INAKTIF"
+                }
             );
 
             let mut sub_actions = Vec::new();
             if !is_act {
                 sub_actions.push(format!(
-                    "\x1b[1;32mSet as Active Provider ({})\x1b[0m",
+                    "Set sebagai Active Provider ({})",
                     target_prov.name
                 ));
             }
-            sub_actions.push("Select / Switch Model for this Provider".to_string());
-            sub_actions.push(format!(
-                "\x1b[1;31mDelete Provider ({})\x1b[0m",
-                target_prov.name
-            ));
-            sub_actions.push("\x1b[38;5;244mBack to Providers Menu\x1b[0m".to_string());
+            sub_actions.push("Pilih / Ganti Model untuk Provider ini".to_string());
+            sub_actions.push(format!("Hapus Provider ({})", target_prov.name));
+            sub_actions.push("← Kembali".to_string());
 
             let sub_sel = terminal_interactive_select(&title_summary, &sub_actions, 0, false, None);
-
             let Some(action_idx) = sub_sel else {
                 continue;
             };
@@ -1033,16 +1039,15 @@ pub(crate) async fn run_cli_provider_menu(ai_service: &AIChatService, action: Op
                 0 => {
                     let mut updated_store = load_provider_store();
                     updated_store.active_id = Some(target_prov.id.clone());
-                    if let Err(error) = save_provider_store(&updated_store) {
-                        println!(
-                            "\n\x1b[1;31m[ERROR] Active provider was not changed: {error}\x1b[0m\n"
-                        );
+                    if let Err(e) = save_provider_store(&updated_store) {
+                        println!("\n\x1b[31m✖ Error: Gagal menyimpan provider aktif: {e}\x1b[0m\n");
                         continue;
                     }
-                    println!(
-                        "\n\x1b[1;32m[OK] Provider '{}' is now active!\x1b[0m\n",
-                        target_prov.name
-                    );
+                    if !ai_service.reload_provider_store().await {
+                        println!(
+                            "\n\x1b[31m✖ Error: Gagal memuat ulang provider di runtime.\x1b[0m\n"
+                        );
+                    }
                 }
                 1 => {
                     let (ok, res) = ai_service
@@ -1053,15 +1058,13 @@ pub(crate) async fn run_cli_provider_menu(ai_service: &AIChatService, action: Op
                     } else {
                         target_prov.models.clone()
                     };
-                    if models.is_empty() {
-                        println!("\x1b[38;5;214m[WARN] No models found on endpoint.\x1b[0m");
-                    } else {
+                    if !models.is_empty() {
                         let curr_idx = models
                             .iter()
                             .position(|m| m == &target_prov.active_model)
                             .unwrap_or(0);
                         if let Some(m_idx) = terminal_interactive_select(
-                            &format!("Select Model for '{}':", target_prov.name),
+                            &format!("Pilih Model untuk '{}':", target_prov.name),
                             &models,
                             curr_idx,
                             true,
@@ -1074,17 +1077,16 @@ pub(crate) async fn run_cli_provider_menu(ai_service: &AIChatService, action: Op
                                 .iter_mut()
                                 .find(|p| p.id == target_prov.id)
                             {
-                                p.active_model = chosen_model.clone();
+                                p.active_model = chosen_model;
                                 p.models = models;
                             }
-                            if let Err(error) = save_provider_store(&updated_store) {
-                                println!("\n\x1b[1;31m[ERROR] Model selection was not saved: {error}\x1b[0m\n");
+                            if let Err(e) = save_provider_store(&updated_store) {
+                                println!("\n\x1b[31m✖ Error: Gagal menyimpan model provider: {e}\x1b[0m\n");
                                 continue;
                             }
-                            println!(
-                                "\n\x1b[1;32m[OK] Model for '{}' set to: {}\x1b[0m\n",
-                                target_prov.name, chosen_model
-                            );
+                            if !ai_service.reload_provider_store().await {
+                                println!("\n\x1b[31m✖ Error: Gagal memuat ulang provider di runtime.\x1b[0m\n");
+                            }
                         }
                     }
                 }
@@ -1093,12 +1095,14 @@ pub(crate) async fn run_cli_provider_menu(ai_service: &AIChatService, action: Op
                         .provider_route_dependencies(&target_prov.id)
                         .await;
                     if !dependencies.is_empty() {
-                        let roles = dependencies
-                            .iter()
-                            .map(|role| role.display_name())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        println!("\n\x1b[1;31m[BLOCKED] Provider '{}' masih dipakai oleh addon Specific: {}.\x1b[0m\n", target_prov.name, roles);
+                        println!(
+                            "\n\x1b[31m✖ Provider '{}' masih dipakai oleh Addon spesifik.\x1b[0m",
+                            target_prov.name
+                        );
+                        print!("\x1b[38;5;244mTekan Enter untuk kembali...\x1b[0m");
+                        let _ = io::stdout().flush();
+                        let mut tmp = String::new();
+                        let _ = io::stdin().read_line(&mut tmp);
                         continue;
                     }
                     let mut updated_store = load_provider_store();
@@ -1109,25 +1113,16 @@ pub(crate) async fn run_cli_provider_menu(ai_service: &AIChatService, action: Op
                     {
                         let removed = updated_store.providers.remove(pos);
                         if updated_store.active_id.as_deref() == Some(removed.id.as_str()) {
-                            updated_store.active_id = updated_store
-                                .providers
-                                .first()
-                                .map(|provider| provider.id.clone());
+                            updated_store.active_id =
+                                updated_store.providers.first().map(|p| p.id.clone());
                         }
-                        if let Err(error) = save_provider_store(&updated_store) {
-                            println!(
-                                "\n\x1b[1;31m[ERROR] Provider was not deleted: {error}\x1b[0m\n"
-                            );
+                        if let Err(e) = save_provider_store(&updated_store) {
+                            println!("\n\x1b[31m✖ Error: Gagal menghapus provider: {e}\x1b[0m\n");
                             continue;
                         }
                         if !ai_service.reload_provider_store().await {
-                            println!("\n\x1b[38;5;214m[WARN] Provider terhapus secara durable, tetapi runtime reload gagal. Restart Xiao.\x1b[0m\n");
-                            continue;
+                            println!("\n\x1b[31m✖ Error: Gagal memuat ulang provider di runtime.\x1b[0m\n");
                         }
-                        println!(
-                            "\n\x1b[1;32m[OK] Provider '{}' deleted.\x1b[0m\n",
-                            removed.name
-                        );
                     }
                 }
                 _ => {}
@@ -1142,379 +1137,171 @@ pub(crate) async fn run_cli_provider_menu(ai_service: &AIChatService, action: Op
     }
 }
 
-fn addon_route_text(route: &ModelRoute, providers: &[ProviderConfig]) -> String {
-    match route {
-        ModelRoute::MainModel => "Main Model".to_string(),
-        ModelRoute::Disabled => "Disabled".to_string(),
-        ModelRoute::Specific { provider_id, model } => {
-            let provider = providers
-                .iter()
-                .find(|provider| &provider.id == provider_id)
-                .map(|provider| provider.name.as_str())
-                .unwrap_or(provider_id.as_str());
-            format!("{} :: {}", provider, model)
-        }
-    }
-}
+pub(crate) async fn run_cli_provider_add(ai_service: &AIChatService) {
+    println!("\n\x1b[1;36mTambah AI Provider Baru\x1b[0m");
+    println!("\x1b[38;5;238m────────────────────────────────────────────────────────────\x1b[0m");
 
-fn print_probe_event(event: ProbeEvent) {
-    let run_status = event.run_status();
-    match event {
-        ProbeEvent::Started { capability } => {
-            println!("  [{run_status:?}] {:?}: started", capability);
-        }
-        ProbeEvent::Progress {
-            capability,
-            message,
-        } => {
-            println!("  [{run_status:?}] {:?}: {}", capability, message);
-        }
-        ProbeEvent::Completed {
-            capability,
-            outcome,
-        } => {
-            println!("  [{run_status:?}] {:?}: {:?}", capability, outcome);
-        }
-        ProbeEvent::Skipped { capability, reason } => {
-            println!("  [{run_status:?}] {:?}: {}", capability, reason);
-        }
-        ProbeEvent::Persistence { saved } => {
-            if saved {
-                println!("  [{run_status:?}] capability candidate persisted");
-            } else {
-                println!("  [{run_status:?}] capability candidate was not persisted");
-            }
-        }
-        ProbeEvent::Finished => println!("  [{run_status:?}] probe completed"),
-    }
-}
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
 
-async fn run_persisted_capability_probe(
-    ai_service: &AIChatService,
-    provider: &ProviderConfig,
-    model: &str,
-) -> Option<crate::ai::service::CapabilityRecord> {
-    let candidate = ai_service
-        .probe_model_capabilities_with_observer(provider, model, print_probe_event)
-        .await;
-    let persisted = ai_service
-        .capability_record(&provider.endpoint, model)
-        .await;
-    match persisted {
-        Some(record) if record.checked_at == candidate.checked_at => Some(record),
-        _ => {
-            println!(
-                "[WARN] Probe completed, but its capability candidate was not published durably. Previous saved evidence remains authoritative."
-            );
-            None
-        }
-    }
-}
-
-async fn probe_addon_role(ai_service: &AIChatService, role: ModelRole) {
-    let route = match ai_service.resolve_model_route_unchecked(role).await {
-        Ok(route) => route,
-        Err(error) => {
-            println!("[ERROR] {}", error);
-            return;
-        }
-    };
-    println!(
-        "Checking {}: {} / {}",
-        role.display_name(),
-        route.provider.name,
-        route.model
-    );
-    let record = match ai_service
-        .probe_addon_role_with_observer(role, print_probe_event)
-        .await
-    {
-        Ok(record) => record,
-        Err(error) => {
-            println!("[FAIL] {error}");
-            return;
-        }
-    };
-    println!(
-        "Saved result: text={:?}, vision={:?}, video={:?}, audio={:?}, stt={:?}, image_gen={:?}",
-        record.supports_text_chat,
-        record.supports_image_input,
-        record.supports_video_input,
-        record.supports_audio_input,
-        record.supports_audio_transcription,
-        record.supports_image_generation,
-    );
-}
-
-pub(crate) async fn run_cli_model_addon(ai_service: &AIChatService, args: &[String]) {
-    let action = args.first().map(String::as_str).unwrap_or("list");
-    let providers = ai_service.get_user_providers(0).await;
-    let routing = ai_service.model_routing_config().await;
-
-    match action {
-        "list" => {
-            println!("\n== Model Addon Routing ==");
-            for role in ModelRole::addon_roles() {
-                let route = routing
-                    .route(role)
-                    .cloned()
-                    .unwrap_or(ModelRoute::MainModel);
-                let health = match ai_service.resolve_model_route(role).await {
-                    Ok(resolved) => format!(
-                        "Available — {} / {}",
-                        resolved.provider.name, resolved.model
-                    ),
-                    Err(error) => format!("Unavailable — {}", error),
-                };
-                println!(
-                    "  {:<24} {:<36} {}",
-                    role.display_name(),
-                    addon_route_text(&route, &providers),
-                    health
-                );
-            }
-            println!("\nAddon configuration is CLI-only in v0.3.0. `reset` means Main Model.\n");
-        }
-        "show" => {
-            let Some(role) = args.get(1).and_then(|value| ModelRole::parse(value)) else {
-                println!("Usage: xiao model addon show <vision|video|audio_stt|image_gen>");
-                return;
-            };
-            if role == ModelRole::Main {
-                println!("Main Model is not an addon route.");
-                return;
-            }
-            let route = routing
-                .route(role)
-                .cloned()
-                .unwrap_or(ModelRoute::MainModel);
-            println!(
-                "{}: {}",
-                role.display_name(),
-                addon_route_text(&route, &providers)
-            );
-            match ai_service.resolve_model_route(role).await {
-                Ok(resolved) => println!(
-                    "Health: Available — {} / {}",
-                    resolved.provider.name, resolved.model
-                ),
-                Err(error) => println!("Health: Unavailable — {}", error),
-            }
-        }
-        "set" => {
-            let Some(role) = args.get(1).and_then(|value| ModelRole::parse(value)) else {
-                println!("Usage: xiao model addon set <role> [main|provider::model]");
-                return;
-            };
-            if role == ModelRole::Main {
-                println!("[ERROR] Main Model is changed with `xiao model`, not addon routing.");
-                return;
-            }
-            let route = if let Some(target) = args.get(2) {
-                if target.eq_ignore_ascii_case("main") {
-                    ModelRoute::MainModel
-                } else if let Some((provider_id, model)) = target.split_once("::") {
-                    ModelRoute::Specific {
-                        provider_id: provider_id.to_string(),
-                        model: model.to_string(),
-                    }
-                } else {
-                    println!("[ERROR] Expected `main` or `provider_id::model`.");
-                    return;
-                }
-            } else {
-                let mut choices = vec!["Main Model".to_string()];
-                let mut routes = vec![ModelRoute::MainModel];
-                for provider in &providers {
-                    for model in &provider.models {
-                        choices.push(format!("{} :: {}", provider.name, model));
-                        routes.push(ModelRoute::Specific {
-                            provider_id: provider.id.clone(),
-                            model: model.clone(),
-                        });
-                    }
-                }
-                let Some(index) = terminal_interactive_select(
-                    &format!(
-                        "Select {} route (Enter on Main Model keeps default):",
-                        role.display_name()
-                    ),
-                    &choices,
-                    0,
-                    true,
-                    None,
-                ) else {
-                    return;
-                };
-                routes[index].clone()
-            };
-            match ai_service.set_model_route(role, route.clone()).await {
-                Ok(()) => println!(
-                    "[OK] {} -> {}",
-                    role.display_name(),
-                    addon_route_text(&route, &providers)
-                ),
-                Err(error) => println!("[ERROR] {}", error),
-            }
-        }
-        "reset" => {
-            let Some(target) = args.get(1) else {
-                println!("Usage: xiao model addon reset <role|all>");
-                return;
-            };
-            if target.eq_ignore_ascii_case("all") {
-                for role in ModelRole::addon_roles() {
-                    if let Err(error) = ai_service
-                        .set_model_route(role, ModelRoute::MainModel)
-                        .await
-                    {
-                        println!("[ERROR] {}: {}", role.display_name(), error);
-                        return;
-                    }
-                }
-                println!("[OK] All addon routes reset to Main Model.");
-                return;
-            }
-            let Some(role) = ModelRole::parse(target) else {
-                println!("[ERROR] Unknown addon role: {}", target);
-                return;
-            };
-            match ai_service
-                .set_model_route(role, ModelRoute::MainModel)
-                .await
-            {
-                Ok(()) => println!("[OK] {} -> Main Model", role.display_name()),
-                Err(error) => println!("[ERROR] {}", error),
-            }
-        }
-        "disable" => {
-            let Some(role) = args.get(1).and_then(|value| ModelRole::parse(value)) else {
-                println!("Usage: xiao model addon disable <role>");
-                return;
-            };
-            match ai_service.set_model_route(role, ModelRoute::Disabled).await {
-                Ok(()) => println!("[OK] {} -> Disabled", role.display_name()),
-                Err(error) => println!("[ERROR] {}", error),
-            }
-        }
-        "probe" => {
-            println!(
-                "Probe refreshes and persists safe capability evidence. Active image-generation probing is skipped here because it may consume credits."
-            );
-            if let Some(role_name) = args.get(1) {
-                let Some(role) = ModelRole::parse(role_name) else {
-                    println!("[ERROR] Unknown role: {}", role_name);
-                    return;
-                };
-                probe_addon_role(ai_service, role).await;
-            } else {
-                for role in ModelRole::addon_roles() {
-                    probe_addon_role(ai_service, role).await;
-                }
-            }
-        }
-        "test" => {
-            let Some(role) = args.get(1).and_then(|value| ModelRole::parse(value)) else {
-                println!("Usage: xiao model addon test <role>");
-                return;
-            };
-            if role == ModelRole::Main {
-                println!("[ERROR] Main Model is not an addon route.");
-                return;
-            }
-            println!(
-                "Test sends a role-specific functional sample to the saved route without changing routing or refreshing the normal capability registry."
-            );
-            match role {
-                ModelRole::ImageGeneration => {
-                    println!(
-                        "[WARN] This explicit image-generation test can consume provider credits."
-                    );
-                    match ai_service
-                        .probe_image_generation_active_with_observer(role, print_probe_event)
-                        .await
-                    {
-                        Ok((_record, ProbeOutcome::Supported)) => {
-                            println!("[OK] Image Generation Model completed an active functional probe and the evidence was saved.");
-                        }
-                        Ok((record, outcome)) => println!(
-                            "[FAIL] Current image-generation probe finished as {outcome:?}; previous saved evidence remains {:?} and is not misreported as a new success.",
-                            record.effective_state_for(CapabilityKind::ImageGeneration)
-                        ),
-                        Err(error) => println!("[FAIL] {error}"),
-                    }
-                }
-                ModelRole::Vision | ModelRole::Video | ModelRole::AudioStt => {
-                    match ai_service.test_model_role(role).await {
-                        Ok(detail) => println!("[OK] {detail}"),
-                        Err(error) => println!("[FAIL] {error}"),
-                    }
-                }
-                ModelRole::Main => unreachable!(),
-            }
-        }
-        _ => {
-            println!("Usage: xiao model addon [list|set|reset|disable|show|probe|test]");
-        }
-    }
-}
-
-pub(crate) async fn run_cli_model_probe(ai_service: &AIChatService) {
-    let providers = ai_service.get_user_providers(0).await;
-    if providers.is_empty() {
-        println!("No AI providers configured.");
+    print!("  \x1b[1;37mEndpoint URL:\x1b[0m ");
+    let _ = io::stdout().flush();
+    let mut endpoint_input = String::new();
+    if reader.read_line(&mut endpoint_input).is_err() {
         return;
     }
-    for provider in providers {
-        let (ok, result) = ai_service
-            .fetch_models_from_endpoint(&provider.endpoint, &provider.api_key)
-            .await;
-        match result {
-            Ok(models) if ok => {
-                println!(
-                    "{}: discovered metadata for {} model(s)",
-                    provider.name,
-                    models.len()
-                );
-                let model = if !provider.active_model.is_empty() {
-                    provider.active_model.clone()
-                } else {
-                    models.first().cloned().unwrap_or_default()
-                };
-                if !model.is_empty() {
-                    if let Some(record) =
-                        run_persisted_capability_probe(ai_service, &provider, &model).await
-                    {
-                        println!(
-                            "  saved active {}: text={:?} image={:?} tools={:?} structured={:?} files={:?}",
-                            record.model,
-                            record.supports_text_chat,
-                            record.supports_image_input,
-                            record.supports_tools,
-                            record.supports_structured_output,
-                            record.supports_native_file_input,
-                        );
-                    }
-                }
-            }
-            Ok(_) | Err(_) => println!("{}: capability discovery failed", provider.name),
-        }
+    let endpoint = endpoint_input.trim().trim_end_matches('/').to_string();
+    if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+        println!("  \x1b[31m✖ Error: Format Endpoint URL tidak valid!\x1b[0m\n");
+        return;
     }
-    let registry = crate::ai::service::load_capability_registry();
-    println!("Capability registry: {} model(s)", registry.models.len());
-    for record in registry.models {
+
+    print!("  \x1b[1;37mAPI Key\x1b[0m \x1b[38;5;244m(Enter jika tanpa key):\x1b[0m ");
+    let _ = io::stdout().flush();
+    let mut key_input = String::new();
+    if reader.read_line(&mut key_input).is_err() {
+        return;
+    }
+    let mut api_key = key_input.trim().to_string();
+    if api_key.is_empty() {
+        api_key = "none".to_string();
+    }
+
+    print!("  \x1b[1;37mProvider Name / Alias:\x1b[0m ");
+    let _ = io::stdout().flush();
+    let mut alias_input = String::new();
+    if reader.read_line(&mut alias_input).is_err() {
+        return;
+    }
+    let raw_alias = alias_input.trim();
+    let alias = if raw_alias.is_empty() {
+        if let Ok(u) = url::Url::parse(&endpoint) {
+            u.host_str().unwrap_or("Custom Provider").to_string()
+        } else {
+            "Custom Provider".to_string()
+        }
+    } else {
+        raw_alias.to_string()
+    };
+
+    println!("  \x1b[38;5;244mMenghubungkan ke endpoint...\x1b[0m");
+    let (ok, res) = ai_service
+        .fetch_models_from_endpoint(&endpoint, &api_key)
+        .await;
+    if !ok {
+        let err = res.err().unwrap_or_else(|| "Unknown error".to_string());
+        println!("  \x1b[31m✖ Error: Gagal terhubung ke provider ({err})\x1b[0m\n");
+        return;
+    }
+
+    let models = res.unwrap_or_else(|_| vec!["gpt-4o".to_string()]);
+    println!(
+        "  \x1b[1;32m✔ Terhubung! Ditemukan {} model.\x1b[0m",
+        models.len()
+    );
+
+    let selected_idx = terminal_interactive_select(
+        "Pilih Active Model untuk Provider Ini:",
+        &models,
+        0,
+        true,
+        None,
+    );
+
+    let active_model = if let Some(idx) = selected_idx {
+        models[idx].clone()
+    } else {
+        models
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "gpt-4o".to_string())
+    };
+
+    let random_suffix: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(6)
+        .map(char::from)
+        .collect();
+    let provider_id = format!("prov_{}", random_suffix.to_lowercase());
+
+    let provider = ProviderConfig {
+        id: provider_id.clone(),
+        name: alias.clone(),
+        endpoint: endpoint.clone(),
+        api_key: api_key.clone(),
+        api_key_ref: None,
+        models: models.clone(),
+        active_model: active_model.clone(),
+    };
+
+    let mut store = load_provider_store();
+    store.providers.push(provider.clone());
+    store.active_id = Some(provider_id);
+    if let Err(error) = save_provider_store(&store) {
+        println!("  \x1b[31m✖ Error: Konfigurasi provider gagal disimpan: {error}\x1b[0m\n");
+        return;
+    }
+    if !ai_service.reload_provider_store().await {
+        println!("  \x1b[31m✖ Error: Gagal memuat ulang provider di runtime.\x1b[0m\n");
+        return;
+    }
+    let _ = run_persisted_capability_probe(ai_service, &provider, &active_model).await;
+
+    println!(
+        "\n  \x1b[1;32m✔ Provider '{}' berhasil ditambahkan dan diaktifkan!\x1b[0m",
+        alias
+    );
+    println!("    Active Model: \x1b[1;36m{}\x1b[0m\n", active_model);
+}
+
+pub(crate) async fn run_cli_provider_remove(ai_service: &AIChatService) {
+    let mut store = load_provider_store();
+    if store.providers.is_empty() {
+        println!("\n\x1b[33mBelum ada provider yang tersimpan.\x1b[0m\n");
+        return;
+    }
+
+    let items: Vec<String> = store
+        .providers
+        .iter()
+        .map(|p| {
+            let is_act = store.active_id.as_deref() == Some(p.id.as_str());
+            if is_act {
+                format!("{} \x1b[1;32m[AKTIF]\x1b[0m", p.name)
+            } else {
+                p.name.clone()
+            }
+        })
+        .collect();
+
+    let selected =
+        terminal_interactive_select("Pilih Provider yang Ingin Dihapus:", &items, 0, false, None);
+
+    if let Some(idx) = selected {
+        let target = store.providers[idx].clone();
+        let dependencies = ai_service.provider_route_dependencies(&target.id).await;
+        if !dependencies.is_empty() {
+            println!(
+                "\n\x1b[31m✖ Provider '{}' masih dipakai oleh Addon spesifik.\x1b[0m\n",
+                target.name
+            );
+            return;
+        }
+        let removed = store.providers.remove(idx);
+        if store.active_id.as_deref() == Some(removed.id.as_str()) {
+            store.active_id = store.providers.first().map(|p| p.id.clone());
+        }
+        if let Err(e) = save_provider_store(&store) {
+            println!("\n\x1b[31m✖ Error: Gagal menyimpan perubahan provider: {e}\x1b[0m\n");
+            return;
+        }
+        if !ai_service.reload_provider_store().await {
+            println!("\n\x1b[31m✖ Error: Gagal memuat ulang provider di runtime.\x1b[0m\n");
+            return;
+        }
         println!(
-            "- {} / {}: image={:?}, audio={:?}, video={:?}, tools={:?}, structured={:?}, files={:?}, context={:?} [{}]",
-            record.provider_name,
-            record.model,
-            record.supports_image_input,
-            record.supports_audio_input,
-            record.supports_video_input,
-            record.supports_tools,
-            record.supports_structured_output,
-            record.supports_native_file_input,
-            record.context_window,
-            record.source
+            "\n\x1b[1;32m✔ Provider '{}' berhasil dihapus.\x1b[0m\n",
+            removed.name
         );
     }
 }
@@ -1524,12 +1311,11 @@ pub(crate) async fn run_cli_model_picker(ai_service: &AIChatService, initial_fil
     let mut store = load_provider_store();
 
     if store.providers.is_empty() {
-        println!("\n\x1b[38;5;214m[WARN] No AI provider configured yet.\x1b[0m");
-        println!("  \x1b[38;5;244mRun 'xiao provider add' to configure a provider.\x1b[0m\n");
+        println!(
+            "\n\x1b[33mBelum ada AI Provider yang terdaftar. Jalankan 'xiao provider'.\x1b[0m\n"
+        );
         return;
     }
-
-    println!("\n\x1b[38;5;244mLoading model catalogs from all saved providers...\x1b[0m");
 
     for prov in store.providers.iter_mut() {
         if prov.models.len() <= 1 && !prov.endpoint.is_empty() {
@@ -1543,9 +1329,9 @@ pub(crate) async fn run_cli_model_picker(ai_service: &AIChatService, initial_fil
             }
         }
     }
-    if let Err(error) = save_provider_store(&store) {
-        println!("\x1b[38;5;214m[WARN] Refreshed model catalog was not persisted: {error}\x1b[0m");
-        store = load_provider_store();
+    if let Err(e) = save_provider_store(&store) {
+        println!("\n\x1b[31m✖ Error: Gagal menyimpan katalog model provider: {e}\x1b[0m\n");
+        return;
     }
 
     let active_prov_id = store.active_id.clone().unwrap_or_default();
@@ -1567,21 +1353,20 @@ pub(crate) async fn run_cli_model_picker(ai_service: &AIChatService, initial_fil
     }
 
     if catalog.is_empty() {
-        println!("\x1b[38;5;214m[WARN] No models found across any configured provider.\x1b[0m\n");
+        println!("\n\x1b[33mTidak ada model yang ditemukan dari provider terdaftar.\x1b[0m\n");
         return;
     }
 
-    let is_multi_provider = store.providers.len() > 1;
-
+    let is_multi = store.providers.len() > 1;
     let items: Vec<String> = catalog
         .iter()
         .map(|(_, prov_name, model_name, is_act)| {
             let act_tag = if *is_act {
-                " \x1b[1;32m[ACTIVE]\x1b[0m"
+                " \x1b[1;32m[AKTIF]\x1b[0m"
             } else {
                 ""
             };
-            if is_multi_provider {
+            if is_multi {
                 format!(
                     "{} \x1b[38;5;244m({})\x1b[0m{}",
                     model_name, prov_name, act_tag
@@ -1597,7 +1382,7 @@ pub(crate) async fn run_cli_model_picker(ai_service: &AIChatService, initial_fil
         .position(|(_, _, _, is_act)| *is_act)
         .unwrap_or(0);
     let title = format!(
-        "Select Active Model (Total {} Models from {} Providers):",
+        "Pilih Main Model (Total {} model dari {} provider):",
         catalog.len(),
         store.providers.len()
     );
@@ -1615,308 +1400,22 @@ pub(crate) async fn run_cli_model_picker(ai_service: &AIChatService, initial_fil
             {
                 p.active_model = chosen_model.clone();
             }
-            if let Err(error) = save_provider_store(&updated_store) {
-                println!("\n\x1b[1;31m[ERROR] Active model was not changed: {error}\x1b[0m\n");
+            if let Err(e) = save_provider_store(&updated_store) {
+                println!("\n\x1b[31m✖ Error: Gagal menyimpan active model: {e}\x1b[0m\n");
                 return;
             }
-            println!(
-                "\n\x1b[1;32m[SUCCESS] Active model set to: {}\x1b[0m",
-                chosen_model
-            );
-            println!(
-                "  \x1b[1;36mProvider:\x1b[0m \x1b[1;37m{}\x1b[0m",
-                prov_name
-            );
-            println!("  \x1b[38;5;244mActivated provider & saved to configuration.\x1b[0m\n");
-        }
-    } else {
-        println!("\n\x1b[38;5;244mModel selection cancelled.\x1b[0m\n");
-    }
-}
-
-pub(crate) async fn run_cli_status(ai_service: &AIChatService) {
-    load_environment();
-    println!("\n\x1b[1;36m== XiaoAI System Status ==\x1b[0m");
-
-    let token = env::var("BOT_TOKEN")
-        .ok()
-        .or_else(|| crate::ai::service::load_app_setting("BOT_TOKEN"))
-        .unwrap_or_default();
-    let endpoint = env::var("AI_ENDPOINT")
-        .ok()
-        .or_else(|| crate::ai::service::load_app_setting("AI_ENDPOINT"))
-        .unwrap_or_default();
-    let api_key = env::var("AI_API_KEY")
-        .ok()
-        .or_else(|| crate::ai::service::load_app_setting("AI_API_KEY"))
-        .unwrap_or_else(|| "none".to_string());
-    let model = env::var("AI_MODEL")
-        .ok()
-        .or_else(|| crate::ai::service::load_app_setting("AI_MODEL"))
-        .unwrap_or_default();
-
-    println!("\x1b[1;37m1. TELEGRAM BOT API\x1b[0m");
-    if token.is_empty() || token == "YOUR_TELEGRAM_BOT_TOKEN_HERE" {
-        println!("   \x1b[31m[FAIL]\x1b[0m BOT_TOKEN: Unconfigured (Run 'xiao setup')");
-    } else {
-        let bot = TelegramBotClient::new(&token);
-        match bot.get_me().await {
-            Ok(resp) if resp.ok => {
-                if let Some(info) = resp.result {
-                    let uname = info.username.unwrap_or_else(|| "Unknown".to_string());
-                    println!(
-                        "   \x1b[1;32m[OK]\x1b[0m   BOT_TOKEN: Connected to @{} (ID: {})",
-                        uname, info.id
-                    );
-                } else {
-                    println!("   \x1b[1;31m[FAIL]\x1b[0m BOT_TOKEN: Telegram returned no bot information");
-                }
-            }
-            Ok(resp) => {
-                println!(
-                    "   \x1b[1;31m[FAIL]\x1b[0m BOT_TOKEN: Invalid ({:?})",
-                    resp.description
-                );
-            }
-            Err(e) => {
-                println!("   \x1b[1;31m[FAIL]\x1b[0m BOT_TOKEN: Connection error ({e})");
-            }
-        }
-    }
-
-    println!("\n\x1b[1;37m2. ACTIVE AI PROVIDER\x1b[0m");
-    if endpoint.is_empty() {
-        println!(
-            "   \x1b[38;5;214m[WARN]\x1b[0m No AI provider configured (Run 'xiao provider add')"
-        );
-    } else {
-        println!("   Endpoint: {}", endpoint);
-        println!("   Model:    \x1b[1;36m{}\x1b[0m", model);
-
-        let (ok, res) = ai_service
-            .fetch_models_from_endpoint(&endpoint, &api_key)
-            .await;
-        if ok {
-            let models = res.unwrap_or_default();
-            println!(
-                "   \x1b[1;32m[OK]\x1b[0m   Endpoint Status: ONLINE ({} models available)",
-                models.len()
-            );
-            if models.iter().any(|m| m == &model) {
-                println!(
-                    "   \x1b[1;32m[OK]\x1b[0m   Model Verification: Confirmed available on server"
-                );
-            } else {
-                println!("   \x1b[38;5;214m[WARN]\x1b[0m Model Verification: Model '{model}' not listed in /models endpoint");
-            }
-        } else {
-            let err = res.err().unwrap_or_else(|| "Offline".to_string());
-            println!("   \x1b[1;31m[FAIL]\x1b[0m Endpoint Status: OFFLINE / Error ({err})");
-        }
-
-        let cap = ai_service
-            .resolved_model_capability(&endpoint, &model)
-            .await;
-        println!("\n\x1b[1;37m3. MODEL CAPABILITIES ({})\x1b[0m", cap.family);
-        println!("   • Context:  {}", cap.context_str);
-        println!("   • Vision:   {}", cap.vision_desc);
-        println!("   • Video:    {}", cap.video_desc);
-        println!("   • Audio:    {}", cap.audio_desc);
-        println!("   • Docs:     {}", cap.docs_desc);
-        println!("   • CoT:      {}", cap.thinking_desc);
-    }
-
-    println!("\n\x1b[1;37m4. MODEL ROUTING\x1b[0m");
-    let providers = ai_service.get_user_providers(0).await;
-    let routing = ai_service.model_routing_config().await;
-    for role in ModelRole::addon_roles() {
-        let route = routing
-            .route(role)
-            .cloned()
-            .unwrap_or(ModelRoute::MainModel);
-        let route_text = addon_route_text(&route, &providers);
-        let health = match ai_service.resolve_model_route(role).await {
-            Ok(resolved) => format!(
-                "Available — {} / {}",
-                resolved.provider.name, resolved.model
-            ),
-            Err(error) => format!("Unavailable — {error}"),
-        };
-        println!(
-            "   • {:<24} {:<36} {}",
-            role.display_name(),
-            route_text,
-            health
-        );
-    }
-    println!("   \x1b[38;5;244mSpecific cross-provider routes are shown explicitly; Xiao never silently reroutes them.\x1b[0m");
-    println!();
-}
-
-pub(crate) async fn run_cli_telegram_check() {
-    load_environment();
-    println!("\n\x1b[1;36m== Telegram Bot Status Check ==\x1b[0m");
-
-    let token = get_configured_token().unwrap_or_default();
-    if token.is_empty() || token == "YOUR_TELEGRAM_BOT_TOKEN_HERE" {
-        println!("  \x1b[1;31m[FAIL]\x1b[0m BOT_TOKEN is not configured.");
-        println!(
-            "  \x1b[38;5;244mRun 'xiao telegram bind' or 'xiao setup' to bind a token.\x1b[0m\n"
-        );
-        return;
-    }
-
-    println!("  \x1b[38;5;244mConnecting to Telegram API...\x1b[0m");
-    let bot = TelegramBotClient::new(&token);
-    match bot.get_me().await {
-        Ok(resp) if resp.ok => {
-            if let Some(info) = resp.result {
-                let uname = info.username.unwrap_or_else(|| "Unknown".to_string());
-                println!("  \x1b[1;32m[OK]\x1b[0m   Status: Connected & Verified");
-                println!("  \x1b[1;37mBot Name:\x1b[0m {}", info.first_name);
-                println!("  \x1b[1;37mUsername:\x1b[0m \x1b[1;36m@{}\x1b[0m", uname);
-                println!("  \x1b[1;37mBot ID:\x1b[0m   {}", info.id);
-                println!("  \x1b[1;37mBot Link:\x1b[0m https://t.me/{}", uname);
-                if let Some(owner) = get_configured_owner_id() {
-                    println!("  \x1b[1;37mOwner ID:\x1b[0m  {}", owner);
-                } else {
-                    println!("  \x1b[1;31m[FAIL] OWNER_USER_ID belum dikonfigurasi.\x1b[0m");
-                }
-            } else {
-                println!("  \x1b[1;31m[FAIL]\x1b[0m Telegram returned no bot information");
-            }
-        }
-        Ok(resp) => {
-            println!(
-                "  \x1b[1;31m[FAIL]\x1b[0m Token is invalid ({:?})",
-                resp.description
-            );
-        }
-        Err(e) => {
-            println!("  \x1b[1;31m[FAIL]\x1b[0m Verification error: {e}");
-        }
-    }
-    println!();
-}
-
-pub(crate) async fn run_cli_telegram_bind(manual_token: Option<&str>) {
-    load_environment();
-    println!("\n\x1b[1;36m== Bind Telegram Bot Token ==\x1b[0m");
-
-    let token = if let Some(t) = manual_token {
-        t.trim().to_string()
-    } else {
-        let stdin = io::stdin();
-        let mut reader = stdin.lock();
-        print!("\x1b[1;37mEnter Telegram Bot Token:\x1b[0m ");
-        let _ = io::stdout().flush();
-        let mut input = String::new();
-        if reader.read_line(&mut input).is_err() {
-            println!("\n\x1b[38;5;244mCancelled.\x1b[0m\n");
-            return;
-        }
-        input.trim().to_string()
-    };
-
-    if token.is_empty() {
-        println!("\x1b[1;31m[ERROR] Token cannot be empty.\x1b[0m\n");
-        return;
-    }
-
-    println!("  \x1b[38;5;244mVerifying token with Telegram API...\x1b[0m");
-    let bot = TelegramBotClient::new(&token);
-    match bot.get_me().await {
-        Ok(resp) if resp.ok => {
-            let Some(info) = resp.result else {
-                println!("  \x1b[1;31m[FAIL] Telegram returned ok=true without bot information.\x1b[0m\n");
+            if !ai_service.reload_provider_store().await {
+                println!("\n\x1b[31m✖ Error: Gagal memuat ulang provider di runtime.\x1b[0m\n");
                 return;
-            };
-            let uname = info.username.unwrap_or_else(|| "Unknown".to_string());
-            println!(
-                "  \x1b[1;32m[OK] Token verified! Connected to @{} ({})\x1b[0m",
-                uname, info.first_name
-            );
-
-            if let Err(e) = save_token_to_env(&token) {
-                println!("  \x1b[1;31m[ERROR] Failed to save token: {e}\x1b[0m\n");
-            } else {
-                println!("  \x1b[1;32m[SUCCESS] Telegram bot token bound successfully!\x1b[0m\n");
             }
-        }
-        Ok(resp) => {
-            println!(
-                "  \x1b[1;31m[FAIL] Invalid token: {:?}\x1b[0m\n",
-                resp.description
-            );
-        }
-        Err(e) => {
-            println!("  \x1b[1;31m[FAIL] Verification error: {e}\x1b[0m\n");
-        }
-    }
-}
-
-pub(crate) async fn run_cli_telegram_change() {
-    load_environment();
-    println!("\n\x1b[1;36m== Change Telegram Bot Token ==\x1b[0m");
-
-    let current_token = env::var("BOT_TOKEN").unwrap_or_default();
-    if !current_token.is_empty() && current_token != "YOUR_TELEGRAM_BOT_TOKEN_HERE" {
-        let temp_bot = TelegramBotClient::new(&current_token);
-        if let Ok(resp) = temp_bot.get_me().await {
-            if let Some(info) = resp.result {
-                let uname = info.username.unwrap_or_else(|| "Unknown".to_string());
-                println!(
-                    "  \x1b[38;5;244mCurrent Bot:\x1b[0m \x1b[1;36m@{}\x1b[0m (ID: {})",
-                    uname, info.id
-                );
+            let chosen_prov = updated_store.providers.iter().find(|p| &p.id == prov_id).cloned();
+            if let Some(prov) = chosen_prov {
+                let _ = run_persisted_capability_probe(ai_service, &prov, chosen_model).await;
             }
-        }
-    }
-
-    let stdin = io::stdin();
-    let mut reader = stdin.lock();
-
-    print!("\x1b[1;37mEnter New Telegram Bot Token:\x1b[0m ");
-    let _ = io::stdout().flush();
-    let mut input = String::new();
-    if reader.read_line(&mut input).is_err() {
-        println!("\n\x1b[38;5;244mCancelled.\x1b[0m\n");
-        return;
-    }
-    let new_token = input.trim().to_string();
-    if new_token.is_empty() {
-        println!("\x1b[1;31m[ERROR] Token cannot be empty.\x1b[0m\n");
-        return;
-    }
-
-    println!("  \x1b[38;5;244mVerifying new token with Telegram API...\x1b[0m");
-    let bot = TelegramBotClient::new(&new_token);
-    match bot.get_me().await {
-        Ok(resp) if resp.ok => {
-            let Some(info) = resp.result else {
-                println!("  \x1b[1;31m[FAIL] Telegram returned ok=true without bot information.\x1b[0m\n");
-                return;
-            };
-            let uname = info.username.unwrap_or_else(|| "Unknown".to_string());
             println!(
-                "  \x1b[1;32m[OK] Token valid! Connected to @{} ({})\x1b[0m",
-                uname, info.first_name
+                "\n\x1b[1;32m✔ Main Model diset ke: {}\x1b[0m ({})\n",
+                chosen_model, prov_name
             );
-
-            if let Err(e) = save_token_to_env(&new_token) {
-                println!("  \x1b[1;31m[ERROR] Failed to save token: {e}\x1b[0m\n");
-            } else {
-                println!("  \x1b[1;32m[SUCCESS] Telegram bot token updated successfully!\x1b[0m\n");
-            }
-        }
-        Ok(resp) => {
-            println!(
-                "  \x1b[1;31m[FAIL] Invalid token: {:?}\x1b[0m\n",
-                resp.description
-            );
-        }
-        Err(e) => {
-            println!("  \x1b[1;31m[FAIL] Verification error: {e}\x1b[0m\n");
         }
     }
 }
@@ -1925,7 +1424,7 @@ pub(crate) async fn run_cli_telegram_pick(ai_service: &AIChatService) {
     let mut store = load_provider_store();
     store.telegram_models.truncate(10);
     if store.providers.is_empty() {
-        println!("\x1b[38;5;214m[WARN] No AI provider configured yet.\x1b[0m");
+        println!("\x1b[33mBelum ada AI Provider yang terdaftar.\x1b[0m\n");
         return;
     }
     for provider in &mut store.providers {
@@ -1951,7 +1450,7 @@ pub(crate) async fn run_cli_telegram_pick(ai_service: &AIChatService) {
         }
     }
     if catalog.is_empty() {
-        println!("\x1b[38;5;214m[WARN] No models found.\x1b[0m");
+        println!("\x1b[33mTidak ada model yang ditemukan.\x1b[0m\n");
         return;
     }
     let items: Vec<String> = catalog
@@ -1968,8 +1467,9 @@ pub(crate) async fn run_cli_telegram_pick(ai_service: &AIChatService) {
                 .any(|selected| selected == &key || selected == model)
         })
         .collect();
+
     let selected = terminal_interactive_multi_select(
-        "Pilih model yang ditampilkan di Telegram",
+        "Pilih Model Menu Telegram (Maksimal 10):",
         &items,
         &selected_flags,
         10,
@@ -1984,81 +1484,621 @@ pub(crate) async fn run_cli_telegram_pick(ai_service: &AIChatService) {
             Some(format!("{}::{}", provider_id, model))
         })
         .collect();
-    if let Err(error) = save_provider_store(&store) {
-        println!("\n\x1b[1;31m[ERROR] Telegram model whitelist was not saved: {error}\x1b[0m\n");
+    if let Err(e) = save_provider_store(&store) {
+        println!("\n\x1b[31m✖ Error: Gagal menyimpan whitelist model Telegram: {e}\x1b[0m\n");
         return;
     }
     if store.telegram_models.is_empty() {
         println!(
-            "\n\x1b[1;32m[OK] Telegram model whitelist cleared; all models are visible.\x1b[0m"
+            "\n\x1b[1;32m✔ Whitelist dibersihkan; seluruh model tampil di menu Telegram.\x1b[0m\n"
         );
     } else {
         println!(
-            "\n\x1b[1;32m[OK] {} model(s) enabled for Telegram (max 10).\x1b[0m",
+            "\n\x1b[1;32m✔ Disimpan: {} model aktif untuk menu Telegram.\x1b[0m\n",
             store.telegram_models.len()
         );
     }
 }
 
-pub(crate) async fn run_cli_telegram_owner(owner_arg: Option<&str>) {
-    let owner = if let Some(value) = owner_arg {
-        value.trim().parse::<i64>().ok()
-    } else {
-        print!("\x1b[1;37mTelegram Owner User ID:\x1b[0m ");
-        let _ = io::stdout().flush();
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_err() {
-            None
-        } else {
-            input.trim().parse::<i64>().ok()
-        }
-    };
-
-    match owner.filter(|value| *value > 0) {
-        Some(owner_id) => match save_env_kv("OWNER_USER_ID", &owner_id.to_string()) {
-            Ok(()) => {
-                println!("\n\x1b[1;32m[OK] Telegram owner diset ke user ID {owner_id}.\x1b[0m\n")
-            }
-            Err(error) => println!("\n\x1b[1;31m[ERROR] Gagal menyimpan owner: {error}\x1b[0m\n"),
-        },
-        None => println!("\n\x1b[1;31m[ERROR] Owner User ID harus berupa angka positif.\x1b[0m\n"),
+fn addon_role_short_label(role: ModelRole) -> &'static str {
+    match role {
+        ModelRole::Vision => "Vision",
+        ModelRole::Video => "Video",
+        ModelRole::AudioStt => "Audio STT",
+        ModelRole::ImageGeneration => "Image Gen",
+        ModelRole::Main => "Main",
     }
 }
 
-pub(crate) async fn run_cli_telegram_menu(action: Option<&str>, arg: Option<&str>) {
+pub(crate) async fn run_cli_addon_menu(ai_service: &AIChatService) {
     load_environment();
-    match action {
-        Some("check") => {
-            run_cli_telegram_check().await;
+    loop {
+        let providers = ai_service.get_user_providers(0).await;
+        let routing = ai_service.model_routing_config().await;
+
+        let mut menu_items = Vec::new();
+        for role in ModelRole::addon_roles() {
+            let route = routing
+                .route(role)
+                .cloned()
+                .unwrap_or(ModelRoute::MainModel);
+            let target_str = match &route {
+                ModelRoute::MainModel => "○ Main Model".to_string(),
+                ModelRoute::Disabled => "✖ Disabled".to_string(),
+                ModelRoute::Specific { provider_id, model } => {
+                    let prov_name = providers
+                        .iter()
+                        .find(|p| &p.id == provider_id)
+                        .map(|p| p.name.as_str())
+                        .unwrap_or(provider_id);
+                    format!("◆ {prov_name} :: {model}")
+                }
+            };
+            let label = addon_role_short_label(role);
+            menu_items.push(format!("{:<12} [{target_str}]", label));
         }
-        Some("bind") | Some("set") => {
-            run_cli_telegram_bind(arg).await;
+        menu_items.push("🧪 Uji Kapabilitas Semua Model Addon Aktif".to_string());
+        menu_items.push("↺ Reset Semua Addon ke Main Model".to_string());
+        menu_items.push("✕ Selesai / Keluar".to_string());
+
+        let sel = terminal_interactive_select(
+            "Kelola Addon Multimodal (Pilih Role):",
+            &menu_items,
+            0,
+            false,
+            None,
+        );
+
+        let Some(idx) = sel else {
+            break;
+        };
+
+        let roles = ModelRole::addon_roles();
+        if idx < roles.len() {
+            let role = roles[idx];
+            run_cli_addon_role_submenu(ai_service, role).await;
+        } else if idx == roles.len() {
+            run_cli_addon_test_all_routes(ai_service).await;
+        } else if idx == roles.len() + 1 {
+            let mut failed = false;
+            for r in ModelRole::addon_roles() {
+                if let Err(e) = ai_service.set_model_route(r, ModelRoute::MainModel).await {
+                    println!(
+                        "\n\x1b[31m✖ Error: Gagal mereset addon {}: {e}\x1b[0m\n",
+                        r.display_name()
+                    );
+                    failed = true;
+                    break;
+                }
+            }
+            if !failed {
+                println!("\n\x1b[1;32m✔ Seluruh role addon di-reset ke Main Model.\x1b[0m\n");
+            }
+        } else {
+            break;
         }
-        Some("change") | Some("update") => {
-            run_cli_telegram_change().await;
+    }
+}
+
+async fn run_cli_addon_role_submenu(ai_service: &AIChatService, role: ModelRole) {
+    let providers = ai_service.get_user_providers(0).await;
+    let routing = ai_service.model_routing_config().await;
+    let curr_route = routing
+        .route(role)
+        .cloned()
+        .unwrap_or(ModelRoute::MainModel);
+    let route_label = addon_route_text(&curr_route, &providers);
+
+    let summary = format!(
+        "== Addon Role: {} ==\r\n\
+         • Route Saat Ini: \x1b[1;36m{}\x1b[0m",
+        role.display_name(),
+        route_label
+    );
+
+    let options = vec![
+        "○ Gunakan Main Model (Inherited / Default)".to_string(),
+        "✖ Nonaktifkan Role Ini (Disabled)".to_string(),
+        "◆ Pilih Model Spesifik dari Provider...".to_string(),
+        "← Kembali".to_string(),
+    ];
+
+    let sel = terminal_interactive_select(&summary, &options, 0, false, None);
+    let Some(choice) = sel else {
+        return;
+    };
+
+    match choice {
+        0 => {
+            if let Err(e) = ai_service
+                .set_model_route(role, ModelRoute::MainModel)
+                .await
+            {
+                println!(
+                    "\n\x1b[31m✖ Error: Gagal menyimpan route {}: {e}\x1b[0m\n",
+                    role.display_name()
+                );
+            }
         }
-        Some("owner") => {
-            run_cli_telegram_owner(arg).await;
+        1 => {
+            if let Err(e) = ai_service.set_model_route(role, ModelRoute::Disabled).await {
+                println!(
+                    "\n\x1b[31m✖ Error: Gagal menonaktifkan route {}: {e}\x1b[0m\n",
+                    role.display_name()
+                );
+            }
         }
-        _ => {
-            run_cli_telegram_check().await;
+        2 => {
+            let mut choices = Vec::new();
+            let mut routes = Vec::new();
+            for prov in &providers {
+                for m in &prov.models {
+                    choices.push(format!("{} :: {}", prov.name, m));
+                    routes.push(ModelRoute::Specific {
+                        provider_id: prov.id.clone(),
+                        model: m.clone(),
+                    });
+                }
+            }
+            if choices.is_empty() {
+                println!("\n\x1b[31m✖ Tidak ada model provider yang tersedia.\x1b[0m\n");
+                return;
+            }
+            if let Some(m_idx) = terminal_interactive_select(
+                &format!("Pilih Model Spesifik untuk {}:", role.display_name()),
+                &choices,
+                0,
+                true,
+                None,
+            ) {
+                let chosen_route = routes[m_idx].clone();
+                let chosen_label = choices[m_idx].clone();
+                if let Err(e) = ai_service.set_model_route(role, chosen_route).await {
+                    println!(
+                        "\n\x1b[31m✖ Error: Gagal menyimpan route {}: {e}\x1b[0m\n",
+                        role.display_name()
+                    );
+                } else {
+                    println!(
+                        "\n\x1b[1;32m✔ Route {} diarahkan ke: {}\x1b[0m",
+                        role.display_name(),
+                        chosen_label
+                    );
+                    print!("\n  \x1b[1;36mUji kapabilitas model ini sekarang untuk memastikan kompatibilitas? [Y/n]:\x1b[0m ");
+                    let _ = io::stdout().flush();
+                    let mut ans = String::new();
+                    let _ = io::stdin().read_line(&mut ans);
+                    if !ans.trim().eq_ignore_ascii_case("n") {
+                        if role == ModelRole::ImageGeneration {
+                            run_cli_probe_test_image_gen(ai_service).await;
+                        } else {
+                            run_cli_probe_test_role(ai_service, role).await;
+                        }
+                        print_press_enter();
+                    }
+                }
+            }
         }
+        _ => {}
+    }
+}
+
+async fn run_cli_addon_test_all_routes(ai_service: &AIChatService) {
+    println!("\n\x1b[1;36mDiagnostik & Uji Kapabilitas Seluruh Rute Addon Aktif...\x1b[0m\n");
+    let providers = ai_service.get_user_providers(0).await;
+    let routing = ai_service.model_routing_config().await;
+
+    for role in ModelRole::addon_roles() {
+        let route = routing
+            .route(role)
+            .cloned()
+            .unwrap_or(ModelRoute::MainModel);
+        let route_str = addon_route_text(&route, &providers);
+
+        if route == ModelRoute::Disabled {
+            println!(
+                "  ● {:<22} : \x1b[38;5;244m✖ Disabled (Dilewati)\x1b[0m\n",
+                role.display_name()
+            );
+            continue;
+        }
+
+        println!("  ● \x1b[1m{}\x1b[0m → {}", role.display_name(), route_str);
+
+        if role == ModelRole::ImageGeneration {
+            print!("    Uji Image Generation? (dapat menggunakan kuota API) [y/N]: ");
+            let _ = io::stdout().flush();
+            let mut ans = String::new();
+            let _ = io::stdin().read_line(&mut ans);
+            if !ans.trim().eq_ignore_ascii_case("y") {
+                println!("    \x1b[38;5;244m○ Uji Image Generation dilewati.\x1b[0m\n");
+                continue;
+            }
+            match ai_service
+                .probe_image_generation_active_with_observer(
+                    ModelRole::ImageGeneration,
+                    print_probe_event,
+                )
+                .await
+            {
+                Ok((_rec, ProbeOutcome::Supported)) => {
+                    println!(
+                        "    \x1b[1;32m✔ Sukses: Image Generation terverifikasi & berfungsi normal.\x1b[0m"
+                    );
+                }
+                Ok((rec, outcome)) => {
+                    println!(
+                        "    \x1b[31m✖ Gagal: Hasil probe {:?}, status tersimpan {:?}.\x1b[0m",
+                        outcome,
+                        rec.effective_state_for(CapabilityKind::ImageGeneration)
+                    );
+                }
+                Err(e) => {
+                    println!("    \x1b[31m✖ Error: {e}\x1b[0m");
+                }
+            }
+        } else {
+            match ai_service
+                .probe_addon_role_with_observer(role, print_probe_event)
+                .await
+            {
+                Ok((record, status)) => match status {
+                    ProbeOutcome::Supported => {
+                        println!(
+                            "    \x1b[32m✔ Kapabilitas terverifikasi & tersimpan di SQLite ({})\x1b[0m",
+                            record.checked_at
+                        );
+                    }
+                    ProbeOutcome::Unsupported => {
+                        println!("    \x1b[31m✖ Model menolak kapabilitas ini (Unsupported).\x1b[0m");
+                    }
+                    _ => {
+                        println!(
+                            "    \x1b[33m○ Status kapabilitas belum terbukti ({status:?}).\x1b[0m"
+                        );
+                    }
+                },
+                Err(e) => {
+                    println!("    \x1b[31m✖ Error probe: {e}\x1b[0m");
+                }
+            }
+
+            match ai_service.test_model_role(role).await {
+                Ok(detail) => println!("    \x1b[1;32m✔ Live Test Fungsional:\x1b[0m {detail}"),
+                Err(error) => println!("    \x1b[31m✖ Live Test Fungsional:\x1b[0m {error}"),
+            }
+        }
+        println!();
+    }
+
+    println!("\x1b[1;32m✔ Selesai memeriksa seluruh rute addon.\x1b[0m");
+    print_press_enter();
+}
+
+pub(crate) async fn run_cli_probe_menu(ai_service: &AIChatService) {
+    load_environment();
+    loop {
+        let menu_items = vec![
+            "🔍 Audit & Refresh Semua Model Aktif".to_string(),
+            "👁️  Uji Spesialis Vision (Live Test)".to_string(),
+            "🎬 Uji Spesialis Video (Live Test)".to_string(),
+            "🎙️  Uji Spesialis Audio STT (Live Test)".to_string(),
+            "🎨 Uji Spesialis Image Gen (Live Test Gambar)".to_string(),
+            "📋 Lihat Cache Kapabilitas SQLite".to_string(),
+            "✕ Selesai / Keluar".to_string(),
+        ];
+
+        let sel = terminal_interactive_select(
+            "Pusat Diagnostik & Probe Kapabilitas:",
+            &menu_items,
+            0,
+            false,
+            None,
+        );
+
+        let Some(idx) = sel else {
+            break;
+        };
+
+        match idx {
+            0 => {
+                run_cli_probe_all_active(ai_service).await;
+                print_press_enter();
+            }
+            1 => {
+                run_cli_probe_test_role(ai_service, ModelRole::Vision).await;
+                print_press_enter();
+            }
+            2 => {
+                run_cli_probe_test_role(ai_service, ModelRole::Video).await;
+                print_press_enter();
+            }
+            3 => {
+                run_cli_probe_test_role(ai_service, ModelRole::AudioStt).await;
+                print_press_enter();
+            }
+            4 => {
+                run_cli_probe_test_image_gen(ai_service).await;
+                print_press_enter();
+            }
+            5 => {
+                run_cli_probe_show_registry().await;
+                print_press_enter();
+            }
+            _ => break,
+        }
+    }
+}
+
+fn print_press_enter() {
+    print!("\n\x1b[38;5;244mTekan Enter untuk kembali...\x1b[0m");
+    let _ = io::stdout().flush();
+    let mut tmp = String::new();
+    let _ = io::stdin().read_line(&mut tmp);
+}
+
+fn capability_display_label(cap: CapabilityKind) -> &'static str {
+    match cap {
+        CapabilityKind::TextChat => "Text Chat",
+        CapabilityKind::ImageInput => "Vision (Image)",
+        CapabilityKind::ImageGeneration => "Image Generation",
+        CapabilityKind::ImageEditing => "Image Editing",
+        CapabilityKind::AudioInput => "Audio Native",
+        CapabilityKind::AudioTranscription => "Audio STT",
+        CapabilityKind::VideoInput => "Video Frames",
+        CapabilityKind::NativeFileInput => "Native File",
+        CapabilityKind::Tools => "Tools / Function",
+        CapabilityKind::StructuredOutput => "Structured JSON",
+        CapabilityKind::Reasoning => "Reasoning",
+    }
+}
+
+fn format_probe_outcome_badge(outcome: ProbeOutcome) -> String {
+    match outcome {
+        ProbeOutcome::Supported => "\x1b[1;32m✔ Supported\x1b[0m".to_string(),
+        ProbeOutcome::Unsupported => "\x1b[1;31m✖ Unsupported\x1b[0m".to_string(),
+        ProbeOutcome::Inconclusive => "\x1b[33m○ Inconclusive\x1b[0m".to_string(),
+        ProbeOutcome::Timeout => "\x1b[33m! Timeout\x1b[0m".to_string(),
+        ProbeOutcome::NetworkError => "\x1b[31m✖ NetworkError\x1b[0m".to_string(),
+        ProbeOutcome::ProtocolMismatch => "\x1b[33m! ProtocolMismatch\x1b[0m".to_string(),
+        ProbeOutcome::AuthFailed => "\x1b[31m✖ AuthFailed\x1b[0m".to_string(),
+        ProbeOutcome::RateLimited => "\x1b[33m! RateLimited\x1b[0m".to_string(),
+        ProbeOutcome::ProviderError => "\x1b[31m✖ ProviderError\x1b[0m".to_string(),
+    }
+}
+
+fn format_cap_bool_badge(val: Option<bool>) -> &'static str {
+    match val {
+        Some(true) => "\x1b[32m✔ Supported\x1b[0m",
+        Some(false) => "\x1b[31m✖ Unsupported\x1b[0m",
+        None => "\x1b[38;5;244m○ Unknown\x1b[0m",
+    }
+}
+
+async fn run_cli_probe_all_active(ai_service: &AIChatService) {
+    println!("\n\x1b[1;36mMemeriksa Kapabilitas Model Aktif...\x1b[0m\n");
+    let providers = ai_service.get_user_providers(0).await;
+    if providers.is_empty() {
+        println!("  \x1b[33m✖ Belum ada AI provider yang terdaftar.\x1b[0m");
+        return;
+    }
+
+    for prov in &providers {
+        let model = &prov.active_model;
+        if model.is_empty() {
+            continue;
+        }
+        println!("  ● Provider: \x1b[1m{}\x1b[0m ({})", prov.name, model);
+        if let Some(record) = run_persisted_capability_probe(ai_service, prov, model).await {
+            println!("    \x1b[1;37mRingkasan Kapabilitas Terverifikasi:\x1b[0m");
+            println!("      • Text Chat        : {}", format_cap_bool_badge(record.supports_text_chat));
+            println!("      • Vision (Image)   : {}", format_cap_bool_badge(record.supports_image_input));
+            println!("      • Structured JSON  : {}", format_cap_bool_badge(record.supports_structured_output));
+            println!("      • Tools / Function : {}", format_cap_bool_badge(record.supports_tools));
+            println!("      • Audio Native     : {}", format_cap_bool_badge(record.supports_audio_input));
+            println!("      • Audio STT        : {}", format_cap_bool_badge(record.supports_audio_transcription));
+            println!("      • Video Frames     : {}", format_cap_bool_badge(record.supports_video_input));
+            if let Some(ctx) = record.context_window {
+                println!("      • Context Limit    : \x1b[36m{} tokens\x1b[0m", ctx);
+            }
+        } else {
+            println!("    \x1b[31m✖ Verifikasi kapabilitas gagal / endpoint tidak merespons.\x1b[0m");
+        }
+        println!();
+    }
+    println!(
+        "\x1b[1;32m✔ Kapabilitas berhasil diverifikasi dan disimpan ke database SQLite.\x1b[0m"
+    );
+}
+
+async fn run_cli_probe_test_role(ai_service: &AIChatService, role: ModelRole) {
+    println!(
+        "\n\x1b[1;36mDiagnostik & Live Test: {}\x1b[0m",
+        role.display_name()
+    );
+    println!("  1. Memverifikasi kapabilitas route...");
+    match ai_service
+        .probe_addon_role_with_observer(role, print_probe_event)
+        .await
+    {
+        Ok((record, status)) => match status {
+            ProbeOutcome::Supported => {
+                println!(
+                    "  ✔ Verification passed: Capability works and persistence succeeded (checked: {})",
+                    record.checked_at
+                );
+            }
+            ProbeOutcome::Unsupported => {
+                println!("  ✖ Probe executed: Model explicitly rejected capability.");
+            }
+            ProbeOutcome::Inconclusive
+            | ProbeOutcome::AuthFailed
+            | ProbeOutcome::RateLimited
+            | ProbeOutcome::Timeout
+            | ProbeOutcome::NetworkError
+            | ProbeOutcome::ProtocolMismatch
+            | ProbeOutcome::ProviderError => {
+                println!("  ⚪ Completed but not verified: Result is inconclusive/stale.");
+            }
+        },
+        Err(e) => {
+            println!("  ✖ Error / PersistenceFailed: {e}");
+        }
+    }
+
+    println!("\n  2. Mengirim payload uji fungsional...");
+    match ai_service.test_model_role(role).await {
+        Ok(detail) => println!("  \x1b[1;32m✔ Sukses:\x1b[0m {detail}"),
+        Err(error) => println!("  \x1b[31m✖ Gagal:\x1b[0m {error}"),
+    }
+}
+
+async fn run_cli_probe_test_image_gen(ai_service: &AIChatService) {
+    println!("\n\x1b[1;36mLive Test: Image Generation\x1b[0m");
+    println!("\x1b[33mPerhatian: Pengujian ini akan membuat gambar uji dan dapat menggunakan kredit API.\x1b[0m");
+    print!("Lanjutkan pengujian? [y/N]: ");
+    let _ = io::stdout().flush();
+    let mut ans = String::new();
+    let _ = io::stdin().read_line(&mut ans);
+    if !ans.trim().eq_ignore_ascii_case("y") {
+        println!("○ Pengujian dibatalkan.");
+        return;
+    }
+
+    println!("Membuat gambar uji...");
+    match ai_service
+        .probe_image_generation_active_with_observer(ModelRole::ImageGeneration, print_probe_event)
+        .await
+    {
+        Ok((_rec, ProbeOutcome::Supported)) => {
+            println!(
+                "  \x1b[1;32m✔ Sukses: Gambar berhasil dibuat dan lolos validasi runtime.\x1b[0m"
+            );
+        }
+        Ok((rec, outcome)) => {
+            println!(
+                "  \x1b[31m✖ Gagal: Hasil probe {:?}, status tersimpan {:?}.\x1b[0m",
+                outcome,
+                rec.effective_state_for(CapabilityKind::ImageGeneration)
+            );
+        }
+        Err(e) => {
+            println!("  \x1b[31m✖ Error: {e}\x1b[0m");
+        }
+    }
+}
+
+async fn run_cli_probe_show_registry() {
+    let registry = crate::ai::service::load_capability_registry();
+    println!(
+        "\n\x1b[1;36mCapability Registry (Total {} model):\x1b[0m\n",
+        registry.models.len()
+    );
+    if registry.models.is_empty() {
+        println!("  \x1b[38;5;244mBelum ada kapabilitas model yang tersimpan di registry.\x1b[0m\n");
+        return;
+    }
+    for r in &registry.models {
+        let vision = if r.supports_image_input == Some(true) { "\x1b[32m✔ Vision\x1b[0m" } else { "\x1b[38;5;244m○ Vision\x1b[0m" };
+        let audio = if r.supports_audio_input == Some(true) || r.supports_audio_transcription == Some(true) { "\x1b[32m✔ Audio\x1b[0m" } else { "\x1b[38;5;244m○ Audio\x1b[0m" };
+        let tools = if r.supports_tools == Some(true) { "\x1b[32m✔ Tools\x1b[0m" } else { "\x1b[38;5;244m○ Tools\x1b[0m" };
+        let ctx_str = r.context_window.map(|c| format!(" · Ctx: {c}")).unwrap_or_default();
+        println!(
+            "  ● \x1b[1m{}\x1b[0m ({})\n    [{vision} · {audio} · {tools}{ctx_str}] \x1b[38;5;244m· {}\x1b[0m",
+            r.model, r.provider_name, r.checked_at
+        );
+    }
+}
+
+fn addon_route_text(route: &ModelRoute, providers: &[ProviderConfig]) -> String {
+    match route {
+        ModelRoute::MainModel => "Main Model".to_string(),
+        ModelRoute::Disabled => "Disabled".to_string(),
+        ModelRoute::Specific { provider_id, model } => {
+            let provider = providers
+                .iter()
+                .find(|p| &p.id == provider_id)
+                .map(|p| p.name.as_str())
+                .unwrap_or(provider_id.as_str());
+            format!("{} :: {}", provider, model)
+        }
+    }
+}
+
+fn print_probe_event(event: ProbeEvent) {
+    match event {
+        ProbeEvent::Started { .. } => {}
+        ProbeEvent::Progress {
+            capability,
+            message,
+        } => {
+            if message.starts_with("Vision 1/2") || message.starts_with("Vision 2/2") {
+                println!(
+                    "    ├─ {:<18} : \x1b[38;5;244m{}\x1b[0m",
+                    capability_display_label(capability),
+                    message
+                );
+            }
+        }
+        ProbeEvent::Completed {
+            capability,
+            outcome,
+        } => {
+            println!(
+                "    ├─ {:<18} : {}",
+                capability_display_label(capability),
+                format_probe_outcome_badge(outcome)
+            );
+        }
+        ProbeEvent::Skipped { capability, reason } => {
+            println!(
+                "    ├─ {:<18} : \x1b[38;5;244m○ Skipped ({})\x1b[0m",
+                capability_display_label(capability),
+                reason
+            );
+        }
+        ProbeEvent::Persistence { saved } => {
+            if saved {
+                println!("    └─ Persist Registry   : \x1b[32m✔ Saved to SQLite\x1b[0m");
+            } else {
+                println!("    └─ Persist Registry   : \x1b[31m✖ Persistence Failed\x1b[0m");
+            }
+        }
+        ProbeEvent::Finished => {}
+    }
+}
+
+async fn run_persisted_capability_probe(
+    ai_service: &AIChatService,
+    provider: &ProviderConfig,
+    model: &str,
+) -> Option<crate::ai::service::CapabilityRecord> {
+    let candidate = ai_service
+        .probe_model_capabilities_with_observer(provider, model, print_probe_event)
+        .await;
+    let persisted = ai_service
+        .capability_record(&provider.endpoint, model)
+        .await;
+    match persisted {
+        Some(record) if record.checked_at == candidate.checked_at => Some(record),
+        _ => None,
     }
 }
 
 pub(crate) fn print_cli_help() {
-    println!("\n\x1b[1;36mUsage:\x1b[0m xiao [command] [args]\n");
-    println!("\x1b[1;37mCommands:\x1b[0m");
-    println!("  \x1b[36mstart\x1b[0m                               Run Telegram bot");
-    println!("  \x1b[36msetup\x1b[0m                               Quickstart setup wizard");
-    println!("  \x1b[36mprovider [add] [del] [status]\x1b[0m       Manage AI providers");
-    println!("  \x1b[36mtelegram [check|bind|change|owner]\x1b[0m  Manage Telegram bot and owner");
-    println!("  \x1b[36mmodel [name] [pick]\x1b[0m                 Select/search Main Model");
-    println!("  \x1b[36mmodel addon [list|set|reset|disable|show|probe|test]\x1b[0m");
-    println!("  \x1b[36mstatus\x1b[0m                              System health check");
-    println!("  \x1b[36mhelp\x1b[0m                                Show this help\n");
+    println!("\n\x1b[1;36mXiaoAI v0.3.0 — AI Assistant Bot\x1b[0m\n");
+    println!("\x1b[1;37mPenggunaan:\x1b[0m");
+    println!("  xiao <command>\n");
+    println!("\x1b[1;37mDaftar Perintah:\x1b[0m");
+    println!("  \x1b[36mstart\x1b[0m               Jalankan bot daemon");
+    println!(
+        "  \x1b[36msetup\x1b[0m               Wizard konfigurasi awal (AI Provider ➔ Gateway)"
+    );
+    println!("  \x1b[36mstatus\x1b[0m              Tampilkan dashboard status sistem lengkap\n");
+    println!("  \x1b[36mgateway\x1b[0m             Kelola gateway chat (Telegram token & owner) [Interaktif]");
+    println!("  \x1b[36mprovider [add|rm]\x1b[0m   Kelola provider AI (list, tambah, hapus)     [Interaktif]\n");
+    println!("  \x1b[36mmodel [query|addon]\x1b[0m Pilih Main Model atau kelola Addon Multimodal [Interaktif]");
+    println!("  \x1b[36mpick\x1b[0m                Pilih daftar model untuk menu Telegram      [Interaktif]");
+    println!("  \x1b[36mprobe\x1b[0m               Pusat diagnostik kapabilitas & live test    [Interaktif]");
+    println!("  \x1b[36mhelp\x1b[0m                Tampilkan panduan perintah ini\n");
 }
-
-// ==========================================
-// Keyboard Interfaces
-// ==========================================

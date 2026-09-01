@@ -1274,6 +1274,7 @@ pub enum EvidenceFreshness {
     Stale,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeRunStatus {
@@ -1323,6 +1324,7 @@ pub enum ProbeEvent {
     Finished,
 }
 
+#[allow(dead_code)]
 impl ProbeEvent {
     pub fn run_status(&self) -> ProbeRunStatus {
         match self {
@@ -1813,6 +1815,7 @@ pub fn save_app_setting(key: &str, value: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::routing::ModelRoutingConfig;
 
     fn session_test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -2456,5 +2459,56 @@ mod tests {
         assert_eq!(dir_mode, 0o700);
         assert_eq!(file_mode, 0o600);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_secret_storage_write_aborts_without_persisting() {
+        let invalid_dir = std::path::Path::new("/nonexistent_dir_cannot_create_secrets");
+        let secret_ref = "secret://test/fail-check";
+        let res = write_secret_in_dir(invalid_dir, secret_ref, "test");
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn model_routing_additive_setup_preserves_custom_routes() {
+        let mut config = ModelRoutingConfig::default();
+        let _ = config.set_route(
+            crate::ai::routing::ModelRole::Vision,
+            crate::ai::routing::ModelRoute::Disabled,
+        );
+        let _ = config.set_route(
+            crate::ai::routing::ModelRole::ImageGeneration,
+            crate::ai::routing::ModelRoute::Specific {
+                provider_id: "prov_custom".to_string(),
+                model: "flux-pro".to_string(),
+            },
+        );
+
+        // Simulate additive setup: only set routes for roles that are None
+        for role in crate::ai::routing::ModelRole::addon_roles() {
+            if config.route(role).is_none() {
+                let _ = config.set_route(role, crate::ai::routing::ModelRoute::MainModel);
+            }
+        }
+
+        assert_eq!(
+            config.route(crate::ai::routing::ModelRole::Vision),
+            Some(&crate::ai::routing::ModelRoute::Disabled)
+        );
+        assert_eq!(
+            config.route(crate::ai::routing::ModelRole::ImageGeneration),
+            Some(&crate::ai::routing::ModelRoute::Specific {
+                provider_id: "prov_custom".to_string(),
+                model: "flux-pro".to_string(),
+            })
+        );
+        assert_eq!(
+            config.route(crate::ai::routing::ModelRole::Video),
+            Some(&crate::ai::routing::ModelRoute::MainModel)
+        );
+        assert_eq!(
+            config.route(crate::ai::routing::ModelRole::AudioStt),
+            Some(&crate::ai::routing::ModelRoute::MainModel)
+        );
     }
 }
