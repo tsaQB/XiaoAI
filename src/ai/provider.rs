@@ -674,53 +674,59 @@ impl AIChatService {
         match role {
             ModelRole::Main => {
                 let state = Self::effective_capability_state(record, CapabilityKind::TextChat);
-                if state == CapabilityState::Supported {
-                    CapabilityState::Supported
-                } else if state == CapabilityState::Unsupported {
+                if state == CapabilityState::Unsupported {
                     CapabilityState::Unsupported
-                } else if !record.model.is_empty() && record.supports_text_chat != Some(false) {
+                } else {
+                    CapabilityState::Supported
+                }
+            }
+            ModelRole::Vision => {
+                let state = Self::effective_capability_state(record, CapabilityKind::ImageInput);
+                if state == CapabilityState::Unsupported {
+                    CapabilityState::Unsupported
+                } else if state == CapabilityState::Supported || !record.model.is_empty() {
                     CapabilityState::Supported
                 } else {
                     CapabilityState::Unknown
                 }
             }
-            ModelRole::Vision => {
-                Self::effective_capability_state(record, CapabilityKind::ImageInput)
-            }
             ModelRole::Video => {
-                Self::effective_capability_state(record, CapabilityKind::VideoInput)
+                let state = Self::effective_capability_state(record, CapabilityKind::VideoInput);
+                if state == CapabilityState::Unsupported {
+                    CapabilityState::Unsupported
+                } else if state == CapabilityState::Supported || !record.model.is_empty() {
+                    CapabilityState::Supported
+                } else {
+                    CapabilityState::Unknown
+                }
             }
             ModelRole::ImageGeneration => {
                 let state =
                     Self::effective_capability_state(record, CapabilityKind::ImageGeneration);
-                if state == CapabilityState::Supported {
-                    CapabilityState::Supported
-                } else if state == CapabilityState::Unsupported {
+                if state == CapabilityState::Unsupported {
                     CapabilityState::Unsupported
-                } else if !record.model.is_empty()
-                    && record.supports_image_generation != Some(false)
-                {
-                    CapabilityState::Supported
                 } else {
-                    state
+                    CapabilityState::Supported
                 }
             }
             ModelRole::AudioStt if origin == RouteOrigin::MainModel => {
                 let audio = Self::effective_capability_state(record, CapabilityKind::AudioInput);
                 let stt =
                     Self::effective_capability_state(record, CapabilityKind::AudioTranscription);
-                if audio == CapabilityState::Supported || stt == CapabilityState::Supported {
-                    CapabilityState::Supported
-                } else if audio == CapabilityState::Unsupported
-                    && stt == CapabilityState::Unsupported
-                {
+                if audio == CapabilityState::Unsupported && stt == CapabilityState::Unsupported {
                     CapabilityState::Unsupported
                 } else {
-                    CapabilityState::Unknown
+                    CapabilityState::Supported
                 }
             }
             ModelRole::AudioStt => {
-                Self::effective_capability_state(record, CapabilityKind::AudioTranscription)
+                let stt =
+                    Self::effective_capability_state(record, CapabilityKind::AudioTranscription);
+                if stt == CapabilityState::Unsupported {
+                    CapabilityState::Unsupported
+                } else {
+                    CapabilityState::Supported
+                }
             }
         }
     }
@@ -1049,8 +1055,21 @@ impl AIChatService {
             };
         }
         let status = response.status().as_u16();
-        if status == 404 || status == 405 {
-            // Adaptive Chat Fallback probe: cek apakah model chat aktif
+        let body = read_bounded_provider_text(response, 64 * 1024)
+            .await
+            .to_ascii_lowercase();
+
+        let is_unsupported_endpoint = status == 404
+            || status == 405
+            || (status == 400
+                && (body.contains("not supported")
+                    || body.contains("not an image model")
+                    || body.contains("unsupported")
+                    || body.contains("unknown url")
+                    || body.contains("not found")));
+
+        if is_unsupported_endpoint {
+            // Adaptive Chat Fallback probe: coba chat completions image generation
             let chat_url = format!(
                 "{}/chat/completions",
                 provider.endpoint.trim_end_matches('/')
@@ -1081,9 +1100,6 @@ impl AIChatService {
                 }
             }
         }
-        let body = read_bounded_provider_text(response, 64 * 1024)
-            .await
-            .to_ascii_lowercase();
         classify_probe_http_failure(CapabilityKind::ImageGeneration, status, &body)
     }
 

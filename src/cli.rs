@@ -431,7 +431,6 @@ pub(crate) async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Opt
         println!("  \x1b[31m✖ Error: Gagal memuat ulang provider di memori runtime.\x1b[0m");
         return None;
     }
-    let _ = run_persisted_capability_probe(ai_service, &provider, &active_model).await;
 
     // Preserving existing routes: only initialize missing routes to Main Model (additive setup)
     let existing_routing = ai_service.model_routing_config().await;
@@ -1258,7 +1257,6 @@ pub(crate) async fn run_cli_provider_add(ai_service: &AIChatService) {
         println!("  \x1b[31m✖ Error: Gagal memuat ulang provider di runtime.\x1b[0m\n");
         return;
     }
-    let _ = run_persisted_capability_probe(ai_service, &provider, &active_model).await;
 
     println!(
         "\n  \x1b[1;32m✔ Provider '{}' berhasil ditambahkan dan diaktifkan!\x1b[0m",
@@ -1420,14 +1418,6 @@ pub(crate) async fn run_cli_model_picker(ai_service: &AIChatService, initial_fil
             if !ai_service.reload_provider_store().await {
                 println!("\n\x1b[31m✖ Error: Gagal memuat ulang provider di runtime.\x1b[0m\n");
                 return;
-            }
-            let chosen_prov = updated_store
-                .providers
-                .iter()
-                .find(|p| &p.id == prov_id)
-                .cloned();
-            if let Some(prov) = chosen_prov {
-                let _ = run_persisted_capability_probe(ai_service, &prov, chosen_model).await;
             }
             println!(
                 "\n\x1b[1;32m✔ Main Model diset ke: {}\x1b[0m ({})\n",

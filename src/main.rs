@@ -895,6 +895,7 @@ fn main_context_overflow_warning(model: &str, used: usize, usable_limit: usize) 
     })
 }
 
+#[allow(dead_code)]
 fn effective_capability_state_label(
     record: &ai::service::CapabilityRecord,
     capability: ai::service::CapabilityKind,
@@ -906,6 +907,7 @@ fn effective_capability_state_label(
     }
 }
 
+#[allow(dead_code)]
 async fn run_observable_main_capability_probe(
     bot: &TelegramBotClient,
     ai_service: &AIChatService,
@@ -3325,14 +3327,6 @@ async fn handle_update(
                         .await;
                     return;
                 }
-                run_observable_main_capability_probe(
-                    bot,
-                    ai_service,
-                    chat_id,
-                    &prov,
-                    selected_model,
-                )
-                .await;
                 let rich = InputRichMessage::new(vec![
                     RichBlock::SectionHeading {
                         text: Value::String("MAIN MODEL CHANGED".to_string()),
@@ -3812,28 +3806,10 @@ async fn handle_update(
                     let _ = bot
                         .answer_callback_query(
                             &cq_id,
-                            Some(&format!(
-                                "Model: {model_name} saved. Checking capabilities…"
-                            )),
+                            Some(&format!("Model aktif diset ke: {model_name}")),
                             false,
                         )
                         .await;
-
-                    if let Some(provider) = ai_service
-                        .get_user_providers(user_id)
-                        .await
-                        .into_iter()
-                        .find(|provider| provider.id == prov_id)
-                    {
-                        run_observable_main_capability_probe(
-                            bot,
-                            ai_service,
-                            chat_id,
-                            &provider,
-                            &model_name,
-                        )
-                        .await;
-                    }
 
                     let new_stats = ai_service.get_context_stats(user_id).await;
                     let warning = main_context_overflow_warning(
