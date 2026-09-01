@@ -450,7 +450,10 @@ pub(crate) async fn run_cli_quickstart_wizard(ai_service: &AIChatService) -> Opt
         }
     }
 
-    println!("  \x1b[1;32m✔ Main Model diset ke: {}\x1b[0m", active_model);
+    println!(
+        "  \x1b[1;32m✔ Main Model diset ke     : {}\x1b[0m",
+        active_model
+    );
 
     // Step 2: Gateway Setup
     println!("\n\x1b[1;37m[2/2] Gateway Setup\x1b[0m");
@@ -633,10 +636,7 @@ pub(crate) async fn run_cli_status(ai_service: &AIChatService) {
             format!("\x1b[31mUnhealthy\x1b[0m ({err})")
         };
 
-        println!(
-            "  Provider     ● {} ({}) — {}",
-            p.name, p.endpoint, provider_health
-        );
+        println!("  Provider     ● {} — {}", p.name, provider_health);
         println!(
             "  Main Model   ◆ {} ({} configured models)",
             p.active_model,
@@ -2095,7 +2095,7 @@ fn print_probe_event(event: ProbeEvent) {
         } => {
             if message.starts_with("Vision 1/2") || message.starts_with("Vision 2/2") {
                 println!(
-                    "    ├─ {:<18} : \x1b[38;5;244m{}\x1b[0m",
+                    "    ├─ {:<20} : \x1b[38;5;244m{}\x1b[0m",
                     capability_display_label(capability),
                     message
                 );
@@ -2106,23 +2106,23 @@ fn print_probe_event(event: ProbeEvent) {
             outcome,
         } => {
             println!(
-                "    ├─ {:<18} : {}",
+                "    ├─ {:<20} : {}",
                 capability_display_label(capability),
                 format_probe_outcome_badge(outcome)
             );
         }
         ProbeEvent::Skipped { capability, reason } => {
             println!(
-                "    ├─ {:<18} : \x1b[38;5;244m○ Skipped ({})\x1b[0m",
+                "    ├─ {:<20} : \x1b[38;5;244m○ Skipped ({})\x1b[0m",
                 capability_display_label(capability),
                 reason
             );
         }
         ProbeEvent::Persistence { saved } => {
             if saved {
-                println!("    └─ Persist Registry   : \x1b[32m✔ Saved to SQLite\x1b[0m");
+                println!("    └─ Persist Registry     : \x1b[32m✔ Saved to SQLite\x1b[0m");
             } else {
-                println!("    └─ Persist Registry   : \x1b[31m✖ Persistence Failed\x1b[0m");
+                println!("    └─ Persist Registry     : \x1b[31m✖ Persistence Failed\x1b[0m");
             }
         }
         ProbeEvent::Finished => {}
