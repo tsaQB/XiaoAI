@@ -30,7 +30,7 @@ impl SseDecoder {
             }
             let line = String::from_utf8(raw)
                 .map_err(|_| "provider SSE emitted invalid UTF-8".to_string())?;
-            self.process_line(&line, &mut events);
+            self.process_line(&line, &mut events)?;
         }
 
         if self.buffer.len() > MAX_SSE_LINE_BYTES {
@@ -49,39 +49,44 @@ impl SseDecoder {
             }
             let line = String::from_utf8(raw)
                 .map_err(|_| "provider SSE emitted invalid UTF-8".to_string())?;
-            self.process_line(&line, &mut events);
+            self.process_line(&line, &mut events)?;
         }
-        self.flush_event(&mut events);
+        self.flush_event(&mut events)?;
         Ok(events)
     }
 
-    fn process_line(&mut self, line: &str, events: &mut Vec<StreamEvent>) {
+    fn process_line(
+        &mut self,
+        line: &str,
+        events: &mut Vec<StreamEvent>,
+    ) -> Result<(), String> {
         if line.is_empty() {
-            self.flush_event(events);
-            return;
+            return self.flush_event(events);
         }
         if line.starts_with(':') {
-            return;
+            return Ok(());
         }
         if let Some(data) = line.strip_prefix("data:") {
             self.data_lines.push(data.trim_start().to_string());
         }
+        Ok(())
     }
 
-    fn flush_event(&mut self, events: &mut Vec<StreamEvent>) {
+    fn flush_event(&mut self, events: &mut Vec<StreamEvent>) -> Result<(), String> {
         if self.data_lines.is_empty() {
-            return;
+            return Ok(());
         }
         let payload = self.data_lines.join("\n");
         self.data_lines.clear();
         let trimmed = payload.trim();
         if trimmed == "[DONE]" {
             events.push(StreamEvent::Done);
-            return;
+            return Ok(());
         }
-        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-            events.push(StreamEvent::Json(value));
-        }
+        let value = serde_json::from_str::<Value>(trimmed)
+            .map_err(|error| format!("provider SSE emitted invalid JSON: {error}"))?;
+        events.push(StreamEvent::Json(value));
+        Ok(())
     }
 }
 
@@ -127,6 +132,13 @@ mod tests {
             events.extend(decoder.push(&wire.as_bytes()[split..]).unwrap());
             assert_eq!(events, vec![expected.clone()], "split at byte {split}");
         }
+    }
+
+    #[test]
+    fn rejects_malformed_json_events() {
+        let mut decoder = SseDecoder::default();
+        let error = decoder.push(b"data: {not-json}\n\n").unwrap_err();
+        assert!(error.contains("invalid JSON"));
     }
 
     #[test]
