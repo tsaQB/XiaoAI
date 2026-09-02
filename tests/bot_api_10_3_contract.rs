@@ -52,11 +52,15 @@ fn media_group_requires_two_to_ten_album_compatible_items() {
     assert!(InputMedia::validate_media_group(&[photo_media("a")]).is_err());
     assert!(InputMedia::validate_media_group(&[photo_media("a"), photo_media("b")]).is_ok());
     assert!(InputMedia::validate_media_group(
-        &(0..10).map(|index| photo_media(&format!("p{index}"))).collect::<Vec<_>>()
+        &(0..10)
+            .map(|index| photo_media(&format!("p{index}")))
+            .collect::<Vec<_>>()
     )
     .is_ok());
     assert!(InputMedia::validate_media_group(
-        &(0..11).map(|index| photo_media(&format!("p{index}"))).collect::<Vec<_>>()
+        &(0..11)
+            .map(|index| photo_media(&format!("p{index}")))
+            .collect::<Vec<_>>()
     )
     .is_err());
 
