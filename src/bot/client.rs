@@ -338,7 +338,10 @@ impl TelegramBotClient {
             return None;
         }
         let file_path = info.file_path?;
-        let url = format!("https://api.telegram.org/file/bot{}/{}", self.token, file_path);
+        let url = format!(
+            "https://api.telegram.org/file/bot{}/{}",
+            self.token, file_path
+        );
         let response = self.client.get(url).send().await.ok()?;
         if !response.status().is_success() {
             return None;
@@ -489,7 +492,8 @@ impl TelegramBotClient {
         Self::add_caption_fields(&mut payload, caption, parse_mode, reply_markup.as_ref());
         if let Some(reply_to_message_id) = reply_to_message_id {
             payload["reply_parameters"] =
-                serde_json::to_value(ReplyParameters::new(reply_to_message_id)).unwrap_or(json!({}));
+                serde_json::to_value(ReplyParameters::new(reply_to_message_id))
+                    .unwrap_or(json!({}));
         }
         Self::apply_delivery_context(&mut payload, true);
         match self.post_json("sendPhoto", payload).await {
@@ -531,7 +535,8 @@ impl TelegramBotClient {
         });
         if let Some(reply_to_message_id) = reply_to_message_id {
             payload["reply_parameters"] =
-                serde_json::to_value(ReplyParameters::new(reply_to_message_id)).unwrap_or(json!({}));
+                serde_json::to_value(ReplyParameters::new(reply_to_message_id))
+                    .unwrap_or(json!({}));
         }
         Self::apply_delivery_context(&mut payload, false);
         match self.post_json("sendMediaGroup", payload).await {
@@ -556,18 +561,12 @@ impl TelegramBotClient {
                     return Err(error);
                 }
                 self.post_multipart("sendMediaGroup", || {
-                    let mut form = Form::new()
-                        .text("chat_id", chat_id.to_string())
-                        .text(
-                            "media",
-                            serde_json::to_string(&updated).map_err(|error| error.to_string())?,
-                        );
-                    form = self.apply_form_delivery_context(
-                        form,
-                        false,
-                        None,
-                        reply_to_message_id,
-                    )?;
+                    let mut form = Form::new().text("chat_id", chat_id.to_string()).text(
+                        "media",
+                        serde_json::to_string(&updated).map_err(|error| error.to_string())?,
+                    );
+                    form =
+                        self.apply_form_delivery_context(form, false, None, reply_to_message_id)?;
                     for (attach_name, bytes, mime, file_name) in &attachments {
                         let part = Part::bytes(bytes.clone())
                             .file_name(file_name.clone())
@@ -738,7 +737,8 @@ impl TelegramBotClient {
         }
         if let Some(reply_to_message_id) = reply_to_message_id {
             payload["reply_parameters"] =
-                serde_json::to_value(ReplyParameters::new(reply_to_message_id)).unwrap_or(json!({}));
+                serde_json::to_value(ReplyParameters::new(reply_to_message_id))
+                    .unwrap_or(json!({}));
         }
         Self::apply_delivery_context(&mut payload, true);
         match self.post_json(method, payload).await {
@@ -810,7 +810,8 @@ impl TelegramBotClient {
         }
         if let Some(reply_to_message_id) = reply_to_message_id {
             payload["reply_parameters"] =
-                serde_json::to_value(ReplyParameters::new(reply_to_message_id)).unwrap_or(json!({}));
+                serde_json::to_value(ReplyParameters::new(reply_to_message_id))
+                    .unwrap_or(json!({}));
         }
         Self::apply_delivery_context(&mut payload, true);
         self.post_json("sendLocation", payload).await
@@ -947,7 +948,8 @@ impl TelegramBotClient {
     ) -> Result<Value, String> {
         let mut attached_media = media.clone();
         Self::set_media_reference(&mut attached_media, "attach://media".to_string());
-        let media_json = serde_json::to_string(&attached_media).map_err(|error| error.to_string())?;
+        let media_json =
+            serde_json::to_string(&attached_media).map_err(|error| error.to_string())?;
         let file_name = file_name.to_string();
         let mime = mime.to_string();
         self.post_multipart("editEphemeralMessageMedia", || {
@@ -1015,7 +1017,8 @@ impl TelegramBotClient {
         if let Some(reply_markup) = reply_markup {
             payload["reply_markup"] = reply_markup;
         }
-        self.post_json("editEphemeralMessageReplyMarkup", payload).await
+        self.post_json("editEphemeralMessageReplyMarkup", payload)
+            .await
     }
 
     pub async fn send_rich_message_with_media(
@@ -1207,7 +1210,9 @@ impl TelegramBotClient {
             info!("Rich Message validation required degradation: {error}");
         }
 
-        let html_chunks = self.inner.render_blocks_to_html_chunks(&rich_message.blocks, 3800);
+        let html_chunks = self
+            .inner
+            .render_blocks_to_html_chunks(&rich_message.blocks, 3800);
         let total = html_chunks.len();
         let mut html_last = json!({"ok": true});
         for (index, chunk) in html_chunks.into_iter().enumerate() {

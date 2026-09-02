@@ -43,9 +43,8 @@ mod tests {
 
     #[test]
     fn normalizes_voice_note_wire_discriminator() {
-        let blocks = parse_markdown_to_rich_blocks(
-            "[voice: Rekaman](https://example.com/sample.ogg)",
-        );
+        let blocks =
+            parse_markdown_to_rich_blocks("[voice: Rekaman](https://example.com/sample.ogg)");
         let Some(RichBlock::VoiceNote { voice_note, .. }) = blocks.first() else {
             panic!("expected voice-note block");
         };

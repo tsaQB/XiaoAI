@@ -88,7 +88,10 @@ mod tests {
             "error_code": 429,
             "parameters": {"retry_after": 7}
         });
-        assert_eq!(retry_delay_from_response(&response, 0), Some(Duration::from_secs(7)));
+        assert_eq!(
+            retry_delay_from_response(&response, 0),
+            Some(Duration::from_secs(7))
+        );
     }
 
     #[test]
@@ -120,7 +123,11 @@ mod tests {
         assert!(fallback_allowed_response(&json!({"error_code": 400})));
         assert!(!fallback_allowed_response(&json!({"error_code": 429})));
         assert!(!fallback_allowed_response(&json!({"error_code": 503})));
-        assert!(fallback_allowed_error("Telegram API error [x] code=400: bad request"));
-        assert!(!fallback_allowed_error("Telegram API error [x] code=429: rate limited"));
+        assert!(fallback_allowed_error(
+            "Telegram API error [x] code=400: bad request"
+        ));
+        assert!(!fallback_allowed_error(
+            "Telegram API error [x] code=429: rate limited"
+        ));
     }
 }
