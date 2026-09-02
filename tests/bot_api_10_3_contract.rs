@@ -99,3 +99,12 @@ fn media_group_requires_two_to_ten_album_compatible_items() {
     };
     assert!(InputMedia::validate_media_group(&[photo_media("a"), voice_note]).is_err());
 }
+
+#[test]
+fn permanent_send_paths_do_not_emit_draft_id_zero() {
+    let source = include_str!("../src/bot/client.rs");
+    assert!(
+        !source.contains("\"draft_id\": 0"),
+        "permanent sendMessage/sendRichMessage payloads must not include draft_id"
+    );
+}
