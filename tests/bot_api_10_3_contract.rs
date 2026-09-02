@@ -6,6 +6,16 @@ mod stream;
 use models::{InputMedia, RichMessageButton, RichTextButton};
 use stream::SseDecoder;
 
+fn photo_media(id: &str) -> InputMedia {
+    InputMedia::Photo {
+        media: id.to_string(),
+        caption: None,
+        parse_mode: None,
+        show_caption_above_media: None,
+        has_spoiler: None,
+    }
+}
+
 #[test]
 fn voice_note_input_media_uses_bot_api_10_3_discriminator() {
     let media = InputMedia::VoiceNote {
@@ -35,4 +45,38 @@ fn malformed_sse_data_is_rejected_instead_of_silently_dropped() {
         .push(b"data: {not-json}\n\n")
         .expect_err("malformed SSE JSON must be surfaced as an error");
     assert!(error.contains("invalid JSON"), "unexpected error: {error}");
+}
+
+#[test]
+fn media_group_requires_two_to_ten_album_compatible_items() {
+    assert!(InputMedia::validate_media_group(&[photo_media("a")]).is_err());
+    assert!(InputMedia::validate_media_group(&[photo_media("a"), photo_media("b")]).is_ok());
+    assert!(InputMedia::validate_media_group(
+        &(0..10).map(|index| photo_media(&format!("p{index}"))).collect::<Vec<_>>()
+    )
+    .is_ok());
+    assert!(InputMedia::validate_media_group(
+        &(0..11).map(|index| photo_media(&format!("p{index}"))).collect::<Vec<_>>()
+    )
+    .is_err());
+
+    let animation = InputMedia::Animation {
+        media: "anim".to_string(),
+        caption: None,
+        parse_mode: None,
+        show_caption_above_media: None,
+        width: None,
+        height: None,
+        duration: None,
+        has_spoiler: None,
+    };
+    assert!(InputMedia::validate_media_group(&[photo_media("a"), animation]).is_err());
+
+    let voice_note = InputMedia::VoiceNote {
+        media: "voice".to_string(),
+        caption: None,
+        parse_mode: None,
+        duration: None,
+    };
+    assert!(InputMedia::validate_media_group(&[photo_media("a"), voice_note]).is_err());
 }
