@@ -10,6 +10,7 @@ use super::models::{
     ApiResponse, BotCommand, EphemeralMessageParameters, FileInfo, InputMedia, InputRichMessage,
     ReplyParameters, RichBlock, RichBlockCaption, RichBlockTableCell, Update, User,
 };
+use super::url_policy::resolve_download_url;
 use futures_util::StreamExt;
 
 const MAX_TELEGRAM_DOWNLOAD_BYTES: usize = 20 * 1024 * 1024;
@@ -464,13 +465,16 @@ impl TelegramBotClient {
         url: &str,
         max_bytes: usize,
     ) -> Option<(Vec<u8>, String, String)> {
+        let resolved = resolve_download_url(url).await.ok()?;
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve(&resolved.host, resolved.address)
             .build()
-            .unwrap_or_else(|_| self.client.clone());
+            .ok()?;
 
-        let resp = client.get(url).send().await.ok()?;
+        let resp = client.get(resolved.url).send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
