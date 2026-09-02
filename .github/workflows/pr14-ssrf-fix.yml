@@ -1,0 +1,122 @@
+name: PR14 one-shot SSRF fix
+
+on:
+  push:
+    branches:
+      - fix/bot-api-10-3-hardening
+    paths:
+      - .github/workflows/pr14-ssrf-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: fix/bot-api-10-3-hardening
+          fetch-depth: 1
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.98.0
+          components: rustfmt
+      - name: Harden external media downloader
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/bot/client/raw.rs')
+          source = path.read_text()
+
+          marker = '#[derive(Clone)]\npub struct TelegramBotClient {'
+          helper = r'''fn is_unsafe_remote_ip(ip: std::net::IpAddr) -> bool {
+              match ip {
+                  std::net::IpAddr::V4(ip) => {
+                      ip.is_loopback()
+                          || ip.is_private()
+                          || ip.is_link_local()
+                          || ip.is_broadcast()
+                          || ip.is_documentation()
+                          || ip.is_unspecified()
+                          || ip.is_multicast()
+                  }
+                  std::net::IpAddr::V6(ip) => {
+                      if let Some(ipv4) = ip.to_ipv4() {
+                          return is_unsafe_remote_ip(std::net::IpAddr::V4(ipv4));
+                      }
+                      let segments = ip.segments();
+                      ip.is_loopback()
+                          || ip.is_unspecified()
+                          || ip.is_multicast()
+                          || ip.is_unique_local()
+                          || ip.is_unicast_link_local()
+                          || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                  }
+              }
+          }
+
+          async fn resolve_download_url(url: &str) -> Option<(url::Url, std::net::SocketAddr)> {
+              let parsed = url::Url::parse(url).ok()?;
+              if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                  return None;
+              }
+              if !parsed.username().is_empty() || parsed.password().is_some() {
+                  return None;
+              }
+
+              let host = parsed.host_str()?.to_string();
+              let port = parsed.port_or_known_default()?;
+              let resolved = tokio::net::lookup_host((host.as_str(), port))
+                  .await
+                  .ok()?
+                  .collect::<Vec<_>>();
+              if resolved.is_empty() || resolved.iter().any(|addr| is_unsafe_remote_ip(addr.ip())) {
+                  return None;
+              }
+
+              Some((parsed, resolved[0]))
+          }
+
+          '''
+          if 'async fn resolve_download_url' not in source:
+              if marker not in source:
+                  raise SystemExit('TelegramBotClient marker not found')
+              source = source.replace(marker, helper + marker, 1)
+
+          old = '''        let client = Client::builder()
+              .timeout(Duration::from_secs(30))
+              .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+              .build()
+              .unwrap_or_else(|_| self.client.clone());
+
+          let resp = client.get(url).send().await.ok()?;'''
+          new = '''        let (parsed_url, resolved_addr) = resolve_download_url(url).await?;
+          let host = parsed_url.host_str()?.to_string();
+          let client = Client::builder()
+              .timeout(Duration::from_secs(30))
+              .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+              .redirect(reqwest::redirect::Policy::none())
+              .resolve(&host, resolved_addr)
+              .build()
+              .ok()?;
+
+          let resp = client.get(parsed_url).send().await.ok()?;'''
+          if old not in source:
+              raise SystemExit('download_media_bytes client block not found or already changed')
+          source = source.replace(old, new, 1)
+          path.write_text(source)
+          PY
+          cargo fmt --all
+          cargo test --locked --test bot_api_10_3_contract
+          cargo check --locked
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/bot/client/raw.rs
+          git commit -m 'fix(bot): harden external media download policy'
+          git push origin HEAD:fix/bot-api-10-3-hardening
