@@ -47,6 +47,18 @@ jobs:
           old = '    new, count = re.subn(pattern, replacement, text, count=1, flags=flags)'
           new = '    new, count = re.subn(pattern, lambda _match: replacement, text, count=1, flags=flags)'
           assert old in s
+          s = s.replace(old, new, 1)
+
+          old = '''    def replace_media_method(name: str, next_marker: str, body: str) -> None:
+        pattern = rf'    (?:#\\[allow\\(clippy::too_many_arguments\\)\\]\\n    )?pub async fn {name}\\(.*?\\n    \\}}\\n\\n    {next_marker}'
+        regex_once("src/bot/client.rs", pattern, body + '\\n\\n    ' + next_marker)
+'''
+          new = '''    def replace_media_method(name: str, next_marker: str, body: str) -> None:
+        next_literal = next_marker.replace("\\\\n", "\\n")
+        pattern = rf'    (?:#\\[allow\\(clippy::too_many_arguments\\)\\]\\n    )?pub async fn {name}\\(.*?\\n    \\}}\\n\\n    {re.escape(next_literal)}'
+        regex_once("src/bot/client.rs", pattern, body + "\\n\\n    " + next_literal)
+'''
+          assert old in s
           p.write_text(s.replace(old, new, 1))
           PY
           python .github/scripts/apply_bot_api_audit_fixes.py fixes
