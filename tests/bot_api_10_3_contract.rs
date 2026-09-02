@@ -1,9 +1,14 @@
 #[path = "../src/bot/models.rs"]
-mod models;
+pub mod models;
+pub mod bot {
+    pub use crate::models;
+}
+#[path = "../src/parser.rs"]
+mod parser;
 #[path = "../src/ai/stream.rs"]
 mod stream;
 
-use models::{InputMedia, RichMessageButton, RichTextButton};
+use models::{InputMedia, RichBlock, RichMessageButton, RichTextButton};
 use stream::SseDecoder;
 
 fn photo_media(id: &str) -> InputMedia {
@@ -26,6 +31,17 @@ fn voice_note_input_media_uses_bot_api_10_3_discriminator() {
     };
     let value = serde_json::to_value(media).expect("voice note should serialize");
     assert_eq!(value["type"], "voice_note");
+}
+
+#[test]
+fn parsed_voice_note_uses_bot_api_10_3_nested_media_discriminator() {
+    let blocks = parser::parse_markdown_to_rich_blocks(
+        "[voice: Rekaman](https://example.com/sample.ogg)",
+    );
+    let Some(RichBlock::VoiceNote { voice_note, .. }) = blocks.first() else {
+        panic!("expected parsed voice-note block");
+    };
+    assert_eq!(voice_note["type"], "voice_note");
 }
 
 #[test]
