@@ -10,9 +10,9 @@ pub use base::{
     InlineKeyboardMarkup, InputRichMessage, KeyboardButton, Location, LoginUrl, Message,
     MessageGenerationStopped, PhotoSize, ReplyKeyboardMarkup, ReplyKeyboardRemove, ReplyParameters,
     RichBlock, RichBlockCaption, RichBlockListItem, RichBlockTableCell, RichMessageButton,
-    SwitchInlineQueryChosenChat, Update, User, Video, VideoNote, Voice,
-    RICH_MESSAGE_MAX_BLOCKS, RICH_MESSAGE_MAX_BUTTONS_PER_ROW, RICH_MESSAGE_MAX_MEDIA,
-    RICH_MESSAGE_MAX_NESTING, RICH_MESSAGE_MAX_TABLE_COLUMNS, RICH_MESSAGE_MAX_TEXT_CHARS,
+    SwitchInlineQueryChosenChat, Update, User, Video, VideoNote, Voice, RICH_MESSAGE_MAX_BLOCKS,
+    RICH_MESSAGE_MAX_BUTTONS_PER_ROW, RICH_MESSAGE_MAX_MEDIA, RICH_MESSAGE_MAX_NESTING,
+    RICH_MESSAGE_MAX_TABLE_COLUMNS, RICH_MESSAGE_MAX_TEXT_CHARS,
 };
 
 use serde::ser::SerializeStruct;
@@ -176,8 +176,7 @@ impl InputMedia {
             .any(|item| matches!(item, Self::Animation { .. } | Self::VoiceNote { .. }))
         {
             return Err(
-                "sendMediaGroup only supports photo, video, audio, or document media"
-                    .to_string(),
+                "sendMediaGroup only supports photo, video, audio, or document media".to_string(),
             );
         }
         Ok(())
