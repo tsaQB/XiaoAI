@@ -66,6 +66,26 @@ jobs:
           s = s.replace('Err(err_msg) if attempt + 1 < MAX_TELEGRAM_ATTEMPTS =>', 'Err(_err_msg) if attempt + 1 < MAX_TELEGRAM_ATTEMPTS =>')
           s = s.replace('Err(error) if attempt + 1 < MAX_TELEGRAM_ATTEMPTS => {\n                        warn!(\n                            "Telegram multipart response decode failed', 'Err(_error) if attempt + 1 < MAX_TELEGRAM_ATTEMPTS => {\n                        warn!(\n                            "Telegram multipart response decode failed')
           p.write_text(s)
+
+          p = Path('src/cli.rs')
+          s = p.read_text()
+          key_plain = '    let mut key_input = String::new();\n    let _ = reader.read_line(&mut key_input);'
+          key_checked = '    let mut key_input = String::new();\n    if reader.read_line(&mut key_input).is_err() {\n        return;\n    }'
+          s = s.replace(key_plain, '    let key_input = rpassword::read_password().unwrap_or_default();')
+          s = s.replace(key_checked, '    let key_input = rpassword::read_password().unwrap_or_default();')
+          quick_token_marker = 'print!("  \\x1b[1;37mTelegram Bot Token:\\x1b[0m ");'
+          pos = s.index(quick_token_marker)
+          tail = s[pos:]
+          token_read = '            let mut input = String::new();\n            if reader.read_line(&mut input).is_err() {\n                println!("\\n\\x1b[38;5;244mSetup dibatalkan.\\x1b[0m");\n                return None;\n            }'
+          tail = tail.replace(token_read, '            let input = rpassword::read_password().unwrap_or_default();', 1)
+          s = s[:pos] + tail
+          bind_marker = 'pub(crate) async fn run_cli_telegram_bind(manual_token: Option<&str>) {'
+          pos = s.index(bind_marker)
+          tail = s[pos:]
+          bind_read = '        let mut input = String::new();\n        if io::stdin().read_line(&mut input).is_err() {\n            return;\n        }'
+          tail = tail.replace(bind_read, '        let input = rpassword::read_password().unwrap_or_default();', 1)
+          s = s[:pos] + tail
+          p.write_text(s)
           PY
 
       - name: Update lockfile and format
@@ -80,15 +100,17 @@ jobs:
           models = Path('src/bot/models.rs').read_text()
           parser = Path('src/parser.rs').read_text()
           cli = Path('src/cli.rs').read_text()
+          client = Path('src/bot/client.rs').read_text()
           assert '#[serde(rename = "voice_note")]' in models
           assert 'serialize_field("type", "button")' in models
           assert 'pub media: Option<Vec<InputRichMessageMedia>>' in models
           assert '"voice_note"' in parser
           assert 'BotSubscriptionUpdated' not in models
           assert 'pub subscription:' not in models
-          assert 'addCommunity' not in Path('src/bot/client.rs').read_text()
-          assert 'removeCommunity' not in Path('src/bot/client.rs').read_text()
+          assert 'addCommunity' not in client
+          assert 'removeCommunity' not in client
           assert 'reader.read_line(&mut key_input)' not in cli
+          assert cli.count('rpassword::read_password()') >= 3
           print('Scoped assertions passed; Community/subscription remain out of scope.')
           PY
 
