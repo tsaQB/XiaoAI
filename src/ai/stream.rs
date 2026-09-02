@@ -55,11 +55,7 @@ impl SseDecoder {
         Ok(events)
     }
 
-    fn process_line(
-        &mut self,
-        line: &str,
-        events: &mut Vec<StreamEvent>,
-    ) -> Result<(), String> {
+    fn process_line(&mut self, line: &str, events: &mut Vec<StreamEvent>) -> Result<(), String> {
         if line.is_empty() {
             return self.flush_event(events);
         }
