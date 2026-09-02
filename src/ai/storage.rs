@@ -1004,34 +1004,38 @@ fn enqueue_telegram_update_on_conn(
     Ok(inserted)
 }
 
-fn pending_telegram_updates_db(limit: usize) -> rusqlite::Result<Vec<TelegramInboxRecord>> {
+fn recover_telegram_processing_db() -> rusqlite::Result<usize> {
     let conn = open_session_db()?;
-    pending_telegram_updates_on_conn(&conn, limit)
+    recover_telegram_processing_on_conn(&conn)
 }
 
-fn pending_telegram_updates_on_conn(
+fn pending_telegram_updates_after_db(
+    after_update_id: i64,
+    limit: usize,
+) -> rusqlite::Result<Vec<TelegramInboxRecord>> {
+    let conn = open_session_db()?;
+    pending_telegram_updates_after_on_conn(&conn, after_update_id, limit)
+}
+
+fn pending_telegram_updates_after_on_conn(
     conn: &Connection,
+    after_update_id: i64,
     limit: usize,
 ) -> rusqlite::Result<Vec<TelegramInboxRecord>> {
     let mut stmt = conn.prepare(
         "SELECT update_id,payload_json
          FROM telegram_inbox
-         WHERE status='pending'
+         WHERE status='pending' AND update_id>?1
          ORDER BY update_id
-         LIMIT ?1",
+         LIMIT ?2",
     )?;
-    let rows = stmt.query_map(params![limit as i64], |row| {
+    let rows = stmt.query_map(params![after_update_id, limit as i64], |row| {
         Ok(TelegramInboxRecord {
             update_id: row.get(0)?,
             payload_json: row.get(1)?,
         })
     })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-}
-
-fn recover_telegram_processing_db() -> rusqlite::Result<usize> {
-    let conn = open_session_db()?;
-    recover_telegram_processing_on_conn(&conn)
+    rows.collect()
 }
 
 fn recover_telegram_processing_on_conn(conn: &Connection) -> rusqlite::Result<usize> {
@@ -1097,9 +1101,12 @@ pub(crate) async fn enqueue_telegram_update_async(
     .await
 }
 
-pub(crate) async fn pending_telegram_updates_async(limit: usize) -> Vec<TelegramInboxRecord> {
-    run_db("pending_telegram_updates", move || {
-        pending_telegram_updates_db(limit)
+pub(crate) async fn pending_telegram_updates_after_async(
+    after_update_id: i64,
+    limit: usize,
+) -> Vec<TelegramInboxRecord> {
+    run_db("pending_telegram_updates_after", move || {
+        pending_telegram_updates_after_db(after_update_id, limit)
     })
     .await
     .unwrap_or_default()
@@ -2042,24 +2049,45 @@ mod tests {
     }
 
     #[test]
+    fn telegram_pending_updates_page_past_first_500_without_replaying_queued_rows() {
+        let mut conn = session_test_conn();
+        for update_id in 1..=501 {
+            let payload = format!(r#"{{"update_id":{update_id}}}"#);
+            assert!(enqueue_telegram_update_on_conn(&mut conn, update_id, &payload).unwrap());
+        }
+
+        let first = pending_telegram_updates_after_on_conn(&conn, i64::MIN, 500).unwrap();
+        assert_eq!(first.len(), 500);
+        assert_eq!(first.first().map(|record| record.update_id), Some(1));
+        assert_eq!(first.last().map(|record| record.update_id), Some(500));
+
+        let second = pending_telegram_updates_after_on_conn(&conn, 500, 500).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].update_id, 501);
+    }
+
+    #[test]
     fn telegram_pending_updates_replayed_and_marked_processing_then_processed() {
         let mut conn = session_test_conn();
         assert!(enqueue_telegram_update_on_conn(&mut conn, 10, r#"{"update_id":10}"#).unwrap());
         assert!(enqueue_telegram_update_on_conn(&mut conn, 11, r#"{"update_id":11}"#).unwrap());
 
-        let pending = pending_telegram_updates_on_conn(&conn, 10).unwrap();
+        let pending = pending_telegram_updates_after_on_conn(&conn, i64::MIN, 10).unwrap();
         assert_eq!(pending.len(), 2);
         assert_eq!(pending[0].update_id, 10);
         assert_eq!(pending[1].update_id, 11);
 
         assert!(mark_telegram_processing_on_conn(&conn, 10).unwrap());
-        let pending_after_first = pending_telegram_updates_on_conn(&conn, 10).unwrap();
+        let pending_after_first =
+            pending_telegram_updates_after_on_conn(&conn, i64::MIN, 10).unwrap();
         assert_eq!(pending_after_first.len(), 1);
         assert_eq!(pending_after_first[0].update_id, 11);
 
         assert!(mark_telegram_processed_on_conn(&conn, 10).unwrap());
         assert_eq!(
-            pending_telegram_updates_on_conn(&conn, 10).unwrap().len(),
+            pending_telegram_updates_after_on_conn(&conn, i64::MIN, 10)
+                .unwrap()
+                .len(),
             1
         );
     }
@@ -2491,10 +2519,16 @@ mod tests {
 
     #[test]
     fn failed_secret_storage_write_aborts_without_persisting() {
-        let invalid_dir = std::path::Path::new("/nonexistent_dir_cannot_create_secrets");
+        let invalid_dir = std::env::temp_dir().join(format!(
+            "xiaoai-secret-parent-file-{}-{:x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::write(&invalid_dir, b"not a directory").unwrap();
         let secret_ref = "secret://test/fail-check";
-        let res = write_secret_in_dir(invalid_dir, secret_ref, "test");
+        let res = write_secret_in_dir(&invalid_dir, secret_ref, "test");
         assert!(res.is_err());
+        let _ = std::fs::remove_file(invalid_dir);
     }
 
     #[test]

@@ -7,11 +7,13 @@ pub enum StreamEvent {
 }
 
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Default)]
 pub struct SseDecoder {
     buffer: Vec<u8>,
     data_lines: Vec<String>,
+    data_bytes: usize,
 }
 
 impl SseDecoder {
@@ -30,7 +32,7 @@ impl SseDecoder {
             }
             let line = String::from_utf8(raw)
                 .map_err(|_| "provider SSE emitted invalid UTF-8".to_string())?;
-            self.process_line(&line, &mut events);
+            self.process_line(&line, &mut events)?;
         }
 
         if self.buffer.len() > MAX_SSE_LINE_BYTES {
@@ -49,39 +51,51 @@ impl SseDecoder {
             }
             let line = String::from_utf8(raw)
                 .map_err(|_| "provider SSE emitted invalid UTF-8".to_string())?;
-            self.process_line(&line, &mut events);
+            self.process_line(&line, &mut events)?;
         }
-        self.flush_event(&mut events);
+        self.flush_event(&mut events)?;
         Ok(events)
     }
 
-    fn process_line(&mut self, line: &str, events: &mut Vec<StreamEvent>) {
+    fn process_line(&mut self, line: &str, events: &mut Vec<StreamEvent>) -> Result<(), String> {
         if line.is_empty() {
-            self.flush_event(events);
-            return;
+            return self.flush_event(events);
         }
         if line.starts_with(':') {
-            return;
+            return Ok(());
         }
         if let Some(data) = line.strip_prefix("data:") {
-            self.data_lines.push(data.trim_start().to_string());
+            let data = data.trim_start();
+            let separator = usize::from(!self.data_lines.is_empty());
+            let next_size = self
+                .data_bytes
+                .saturating_add(separator)
+                .saturating_add(data.len());
+            if next_size > MAX_SSE_EVENT_BYTES {
+                return Err("provider SSE event exceeded 1 MiB".to_string());
+            }
+            self.data_lines.push(data.to_string());
+            self.data_bytes = next_size;
         }
+        Ok(())
     }
 
-    fn flush_event(&mut self, events: &mut Vec<StreamEvent>) {
+    fn flush_event(&mut self, events: &mut Vec<StreamEvent>) -> Result<(), String> {
         if self.data_lines.is_empty() {
-            return;
+            return Ok(());
         }
         let payload = self.data_lines.join("\n");
         self.data_lines.clear();
+        self.data_bytes = 0;
         let trimmed = payload.trim();
         if trimmed == "[DONE]" {
             events.push(StreamEvent::Done);
-            return;
+            return Ok(());
         }
-        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-            events.push(StreamEvent::Json(value));
-        }
+        let value = serde_json::from_str::<Value>(trimmed)
+            .map_err(|error| format!("provider SSE emitted invalid JSON: {error}"))?;
+        events.push(StreamEvent::Json(value));
+        Ok(())
     }
 }
 
@@ -130,11 +144,31 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_json_events() {
+        let mut decoder = SseDecoder::default();
+        let error = decoder.push(b"data: {not-json}\n\n").unwrap_err();
+        assert!(error.contains("invalid JSON"));
+    }
+
+    #[test]
     fn rejects_invalid_utf8_and_oversized_lines() {
         let mut invalid = SseDecoder::default();
         assert!(invalid.push(b"data: \xff\n").is_err());
 
         let mut oversized = SseDecoder::default();
         assert!(oversized.push(&vec![b'x'; MAX_SSE_LINE_BYTES + 1]).is_err());
+
+        let mut terminated = vec![b'x'; MAX_SSE_LINE_BYTES + 1];
+        terminated.push(b'\n');
+        let mut oversized = SseDecoder::default();
+        assert!(oversized.push(&terminated).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_multiline_events() {
+        let line = format!("data: {}\n", "x".repeat(MAX_SSE_LINE_BYTES / 2));
+        let mut decoder = SseDecoder::default();
+        assert!(decoder.push(line.as_bytes()).unwrap().is_empty());
+        assert!(decoder.push(line.as_bytes()).is_err());
     }
 }
