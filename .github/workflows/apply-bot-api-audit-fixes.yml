@@ -1,0 +1,104 @@
+name: Apply Bot API Audit Fixes
+
+on:
+  push:
+    branches: [fix/bot-api-10-3-audit-findings]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'chore: bootstrap Bot API audit fixer'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: fix/bot-api-10-3-audit-findings
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+
+      - name: Configure commit identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: RED - add contract regressions
+        run: |
+          python .github/scripts/apply_bot_api_audit_fixes.py tests
+          set +e
+          cargo test --locked > /tmp/red.log 2>&1
+          status=$?
+          set -e
+          cat /tmp/red.log
+          if [ "$status" -eq 0 ]; then
+            echo "Expected regression suite to fail before production changes, but it passed."
+            exit 1
+          fi
+          echo "RED confirmed: regression suite detects the audited defects."
+          git add src/bot/models.rs src/bot/client.rs src/ai/stream.rs src/ai/storage.rs
+          git commit -m "test(telegram): reproduce Bot API audit regressions"
+
+      - name: GREEN - apply scoped production fixes
+        run: |
+          python .github/scripts/apply_bot_api_audit_fixes.py fixes
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/ai/stream.rs')
+          s = p.read_text()
+          s = s.replace('        self.flush_event(&mut events);\n        Ok(events)', '        self.flush_event(&mut events)?;\n        Ok(events)')
+          p.write_text(s)
+
+          p = Path('src/bot/client.rs')
+          s = p.read_text()
+          s = s.replace('Err(err_msg) if attempt + 1 < MAX_TELEGRAM_ATTEMPTS =>', 'Err(_err_msg) if attempt + 1 < MAX_TELEGRAM_ATTEMPTS =>')
+          s = s.replace('Err(error) if attempt + 1 < MAX_TELEGRAM_ATTEMPTS => {\n                        warn!(\n                            "Telegram multipart response decode failed', 'Err(_error) if attempt + 1 < MAX_TELEGRAM_ATTEMPTS => {\n                        warn!(\n                            "Telegram multipart response decode failed')
+          p.write_text(s)
+          PY
+
+      - name: Update lockfile and format
+        run: |
+          cargo check
+          cargo fmt --all
+
+      - name: Verify scoped source assertions
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          models = Path('src/bot/models.rs').read_text()
+          parser = Path('src/parser.rs').read_text()
+          cli = Path('src/cli.rs').read_text()
+          assert '#[serde(rename = "voice_note")]' in models
+          assert 'serialize_field("type", "button")' in models
+          assert 'pub media: Option<Vec<InputRichMessageMedia>>' in models
+          assert '"voice_note"' in parser
+          assert 'BotSubscriptionUpdated' not in models
+          assert 'pub subscription:' not in models
+          assert 'addCommunity' not in Path('src/bot/client.rs').read_text()
+          assert 'removeCommunity' not in Path('src/bot/client.rs').read_text()
+          assert 'reader.read_line(&mut key_input)' not in cli
+          print('Scoped assertions passed; Community/subscription remain out of scope.')
+          PY
+
+      - name: Full Rust validation
+        run: |
+          cargo fmt --all -- --check
+          cargo check --locked
+          cargo test --locked
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo build --release --locked
+
+      - name: Remove temporary fix harness and commit final patch
+        run: |
+          git rm .github/scripts/apply_bot_api_audit_fixes.py .github/workflows/apply-bot-api-audit-fixes.yml
+          git add -A
+          git commit -m "fix(telegram): resolve Bot API 10.3 audit findings"
+          git push origin HEAD:fix/bot-api-10-3-audit-findings
