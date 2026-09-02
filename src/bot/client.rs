@@ -393,7 +393,7 @@ impl TelegramBotClient {
         let total = chunks.len();
         let mut last = json!({"ok": true});
         for (index, chunk) in chunks.into_iter().enumerate() {
-            let mut payload = json!({"chat_id": chat_id, "draft_id": 0, "text": chunk});
+            let mut payload = json!({"chat_id": chat_id, "text": chunk});
             if let Some(parse_mode) = parse_mode {
                 payload["parse_mode"] = json!(parse_mode);
             }
@@ -1179,7 +1179,6 @@ impl TelegramBotClient {
         if validation.is_ok() {
             let mut payload = json!({
                 "chat_id": chat_id,
-                "draft_id": 0,
                 "rich_message": serde_json::to_value(rich_message).map_err(|error| error.to_string())?,
             });
             if let Some(ref reply_markup) = reply_markup {
