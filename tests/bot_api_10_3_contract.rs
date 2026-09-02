@@ -105,6 +105,15 @@ fn permanent_send_paths_do_not_emit_draft_id_zero() {
     let source = include_str!("../src/bot/client.rs");
     assert!(
         !source.contains("\"draft_id\": 0"),
-        "permanent sendMessage/sendRichMessage payloads must not include draft_id"
+        "permanent wrapper sendMessage/sendRichMessage payloads must not include draft_id"
+    );
+}
+
+#[test]
+fn raw_transport_permanent_send_paths_do_not_emit_draft_id_zero() {
+    let source = include_str!("../src/bot/client/raw.rs");
+    assert!(
+        !source.contains("\"draft_id\": 0"),
+        "inner transport permanent sends must not retain the invalid draft_id sentinel"
     );
 }
