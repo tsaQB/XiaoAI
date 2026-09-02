@@ -101,6 +101,8 @@ mod tests {
         assert!(is_unsafe_remote_ip("192.168.1.1".parse().unwrap()));
         assert!(is_unsafe_remote_ip("fc00::1".parse().unwrap()));
         assert!(!is_unsafe_remote_ip("1.1.1.1".parse().unwrap()));
-        assert!(!is_unsafe_remote_ip("2606:4700:4700::1111".parse().unwrap()));
+        assert!(!is_unsafe_remote_ip(
+            "2606:4700:4700::1111".parse().unwrap()
+        ));
     }
 }
