@@ -117,3 +117,24 @@ fn raw_transport_permanent_send_paths_do_not_emit_draft_id_zero() {
         "inner transport permanent sends must not retain the invalid draft_id sentinel"
     );
 }
+
+#[test]
+fn raw_media_downloader_enforces_safe_outbound_url_policy() {
+    let source = include_str!("../src/bot/client/raw.rs");
+    let start = source
+        .find("pub async fn download_media_bytes")
+        .expect("raw downloader must exist");
+    let tail = &source[start..];
+    let end = tail
+        .find("pub async fn send_photo(")
+        .expect("send_photo should follow raw downloader");
+    let body = &tail[..end];
+    assert!(
+        body.contains("resolve_download_url"),
+        "external media fallback must resolve and validate outbound targets before requesting them"
+    );
+    assert!(
+        body.contains("Policy::none()"),
+        "external media fallback must disable redirects so a public URL cannot pivot to a private target"
+    );
+}
