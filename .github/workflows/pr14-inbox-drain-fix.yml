@@ -30,6 +30,30 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
+          def remove_rust_function(source: str, prefix: str) -> str:
+              start = source.find(prefix)
+              if start < 0:
+                  raise SystemExit(f'function not found: {prefix}')
+              brace = source.find('{', start)
+              if brace < 0:
+                  raise SystemExit(f'function body not found: {prefix}')
+              depth = 0
+              end = None
+              for index in range(brace, len(source)):
+                  char = source[index]
+                  if char == '{':
+                      depth += 1
+                  elif char == '}':
+                      depth -= 1
+                      if depth == 0:
+                          end = index + 1
+                          break
+              if end is None:
+                  raise SystemExit(f'unbalanced function body: {prefix}')
+              while end < len(source) and source[end] == '\n':
+                  end += 1
+              return source[:start] + source[end:]
+
           storage = Path('src/ai/storage.rs')
           text = storage.read_text()
 
@@ -118,6 +142,18 @@ jobs:
               if test_anchor not in text:
                   raise SystemExit('telegram inbox test anchor not found')
               text = text.replace(test_anchor, test_addition + test_anchor, 1)
+
+          text = text.replace(
+              'pending_telegram_updates_on_conn(&conn, ',
+              'pending_telegram_updates_after_on_conn(&conn, i64::MIN, ',
+          )
+          for prefix in (
+              'fn pending_telegram_updates_db(',
+              'fn pending_telegram_updates_on_conn(',
+              'pub(crate) async fn pending_telegram_updates_async(',
+          ):
+              if prefix in text:
+                  text = remove_rust_function(text, prefix)
 
           storage.write_text(text)
 
