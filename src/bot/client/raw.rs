@@ -344,7 +344,6 @@ impl TelegramBotClient {
 
         let mut payload = json!({
             "chat_id": chat_id,
-            "draft_id": 0,
             "text": text,
         });
         if let Some(pm) = parse_mode {
@@ -1469,7 +1468,6 @@ impl TelegramBotClient {
             let rich_json = serde_json::to_value(rich_message).map_err(|e| e.to_string())?;
             let mut payload = json!({
                 "chat_id": chat_id,
-                "draft_id": 0,
                 "rich_message": rich_json,
             });
             if let Some(ref rm) = reply_markup {
