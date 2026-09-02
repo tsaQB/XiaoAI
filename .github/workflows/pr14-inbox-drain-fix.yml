@@ -1,0 +1,156 @@
+name: PR14 one-shot durable inbox drain fix
+
+on:
+  push:
+    branches:
+      - fix/bot-api-10-3-hardening
+    paths:
+      - .github/workflows/pr14-inbox-drain-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: fix/bot-api-10-3-hardening
+          fetch-depth: 1
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+      - name: Add cursor-based startup replay and verify
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          storage = Path('src/ai/storage.rs')
+          text = storage.read_text()
+
+          async_anchor = '''pub(crate) async fn pending_telegram_updates_async(limit: usize) -> Vec<TelegramInboxRecord> {
+              run_db("pending_telegram_updates", move || {
+                  pending_telegram_updates_db(limit)
+              })
+              .await
+              .unwrap_or_default()
+          }
+          '''
+          async_addition = async_anchor + '''
+          pub(crate) async fn pending_telegram_updates_after_async(
+              after_update_id: i64,
+              limit: usize,
+          ) -> Vec<TelegramInboxRecord> {
+              run_db("pending_telegram_updates_after", move || {
+                  pending_telegram_updates_after_db(after_update_id, limit)
+              })
+              .await
+              .unwrap_or_default()
+          }
+          '''
+          if 'pending_telegram_updates_after_async' not in text:
+              if async_anchor not in text:
+                  raise SystemExit('async pending inbox anchor not found')
+              text = text.replace(async_anchor, async_addition, 1)
+
+          recover_anchor = 'fn recover_telegram_processing_on_conn(conn: &Connection) -> rusqlite::Result<usize> {'
+          db_addition = '''fn pending_telegram_updates_after_db(
+              after_update_id: i64,
+              limit: usize,
+          ) -> rusqlite::Result<Vec<TelegramInboxRecord>> {
+              let conn = open_session_db()?;
+              pending_telegram_updates_after_on_conn(&conn, after_update_id, limit)
+          }
+
+          fn pending_telegram_updates_after_on_conn(
+              conn: &Connection,
+              after_update_id: i64,
+              limit: usize,
+          ) -> rusqlite::Result<Vec<TelegramInboxRecord>> {
+              let mut stmt = conn.prepare(
+                  "SELECT update_id,payload_json
+                   FROM telegram_inbox
+                   WHERE status='pending' AND update_id>?1
+                   ORDER BY update_id
+                   LIMIT ?2",
+              )?;
+              let rows = stmt.query_map(params![after_update_id, limit as i64], |row| {
+                  Ok(TelegramInboxRecord {
+                      update_id: row.get(0)?,
+                      payload_json: row.get(1)?,
+                  })
+              })?;
+              rows.collect()
+          }
+
+          '''
+          if 'fn pending_telegram_updates_after_db(' not in text:
+              if recover_anchor not in text:
+                  raise SystemExit('recover inbox anchor not found')
+              text = text.replace(recover_anchor, db_addition + recover_anchor, 1)
+
+          test_anchor = '    #[test]\n    fn telegram_pending_updates_replayed_and_marked_processing_then_processed() {'
+          test_addition = '''    #[test]
+              fn telegram_pending_updates_page_past_first_500_without_replaying_queued_rows() {
+                  let mut conn = session_test_conn();
+                  for update_id in 1..=501 {
+                      let payload = format!(r#"{{"update_id":{update_id}}}"#);
+                      assert!(enqueue_telegram_update_on_conn(&mut conn, update_id, &payload).unwrap());
+                  }
+
+                  let first = pending_telegram_updates_after_on_conn(&conn, i64::MIN, 500).unwrap();
+                  assert_eq!(first.len(), 500);
+                  assert_eq!(first.first().map(|record| record.update_id), Some(1));
+                  assert_eq!(first.last().map(|record| record.update_id), Some(500));
+
+                  let second = pending_telegram_updates_after_on_conn(&conn, 500, 500).unwrap();
+                  assert_eq!(second.len(), 1);
+                  assert_eq!(second[0].update_id, 501);
+              }
+
+          '''
+          if 'telegram_pending_updates_page_past_first_500_without_replaying_queued_rows' not in text:
+              if test_anchor not in text:
+                  raise SystemExit('telegram inbox test anchor not found')
+              text = text.replace(test_anchor, test_addition + test_anchor, 1)
+
+          storage.write_text(text)
+
+          main = Path('src/main.rs')
+          text = main.read_text()
+          old_for = '    for record in ai::storage::pending_telegram_updates_async(500).await {'
+          new_for = '''    let mut replay_after_update_id = i64::MIN;
+              loop {
+                  let replay_batch =
+                      ai::storage::pending_telegram_updates_after_async(replay_after_update_id, 500).await;
+                  if replay_batch.is_empty() {
+                      break;
+                  }
+                  for record in replay_batch {
+                      replay_after_update_id = record.update_id;'''
+          if 'let mut replay_after_update_id = i64::MIN;' not in text:
+              if old_for not in text:
+                  raise SystemExit('startup replay loop anchor not found')
+              text = text.replace(old_for, new_for, 1)
+              offset_anchor = '\n    let mut offset = ai::storage::load_telegram_offset_async().await;'
+              if offset_anchor not in text:
+                  raise SystemExit('polling offset anchor not found')
+              text = text.replace(offset_anchor, '\n    }\n' + offset_anchor, 1)
+          main.write_text(text)
+          PY
+          cargo fmt --all
+          cargo test --locked ai::storage::tests::telegram_pending_updates_page_past_first_500_without_replaying_queued_rows
+          cargo test --locked
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo check --locked
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/ai/storage.rs src/main.rs
+          git commit -m 'fix(bot): drain durable inbox beyond first replay page'
+          git push origin HEAD:fix/bot-api-10-3-hardening
