@@ -35,9 +35,8 @@ fn voice_note_input_media_uses_bot_api_10_3_discriminator() {
 
 #[test]
 fn parsed_voice_note_uses_bot_api_10_3_nested_media_discriminator() {
-    let blocks = parser::parse_markdown_to_rich_blocks(
-        "[voice: Rekaman](https://example.com/sample.ogg)",
-    );
+    let blocks =
+        parser::parse_markdown_to_rich_blocks("[voice: Rekaman](https://example.com/sample.ogg)");
     let Some(RichBlock::VoiceNote { voice_note, .. }) = blocks.first() else {
         panic!("expected parsed voice-note block");
     };
