@@ -56,6 +56,7 @@ jobs:
           python .github/scripts/apply_bot_api_audit_fixes.py fixes
           python - <<'PY'
           from pathlib import Path
+
           p = Path('src/ai/stream.rs')
           s = p.read_text()
           s = s.replace('        self.flush_event(&mut events);\n        Ok(events)', '        self.flush_event(&mut events)?;\n        Ok(events)')
@@ -65,6 +66,37 @@ jobs:
           s = p.read_text()
           s = s.replace('Err(err_msg) if attempt + 1 < MAX_TELEGRAM_ATTEMPTS =>', 'Err(_err_msg) if attempt + 1 < MAX_TELEGRAM_ATTEMPTS =>')
           s = s.replace('Err(error) if attempt + 1 < MAX_TELEGRAM_ATTEMPTS => {\n                        warn!(\n                            "Telegram multipart response decode failed', 'Err(_error) if attempt + 1 < MAX_TELEGRAM_ATTEMPTS => {\n                        warn!(\n                            "Telegram multipart response decode failed')
+
+          old_tracks = '            "sendMessage"\n                | "sendLocation"\n                | "editMessageText"\n                | "editEphemeralMessageText"\n                | "editEphemeralMessageCaption"\n                | "editEphemeralMessageReplyMarkup"\n                | "deleteMessage"\n                | "deleteEphemeralMessage"'
+          new_tracks = '            "sendMessage" | "sendLocation"'
+          assert old_tracks in s
+          s = s.replace(old_tracks, new_tracks, 1)
+
+          old_post = '        let response = self.post_json_raw(method, payload).await?;\n        if response.get("ok").and_then(Value::as_bool) == Some(true) {'
+          new_post = '        let response = match self.post_json_raw(method, payload).await {\n            Ok(response) => response,\n            Err(error) => {\n                if Self::tracks_terminal_delivery(method) {\n                    Self::mark_terminal_delivery_failure();\n                }\n                return Err(error);\n            }\n        };\n        if response.get("ok").and_then(Value::as_bool) == Some(true) {'
+          assert old_post in s
+          s = s.replace(old_post, new_post, 1)
+
+          s = s.replace('    pub async fn edit_ephemeral_message_media_bytes(\n', '    #[allow(clippy::too_many_arguments)]\n    pub async fn edit_ephemeral_message_media_bytes(\n', 1)
+
+          old_edit_terminal = '            return Self::terminal_delivery_error(Self::telegram_api_error(method, &res));'
+          assert old_edit_terminal in s
+          s = s.replace(old_edit_terminal, '            return Err(Self::telegram_api_error(method, &res));', 1)
+
+          tracker_test = '        assert!(failed);\n\n        let (_, answered) = TelegramBotClient::with_callback_answer_tracking(async {'
+          tracker_repl = '        assert!(failed);\n\n        let ((_, isolated_failure), outer_failed) = TelegramBotClient::with_delivery_tracking(async {\n            TelegramBotClient::with_delivery_tracking(async {\n                TelegramBotClient::mark_terminal_delivery_failure();\n            })\n            .await\n        })\n        .await;\n        assert!(isolated_failure);\n        assert!(!outer_failed);\n\n        let (_, answered) = TelegramBotClient::with_callback_answer_tracking(async {'
+          assert tracker_test in s
+          s = s.replace(tracker_test, tracker_repl, 1)
+          p.write_text(s)
+
+          p = Path('src/main.rs')
+          s = p.read_text()
+          start = '    let delivery = deliver_generated_image_with(\n'
+          assert start in s
+          s = s.replace(start, '    let (delivery, _) = TelegramBotClient::with_delivery_tracking(deliver_generated_image_with(\n', 1)
+          end = '    )\n    .await;\n\n    if let Err(failure) = delivery {'
+          assert end in s
+          s = s.replace(end, '    ))\n    .await;\n\n    if let Err(failure) = delivery {', 1)
           p.write_text(s)
 
           p = Path('src/cli.rs')
@@ -101,6 +133,7 @@ jobs:
           parser = Path('src/parser.rs').read_text()
           cli = Path('src/cli.rs').read_text()
           client = Path('src/bot/client.rs').read_text()
+          main = Path('src/main.rs').read_text()
           assert '#[serde(rename = "voice_note")]' in models
           assert 'serialize_field("type", "button")' in models
           assert 'pub media: Option<Vec<InputRichMessageMedia>>' in models
@@ -111,6 +144,10 @@ jobs:
           assert 'removeCommunity' not in client
           assert 'reader.read_line(&mut key_input)' not in cli
           assert cli.count('rpassword::read_password()') >= 3
+          assert '"sendMessage" | "sendLocation"' in client
+          assert '| "deleteMessage"' not in client[client.index('fn tracks_terminal_delivery'):client.index('pub async fn with_delivery_context')]
+          assert '#[allow(clippy::too_many_arguments)]\n    pub async fn edit_ephemeral_message_media_bytes' in client
+          assert 'with_delivery_tracking(deliver_generated_image_with(' in main
           print('Scoped assertions passed; Community/subscription remain out of scope.')
           PY
 
