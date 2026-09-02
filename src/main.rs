@@ -4222,43 +4222,52 @@ async fn main() {
         );
     }
 
-    for record in ai::storage::pending_telegram_updates_async(500).await {
-        match serde_json::from_str::<Update>(&record.payload_json) {
-            Ok(update) => {
-                if update.stopped_message_generation.is_some() {
-                    // Native Stop bypasses both queues for immediate cancellation.
-                    process_durable_update(
-                        &bot,
-                        &ai_service,
-                        &user_last_image_prompt,
-                        &access,
-                        update,
-                    )
-                    .await;
-                } else {
-                    let lane = classify_update_lane(&ai_service, &update).await;
-                    let send_result = match lane {
-                        UpdateLane::Control => control_tx.send(update).await,
-                        UpdateLane::Generation => generation_tx.send(update).await,
-                    };
-                    if send_result.is_err() {
-                        error!("Update worker stopped while replaying durable inbox");
-                        return;
+    let mut replay_after_update_id = i64::MIN;
+    loop {
+        let replay_batch =
+            ai::storage::pending_telegram_updates_after_async(replay_after_update_id, 500).await;
+        if replay_batch.is_empty() {
+            break;
+        }
+        for record in replay_batch {
+            replay_after_update_id = record.update_id;
+            match serde_json::from_str::<Update>(&record.payload_json) {
+                Ok(update) => {
+                    if update.stopped_message_generation.is_some() {
+                        // Native Stop bypasses both queues for immediate cancellation.
+                        process_durable_update(
+                            &bot,
+                            &ai_service,
+                            &user_last_image_prompt,
+                            &access,
+                            update,
+                        )
+                        .await;
+                    } else {
+                        let lane = classify_update_lane(&ai_service, &update).await;
+                        let send_result = match lane {
+                            UpdateLane::Control => control_tx.send(update).await,
+                            UpdateLane::Generation => generation_tx.send(update).await,
+                        };
+                        if send_result.is_err() {
+                            error!("Update worker stopped while replaying durable inbox");
+                            return;
+                        }
                     }
                 }
-            }
-            Err(error) => {
-                warn!(
-                    "Durable Telegram update {} tidak dapat didecode: {error}",
-                    record.update_id
-                );
-                if ai::storage::mark_telegram_processing_async(record.update_id).await
-                    && !ai::storage::mark_telegram_processed_async(record.update_id).await
-                {
+                Err(error) => {
                     warn!(
+                        "Durable Telegram update {} tidak dapat didecode: {error}",
+                        record.update_id
+                    );
+                    if ai::storage::mark_telegram_processing_async(record.update_id).await
+                        && !ai::storage::mark_telegram_processed_async(record.update_id).await
+                    {
+                        warn!(
                         "Gagal menandai durable Telegram update {} yang invalid sebagai completed",
                         record.update_id
                     );
+                    }
                 }
             }
         }
