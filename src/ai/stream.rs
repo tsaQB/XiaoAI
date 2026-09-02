@@ -7,11 +7,13 @@ pub enum StreamEvent {
 }
 
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Default)]
 pub struct SseDecoder {
     buffer: Vec<u8>,
     data_lines: Vec<String>,
+    data_bytes: usize,
 }
 
 impl SseDecoder {
@@ -63,7 +65,17 @@ impl SseDecoder {
             return Ok(());
         }
         if let Some(data) = line.strip_prefix("data:") {
-            self.data_lines.push(data.trim_start().to_string());
+            let data = data.trim_start();
+            let separator = usize::from(!self.data_lines.is_empty());
+            let next_size = self
+                .data_bytes
+                .saturating_add(separator)
+                .saturating_add(data.len());
+            if next_size > MAX_SSE_EVENT_BYTES {
+                return Err("provider SSE event exceeded 1 MiB".to_string());
+            }
+            self.data_lines.push(data.to_string());
+            self.data_bytes = next_size;
         }
         Ok(())
     }
@@ -74,6 +86,7 @@ impl SseDecoder {
         }
         let payload = self.data_lines.join("\n");
         self.data_lines.clear();
+        self.data_bytes = 0;
         let trimmed = payload.trim();
         if trimmed == "[DONE]" {
             events.push(StreamEvent::Done);
@@ -144,5 +157,18 @@ mod tests {
 
         let mut oversized = SseDecoder::default();
         assert!(oversized.push(&vec![b'x'; MAX_SSE_LINE_BYTES + 1]).is_err());
+
+        let mut terminated = vec![b'x'; MAX_SSE_LINE_BYTES + 1];
+        terminated.push(b'\n');
+        let mut oversized = SseDecoder::default();
+        assert!(oversized.push(&terminated).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_multiline_events() {
+        let line = format!("data: {}\n", "x".repeat(MAX_SSE_LINE_BYTES / 2));
+        let mut decoder = SseDecoder::default();
+        assert!(decoder.push(line.as_bytes()).unwrap().is_empty());
+        assert!(decoder.push(line.as_bytes()).is_err());
     }
 }

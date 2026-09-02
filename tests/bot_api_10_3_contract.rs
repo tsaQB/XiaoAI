@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_imports)]
+#![allow(dead_code)]
 
 #[path = "../src/bot/models.rs"]
 pub mod models;
@@ -103,6 +103,20 @@ fn media_group_requires_two_to_ten_album_compatible_items() {
 }
 
 #[test]
+fn media_group_keeps_audio_and_documents_in_homogeneous_albums() {
+    let audio = InputMedia::audio("audio", None, None, None, None);
+    let document = InputMedia::document("document", None, None);
+    let video = InputMedia::video("video", None, None);
+
+    assert!(InputMedia::validate_media_group(&[photo_media("photo"), video]).is_ok());
+    assert!(InputMedia::validate_media_group(&[photo_media("photo"), audio.clone()]).is_err());
+    assert!(InputMedia::validate_media_group(&[photo_media("photo"), document.clone()]).is_err());
+    assert!(InputMedia::validate_media_group(&[audio.clone(), document.clone()]).is_err());
+    assert!(InputMedia::validate_media_group(&[audio.clone(), audio]).is_ok());
+    assert!(InputMedia::validate_media_group(&[document.clone(), document]).is_ok());
+}
+
+#[test]
 fn permanent_send_paths_do_not_emit_draft_id_zero() {
     let source = include_str!("../src/bot/client.rs");
     assert!(
@@ -138,5 +152,9 @@ fn raw_media_downloader_enforces_safe_outbound_url_policy() {
     assert!(
         body.contains("Policy::none()"),
         "external media fallback must disable redirects so a public URL cannot pivot to a private target"
+    );
+    assert!(
+        body.contains(".no_proxy()"),
+        "external media fallback must not let ambient proxies bypass DNS pinning"
     );
 }

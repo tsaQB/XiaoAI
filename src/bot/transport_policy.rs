@@ -33,39 +33,31 @@ pub fn retry_delay_from_error(error: &str, attempt: usize) -> Option<Duration> {
     if !bounded_attempt(attempt) {
         return None;
     }
-    if let Some(value) = error
-        .split("retry_after=")
-        .nth(1)
-        .and_then(|tail| tail.split('s').next())
-        .and_then(|seconds| seconds.parse::<u64>().ok())
-    {
-        return Some(Duration::from_secs(value));
-    }
-    if let Some(code) = error
-        .split("code=")
-        .nth(1)
-        .and_then(|tail| tail.split(|c: char| !c.is_ascii_digit()).next())
-        .and_then(|value| value.parse::<u16>().ok())
-    {
+    if let Some(code) = normalized_api_error_code(error) {
+        if code == 429 {
+            return error
+                .rsplit_once(" retry_after=")
+                .and_then(|(_, tail)| tail.strip_suffix('s'))
+                .and_then(|seconds| seconds.parse::<u64>().ok())
+                .map(Duration::from_secs)
+                .or_else(|| Some(backoff(attempt)));
+        }
         if (500..=599).contains(&code) {
             return Some(backoff(attempt));
         }
         return None;
     }
-    let lower = error.to_ascii_lowercase();
-    if [
-        "timeout",
-        "connection failure",
-        "transport failure",
-        "request failure",
-        "body failure",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-    {
+    if error.to_ascii_lowercase().contains("connection failure") {
         return Some(backoff(attempt));
     }
     None
+}
+
+fn normalized_api_error_code(error: &str) -> Option<u16> {
+    let error = error.strip_prefix("Telegram API error [")?;
+    let (_, tail) = error.split_once("] code=")?;
+    let (code, _) = tail.split_once(':')?;
+    code.parse().ok()
 }
 
 pub fn fallback_allowed_response(response: &Value) -> bool {
@@ -73,7 +65,7 @@ pub fn fallback_allowed_response(response: &Value) -> bool {
 }
 
 pub fn fallback_allowed_error(error: &str) -> bool {
-    error.contains("code=400")
+    normalized_api_error_code(error) == Some(400)
 }
 
 #[cfg(test)]
@@ -129,5 +121,28 @@ mod tests {
         assert!(!fallback_allowed_error(
             "Telegram API error [x] code=429: rate limited"
         ));
+    }
+
+    #[test]
+    fn normalized_error_policy_ignores_description_substrings() {
+        assert!(!fallback_allowed_error(
+            "Telegram API error [x] code=500: upstream code=400"
+        ));
+        assert!(!fallback_allowed_error(
+            "Telegram API error [x] code=4000: unknown"
+        ));
+        assert!(
+            retry_delay_from_error("Telegram API error [x] code=400: bad retry_after=9s", 0)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn retries_only_transport_failures_known_to_precede_request_delivery() {
+        assert!(retry_delay_from_error("connection failure", 0).is_some());
+        assert!(retry_delay_from_error("timeout", 0).is_none());
+        assert!(retry_delay_from_error("body failure", 0).is_none());
+        assert!(retry_delay_from_error("transport failure", 0).is_none());
+        assert!(retry_delay_from_error("request failure", 0).is_none());
     }
 }

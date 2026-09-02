@@ -2519,10 +2519,16 @@ mod tests {
 
     #[test]
     fn failed_secret_storage_write_aborts_without_persisting() {
-        let invalid_dir = std::path::Path::new("/nonexistent_dir_cannot_create_secrets");
+        let invalid_dir = std::env::temp_dir().join(format!(
+            "xiaoai-secret-parent-file-{}-{:x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::write(&invalid_dir, b"not a directory").unwrap();
         let secret_ref = "secret://test/fail-check";
-        let res = write_secret_in_dir(invalid_dir, secret_ref, "test");
+        let res = write_secret_in_dir(&invalid_dir, secret_ref, "test");
         assert!(res.is_err());
+        let _ = std::fs::remove_file(invalid_dir);
     }
 
     #[test]

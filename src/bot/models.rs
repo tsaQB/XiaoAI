@@ -172,15 +172,20 @@ impl InputMedia {
                 media.len()
             ));
         }
-        if media
-            .iter()
-            .any(|item| matches!(item, Self::Animation { .. } | Self::VoiceNote { .. }))
-        {
-            return Err(
-                "sendMediaGroup only supports photo, video, audio, or document media".to_string(),
-            );
-        }
-        Ok(())
+        let compatible = match &media[0] {
+            Self::Audio { .. } => media.iter().all(|item| matches!(item, Self::Audio { .. })),
+            Self::Document { .. } => media
+                .iter()
+                .all(|item| matches!(item, Self::Document { .. })),
+            Self::Photo { .. } | Self::Video { .. } => media
+                .iter()
+                .all(|item| matches!(item, Self::Photo { .. } | Self::Video { .. })),
+            Self::Animation { .. } | Self::VoiceNote { .. } => false,
+        };
+        compatible.then_some(()).ok_or_else(|| {
+            "sendMediaGroup requires audio-only or document-only albums; photos and videos may be combined"
+                .to_string()
+        })
     }
 }
 

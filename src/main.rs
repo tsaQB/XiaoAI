@@ -4721,7 +4721,7 @@ mod update_lane_tests {
 
     #[test]
     fn telegram_document_runtime_uses_one_authoritative_media_classifier() {
-        let source = include_str!("main.rs");
+        let source = include_str!("main.rs").replace("\r\n", "\n");
         let document_start = source
             .find("} else if let Some(doc) = msg.document {")
             .expect("Telegram document branch");

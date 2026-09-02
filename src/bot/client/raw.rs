@@ -468,6 +468,9 @@ impl TelegramBotClient {
         let resolved = resolve_download_url(url).await.ok()?;
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .resolve(&resolved.host, resolved.address)
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .redirect(reqwest::redirect::Policy::none())
             .resolve(&resolved.host, resolved.address)

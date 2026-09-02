@@ -16,6 +16,7 @@ use crate::attachments::{
     decode_user_content, delete_attachment_refs, delete_session_attachments, encode_user_content,
     load_attachment, persist_attachment,
 };
+use crate::bot::url_policy::is_unsafe_remote_ip;
 use crate::util::{truncate_chars, truncate_chars_with_ellipsis};
 
 use super::http::{is_retryable_status, retry_delay, MAX_PROVIDER_ATTEMPTS};
@@ -396,27 +397,6 @@ fn generation_revision_matches(
     session.is_some_and(|session| session.id == session_id && session.revision == revision)
 }
 
-fn is_unsafe_remote_ip(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(ip) => {
-            ip.is_loopback()
-                || ip.is_private()
-                || ip.is_link_local()
-                || ip.is_broadcast()
-                || ip.is_documentation()
-                || ip.is_unspecified()
-                || ip.is_multicast()
-        }
-        std::net::IpAddr::V6(ip) => {
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_multicast()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local()
-        }
-    }
-}
-
 fn validate_generated_image_bytes(bytes: &[u8]) -> Result<(), String> {
     if bytes.is_empty() {
         return Err("generated image response was empty".to_string());
@@ -551,6 +531,7 @@ pub(super) async fn download_generated_image(url: &str) -> Result<Vec<u8>, Image
         // above without a custom resolver. Disable redirects to prevent a
         // trusted public URL from pivoting into a private network address.
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .resolve(host, resolved[0])
         .build()
         .map_err(|_| {
@@ -3768,7 +3749,9 @@ mod tests {
         assert!(parse_generated_image_url("https://example.com/image.png").is_ok());
         assert!(is_unsafe_remote_ip("127.0.0.1".parse().unwrap()));
         assert!(is_unsafe_remote_ip("10.1.2.3".parse().unwrap()));
+        assert!(is_unsafe_remote_ip("100.64.0.1".parse().unwrap()));
         assert!(is_unsafe_remote_ip("::1".parse().unwrap()));
+        assert!(is_unsafe_remote_ip("::ffff:127.0.0.1".parse().unwrap()));
         assert!(!is_unsafe_remote_ip("1.1.1.1".parse().unwrap()));
     }
 
