@@ -41,6 +41,7 @@ impl Deref for TelegramBotClient {
     }
 }
 
+#[allow(dead_code)]
 impl TelegramBotClient {
     pub fn new(token: impl Into<String>) -> Self {
         let token = token.into().trim().to_string();

@@ -5,22 +5,26 @@ use crate::bot::models::{InputRichMessage, RichBlock};
 #[path = "parser/markdown.rs"]
 mod markdown;
 
+#[allow(dead_code)]
 pub fn parse_inline(input_str: &str) -> Value {
     markdown::parse_inline(input_str)
 }
 
+#[allow(dead_code)]
 pub fn parse_streaming_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
     let mut blocks = markdown::parse_streaming_markdown_to_rich_blocks(text);
     normalize_bot_api_10_3_media(&mut blocks);
     blocks
 }
 
+#[allow(dead_code)]
 pub fn parse_markdown_to_rich_blocks(text: &str) -> Vec<RichBlock> {
     let mut blocks = markdown::parse_markdown_to_rich_blocks(text);
     normalize_bot_api_10_3_media(&mut blocks);
     blocks
 }
 
+#[allow(dead_code)]
 pub fn build_full_rich_message(answer_text: &str, model_name: Option<&str>) -> InputRichMessage {
     let mut message = markdown::build_full_rich_message(answer_text, model_name);
     normalize_bot_api_10_3_media(&mut message.blocks);

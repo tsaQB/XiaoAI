@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports)]
+
 #[path = "../src/bot/models.rs"]
 pub mod models;
 pub mod bot {
